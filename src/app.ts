@@ -1,11 +1,14 @@
+import { createRequire } from "node:module";
 import cors from "cors";
 import express, { type ErrorRequestHandler, type RequestHandler } from "express";
-import helmet from "helmet";
 import multer from "multer";
 import swaggerUi from "swagger-ui-express";
 import { badRequest, HttpError, internalServerError, notFound } from "./http-error.js";
 import { openApiDocument } from "./openapi.js";
 import type { AppDependencies, AsyncRequestHandler, WineListQuery } from "./types.js";
+
+const require = createRequire(import.meta.url);
+const helmet = require("helmet") as (options?: { contentSecurityPolicy?: boolean }) => RequestHandler;
 
 const acceptedMimeTypes = new Set([
   "image/jpeg",
