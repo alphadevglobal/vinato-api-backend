@@ -10,7 +10,8 @@
     "test": "vitest run tests",
     "db:migrate": "tsx scripts/migrate.ts",
     "db:seed": "tsx scripts/seed.ts",
-    "db:import": "tsx scripts/import-source.ts"
+    "db:import": "tsx scripts/import-source.ts",
+    "db:import:hf": "tsx scripts/import-huggingface.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
