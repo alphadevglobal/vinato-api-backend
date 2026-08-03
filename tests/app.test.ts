@@ -117,6 +117,18 @@ describe("Wine API", () => {
     expect(response.headers.location).toBe("/api/docs/");
   });
 
+  it("serves Swagger UI static assets", async () => {
+    const cssResponse = await request(app).get("/api/docs/swagger-ui.css").expect(200);
+    const jsResponse = await request(app)
+      .get("/api/docs/swagger-ui-bundle.js")
+      .expect(200);
+
+    expect(cssResponse.headers["content-type"]).toContain("text/css");
+    expect(cssResponse.text).toContain(".swagger-ui");
+    expect(jsResponse.headers["content-type"]).toContain("javascript");
+    expect(jsResponse.text).toContain("SwaggerUIBundle");
+  });
+
   it("lists wines with pagination metadata", async () => {
     const response = await request(app).get("/wines?limit=2&page=1").expect(200);
 

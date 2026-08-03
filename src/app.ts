@@ -61,11 +61,8 @@ export function createApp(dependencies: AppDependencies) {
   app.get(/^\/api\/docs$/, (_req, res) => {
     res.redirect(302, "/api/docs/");
   });
-  app.use(
-    "/api/docs",
-    swaggerUi.serveFiles(openApiDocument, swaggerUiOptions),
-    swaggerUi.setup(openApiDocument, swaggerUiOptions),
-  );
+  app.use("/api/docs", swaggerUi.serve);
+  app.get("/api/docs/", swaggerUi.setup(openApiDocument, swaggerUiOptions));
 
   app.get(
     "/wines",
