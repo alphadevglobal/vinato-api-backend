@@ -3,3 +3,5 @@ dist/
 .env
 coverage/
 *.log
+.vercel
+.env.local
