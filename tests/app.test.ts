@@ -111,6 +111,12 @@ describe("Wine API", () => {
     expect(response.body.paths).toHaveProperty("/wine-scanner/scan");
   });
 
+  it("redirects Swagger UI to the trailing-slash route", async () => {
+    const response = await request(app).get("/api/docs").expect(302);
+
+    expect(response.headers.location).toBe("/api/docs/");
+  });
+
   it("lists wines with pagination metadata", async () => {
     const response = await request(app).get("/wines?limit=2&page=1").expect(200);
 

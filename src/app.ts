@@ -55,7 +55,9 @@ export function createApp(dependencies: AppDependencies) {
       persistAuthorization: true,
     },
   };
-  app.get("/api/docs", swaggerUi.setup(openApiDocument, swaggerUiOptions));
+  app.get(/^\/api\/docs$/, (_req, res) => {
+    res.redirect(302, "/api/docs/");
+  });
   app.use(
     "/api/docs",
     swaggerUi.serveFiles(openApiDocument, swaggerUiOptions),
