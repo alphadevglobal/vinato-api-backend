@@ -41,4 +41,4 @@ npm run db:import -- --truncate --pages=25 --limit=100
 
 O endpoint `POST /wine-scanner/scan` recebe `multipart/form-data` no campo `image`. Quando `OPENROUTER_API_KEY` está configurado, a API chama o modelo definido em `OPENROUTER_MODEL` para extrair os dados do rótulo.
 
-O modelo padrão sugerido é `google/gemma-4-26b-a4b-it:free`, que aceita imagem via OpenRouter. Para usar Gemini, configure `OPENROUTER_MODEL=google/gemini-2.5-flash` e garanta que a conta OpenRouter tenha créditos.
+O modelo primário padrão é `google/gemini-2.5-flash`. Se o OpenRouter responder `402 Insufficient credits`, a API tenta automaticamente o modelo configurado em `OPENROUTER_FALLBACK_MODEL`, cujo padrão é `google/gemma-4-26b-a4b-it:free`.

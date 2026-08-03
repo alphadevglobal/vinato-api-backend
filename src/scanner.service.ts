@@ -18,36 +18,7 @@ export class OpenRouterWineScanner implements WineScanner {
     }
 
     const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.openRouterApiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost",
-        "X-Title": "Wine API",
-      },
-      body: JSON.stringify({
-        model: config.openRouterModel,
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: scannerPrompt },
-              { type: "image_url", image_url: { url: imageDataUrl } },
-            ],
-          },
-        ],
-      }),
-    });
-
-    if (!response.ok) {
-      throw internalServerError("Falha na comunicação com a API OpenRouter.");
-    }
-
-    const payload = (await response.json()) as {
-      choices?: Array<{ message?: { content?: unknown } }>;
-    };
+    const payload = await this.scanWithFallback(imageDataUrl);
     const content = payload.choices?.[0]?.message?.content;
     const parsed = parseModelJson(content);
 
@@ -56,6 +27,76 @@ export class OpenRouterWineScanner implements WineScanner {
       success: true,
     };
   }
+
+  private async scanWithFallback(imageDataUrl: string): Promise<OpenRouterPayload> {
+    const primary = await callOpenRouter(config.openRouterModel, imageDataUrl);
+    if (primary.ok) return primary.payload;
+
+    if (
+      shouldFallbackForInsufficientCredits(primary) &&
+      config.openRouterFallbackModel !== config.openRouterModel
+    ) {
+      const fallback = await callOpenRouter(
+        config.openRouterFallbackModel,
+        imageDataUrl,
+      );
+      if (fallback.ok) return fallback.payload;
+    }
+
+    throw internalServerError("Falha na comunicação com a API OpenRouter.");
+  }
+}
+
+type OpenRouterPayload = {
+  choices?: Array<{ message?: { content?: unknown } }>;
+};
+
+type OpenRouterResult =
+  | { ok: true; payload: OpenRouterPayload }
+  | { ok: false; status: number; body: string };
+
+async function callOpenRouter(
+  model: string,
+  imageDataUrl: string,
+): Promise<OpenRouterResult> {
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.openRouterApiKey}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "http://localhost",
+      "X-Title": "Wine API",
+    },
+    body: JSON.stringify({
+      model,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: scannerPrompt },
+            { type: "image_url", image_url: { url: imageDataUrl } },
+          ],
+        },
+      ],
+    }),
+  });
+
+  const body = await response.text();
+  if (!response.ok) {
+    return { ok: false, status: response.status, body };
+  }
+
+  try {
+    return { ok: true, payload: JSON.parse(body) as OpenRouterPayload };
+  } catch {
+    throw internalServerError("Resposta inválida da API OpenRouter.");
+  }
+}
+
+function shouldFallbackForInsufficientCredits(result: OpenRouterResult) {
+  if (result.ok || result.status !== 402) return false;
+  return /insufficient credits/i.test(result.body);
 }
 
 function parseModelJson(content: unknown): Record<string, unknown> {
