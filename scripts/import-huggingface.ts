@@ -9,6 +9,7 @@ import { upsertWines } from "../src/wine-upsert.js";
 const VINTAGES_URL = "https://huggingface.co/datasets/Dakhoo/L2T-NeurIPS-2023/resolve/main/data/vintages/vintages_dataset.jsonl";
 const ALL_URL = "https://huggingface.co/datasets/Dakhoo/L2T-NeurIPS-2023/resolve/main/data/all/all_dataset.jsonl";
 const BATCH_SIZE = 500;
+const materializeOnly = process.argv.includes("--materialize-only");
 
 type WineSensedRow = {
   vintage_id?: unknown; image?: unknown; review?: unknown; experiment_id?: unknown;
@@ -20,8 +21,11 @@ type WineSensedRow = {
 type Observation = { id: string; vintageId: string; imagePath: string | null; review: string | null; experimentId: string | null };
 
 try {
-  await importStream(VINTAGES_URL, false);
-  await importStream(ALL_URL, true);
+  if (!materializeOnly) {
+    await importStream(VINTAGES_URL, false);
+    await importStream(ALL_URL, true);
+  }
+  await materializeCatalog();
   await pool.query(`
     UPDATE catalog_wines wine
     SET review_count = counts.total,
@@ -44,6 +48,36 @@ try {
   console.log("WineSensed import complete", summary.rows[0]);
 } finally {
   await pool.end();
+}
+
+async function materializeCatalog() {
+  const result = await pool.query(`
+    INSERT INTO catalog_wines (
+      id, lwin, status, display_name, wine, type, reference,
+      source, source_id, image_path, review_count, created_at, updated_at
+    )
+    SELECT
+      gen_random_uuid(),
+      'hf-' || observations.vintage_id,
+      'test-only',
+      'WineSensed Vintage #' || observations.vintage_id,
+      NULL,
+      'Wine',
+      'WineSensed / Dakhoo/L2T-NeurIPS-2023; CC BY-NC-ND 4.0; TEST ONLY',
+      'winesensed',
+      observations.vintage_id,
+      MIN(observations.image_path) FILTER (WHERE observations.image_path IS NOT NULL),
+      COUNT(observations.review)::int,
+      now(),
+      now()
+    FROM winesensed_observations observations
+    GROUP BY observations.vintage_id
+    ON CONFLICT (lwin) DO UPDATE SET
+      image_path = COALESCE(catalog_wines.image_path, EXCLUDED.image_path),
+      review_count = EXCLUDED.review_count,
+      updated_at = now()
+  `);
+  console.log(`WineSensed catalog materialized: ${result.rowCount ?? 0} vintages processed`);
 }
 
 async function importStream(url: string, includeObservations: boolean) {
