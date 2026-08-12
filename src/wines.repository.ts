@@ -34,9 +34,20 @@ const baseSelect = `
     date_added,
     date_updated,
     reference,
+    source,
+    source_id,
+    vintage_year,
+    alcohol,
+    price_usd,
+    rating,
+    grapes,
+    image_path,
+    image_url,
+    source_url,
+    review_count,
     created_at,
     updated_at
-  FROM wines
+  FROM catalog_wines
 `;
 
 export class PgWineRepository implements WineRepository {
@@ -46,7 +57,7 @@ export class PgWineRepository implements WineRepository {
     const { whereSql, params } = buildWhere(query);
     const offset = (query.page - 1) * query.limit;
     const countResult = await this.pool.query<{ total: string }>(
-      `SELECT COUNT(*)::int AS total FROM wines ${whereSql}`,
+      `SELECT COUNT(*)::int AS total FROM catalog_wines ${whereSql}`,
       params,
     );
     const total = Number(countResult.rows[0]?.total ?? 0);
@@ -77,6 +88,10 @@ export class PgWineRepository implements WineRepository {
       displayName: wine.displayName,
       country: wine.country,
       colour: wine.colour,
+      imageUrl: wine.imageUrl,
+      rating: wine.rating,
+      grapes: wine.grapes,
+      reviewCount: wine.reviewCount,
     }));
   }
 

@@ -1,13 +1,15 @@
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { pool } from "../src/db.js";
 
-const migrationPath = join(process.cwd(), "migrations", "001_create_wines.sql");
-const sql = await readFile(migrationPath, "utf8");
-
 try {
-  await pool.query(sql);
-  console.log("Migrations applied.");
+  const directory = join(process.cwd(), "migrations");
+  const migrations = (await readdir(directory)).filter((file) => file.endsWith(".sql")).sort();
+  for (const migration of migrations) {
+    const sql = await readFile(join(directory, migration), "utf8");
+    await pool.query(sql);
+    console.log(`Applied ${migration}`);
+  }
 } finally {
   await pool.end();
 }

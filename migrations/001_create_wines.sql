@@ -1,7 +1,7 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
-CREATE TABLE IF NOT EXISTS wines (
+CREATE TABLE IF NOT EXISTS catalog_wines (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   lwin text NOT NULL UNIQUE,
   status text,
@@ -29,9 +29,9 @@ CREATE TABLE IF NOT EXISTS wines (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS wines_display_name_idx ON wines (display_name);
-CREATE INDEX IF NOT EXISTS wines_display_name_trgm_idx ON wines USING gin (display_name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS wines_country_lower_idx ON wines (lower(country));
-CREATE INDEX IF NOT EXISTS wines_colour_lower_idx ON wines (lower(colour));
-CREATE INDEX IF NOT EXISTS wines_region_lower_idx ON wines (lower(region));
-CREATE INDEX IF NOT EXISTS wines_type_lower_idx ON wines (lower(type));
+CREATE INDEX IF NOT EXISTS catalog_wines_display_name_idx ON catalog_wines (display_name);
+CREATE INDEX IF NOT EXISTS catalog_wines_display_name_trgm_idx ON catalog_wines USING gin (display_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS catalog_wines_country_lower_idx ON catalog_wines (lower(country));
+CREATE INDEX IF NOT EXISTS catalog_wines_colour_lower_idx ON catalog_wines (lower(colour));
+CREATE INDEX IF NOT EXISTS catalog_wines_region_lower_idx ON catalog_wines (lower(region));
+CREATE INDEX IF NOT EXISTS catalog_wines_type_lower_idx ON catalog_wines (lower(type));

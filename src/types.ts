@@ -24,6 +24,17 @@ export type Wine = {
   dateAdded: string | null;
   dateUpdated: string | null;
   reference: string | null;
+  source?: string;
+  sourceId?: string | null;
+  vintageYear?: number | null;
+  alcohol?: number | null;
+  priceUsd?: number | null;
+  rating?: number | null;
+  grapes?: string | null;
+  imagePath?: string | null;
+  imageUrl?: string | null;
+  sourceUrl?: string | null;
+  reviewCount?: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -52,6 +63,17 @@ export type WineRow = {
   date_added: string | null;
   date_updated: string | null;
   reference: string | null;
+  source: string;
+  source_id: string | null;
+  vintage_year: number | null;
+  alcohol: string | number | null;
+  price_usd: string | number | null;
+  rating: string | number | null;
+  grapes: string | null;
+  image_path: string | null;
+  image_url: string | null;
+  source_url: string | null;
+  review_count: number;
   created_at: string | Date;
   updated_at: string | Date;
 };
@@ -76,7 +98,7 @@ export type PaginatedWines = {
 
 export type AutocompleteWine = Pick<
   Wine,
-  "id" | "lwin" | "displayName" | "country" | "colour"
+  "id" | "lwin" | "displayName" | "country" | "colour" | "imageUrl" | "rating" | "grapes" | "reviewCount"
 >;
 
 export type ScannedWineData = {

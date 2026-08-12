@@ -37,7 +37,7 @@ Use `--truncate` se quiser limpar a tabela antes de importar:
 npm run db:import -- --truncate --pages=25 --limit=100
 ```
 
-## Importando WineSensed do Hugging Face
+## Importando WineSensed do Hugging Face (somente testes não comerciais)
 
 Também existe um importador opcional para a base [Dakhoo/L2T-NeurIPS-2023](https://huggingface.co/datasets/Dakhoo/L2T-NeurIPS-2023), sem baixar imagens:
 
@@ -45,7 +45,9 @@ Também existe um importador opcional para a base [Dakhoo/L2T-NeurIPS-2023](http
 npm run db:import:hf
 ```
 
-O script baixa `vintages_dataset.jsonl`, deduplica por `vintage_id` e cria `lwin` com prefixo `hf-`. A licença informada pelo dataset é `CC BY-NC-ND 4.0`; confirme que o uso do produto é compatível antes de usar esses dados fora de desenvolvimento ou pesquisa. Esta configuração do dataset contém pouco mais de 100 vinhos nomeados; para uma amostra grande de autocomplete, use também `npm run db:import -- --pages=250 --limit=100`.
+O script processa integralmente `vintages_dataset.jsonl` e `all_dataset.jsonl` em streaming. Vinhos nomeados entram em `catalog_wines`; avaliações e referências de imagem entram em `winesensed_observations`. Os arquivos de imagem não são distribuídos pelo repositório atual, portanto `image_path` é preservado para associação futura e `image_url` permanece nulo para não entregar links quebrados ao app.
+
+A licença informada pelo dataset é `CC BY-NC-ND 4.0`. Estes dados são marcados como `test-only` e não devem ser publicados em produção comercial sem autorização expressa dos titulares.
 
 ## Scanner
 

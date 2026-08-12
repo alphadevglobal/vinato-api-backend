@@ -25,6 +25,17 @@ const columns = [
   "date_added",
   "date_updated",
   "reference",
+  "source",
+  "source_id",
+  "vintage_year",
+  "alcohol",
+  "price_usd",
+  "rating",
+  "grapes",
+  "image_path",
+  "image_url",
+  "source_url",
+  "review_count",
   "created_at",
   "updated_at",
 ] as const;
@@ -47,7 +58,7 @@ export async function upsertWines(pool: pg.Pool, wines: Wine[]) {
 
   await pool.query(
     `
-      INSERT INTO wines (${columns.join(", ")})
+      INSERT INTO catalog_wines (${columns.join(", ")})
       VALUES ${rowsSql.join(", ")}
       ON CONFLICT (lwin) DO UPDATE SET ${updates}
     `,
@@ -80,6 +91,17 @@ function wineToRowValues(wine: Wine) {
     wine.dateAdded,
     wine.dateUpdated,
     wine.reference,
+    wine.source ?? "lwin",
+    wine.sourceId ?? null,
+    wine.vintageYear ?? null,
+    wine.alcohol ?? null,
+    wine.priceUsd ?? null,
+    wine.rating ?? null,
+    wine.grapes ?? null,
+    wine.imagePath ?? null,
+    wine.imageUrl ?? null,
+    wine.sourceUrl ?? null,
+    wine.reviewCount ?? 0,
     wine.createdAt,
     wine.updatedAt,
   ];
