@@ -12,39 +12,43 @@ import type pg from "pg";
 const baseSelect = `
   SELECT
     id,
-    lwin,
-    status,
+    COALESCE(scan_code, 'catalog-' || id::text) AS lwin,
+    'active'::text AS status,
     display_name,
-    producer_title,
-    producer_name,
-    wine,
+    NULL::text AS producer_title,
+    producer_manufacturer AS producer_name,
+    wine_name AS wine,
     country,
     region,
     sub_region,
-    site,
-    parcel,
-    colour,
-    type,
-    sub_type,
+    NULL::text AS site,
+    NULL::text AS parcel,
+    color AS colour,
+    wine_type AS type,
+    NULL::text AS sub_type,
     designation,
     classification,
-    vintage_config,
-    first_vintage,
-    final_vintage,
-    date_added,
-    date_updated,
-    reference,
-    source,
-    source_id,
-    vintage_year,
-    alcohol,
-    price_usd,
-    rating,
-    grapes,
-    image_path,
-    image_url,
-    source_url,
-    review_count,
+    NULL::text AS vintage_config,
+    vintage::text AS first_vintage,
+    vintage::text AS final_vintage,
+    created_at::text AS date_added,
+    updated_at::text AS date_updated,
+    description AS reference,
+    'catalog_wines'::text AS source,
+    id::text AS source_id,
+    vintage AS vintage_year,
+    alcohol_percent AS alcohol,
+    NULL::numeric AS price_usd,
+    NULL::numeric AS rating,
+    CASE WHEN jsonb_typeof(grapes) = 'array' THEN array_to_string(ARRAY(SELECT jsonb_array_elements_text(grapes)), ', ') ELSE grapes #>> '{}' END AS grapes,
+    NULL::text AS image_path,
+    CASE
+      WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 AND jsonb_typeof(images->0) = 'string' THEN images->>0
+      WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 THEN COALESCE(images->0->>'url', images->0->>'image_url')
+      ELSE NULL
+    END AS image_url,
+    NULL::text AS source_url,
+    0::integer AS review_count,
     created_at,
     updated_at
   FROM catalog_wines
@@ -78,7 +82,7 @@ export class PgWineRepository implements WineRepository {
   async autocomplete(term: string): Promise<AutocompleteWine[]> {
     const normalizedTerm = `%${term}%`;
     const result = await this.pool.query<WineRow>(
-      `${baseSelect} WHERE display_name ILIKE $1 ORDER BY id ASC LIMIT 10`,
+      `${baseSelect} WHERE normalized_search ILIKE $1 OR display_name ILIKE $1 ORDER BY display_name ASC LIMIT 20`,
       [normalizedTerm],
     );
 
@@ -106,7 +110,7 @@ export class PgWineRepository implements WineRepository {
 
   async findByLwin(lwin: string): Promise<Wine | null> {
     const result = await this.pool.query<WineRow>(
-      `${baseSelect} WHERE lwin = $1 LIMIT 1`,
+      `${baseSelect} WHERE scan_code = $1 OR 'catalog-' || id::text = $1 LIMIT 1`,
       [lwin],
     );
 
@@ -125,13 +129,13 @@ function buildWhere(query: WineListQuery) {
   };
 
   addExactFilter("country", query.country);
-  addExactFilter("colour", query.colour);
+  addExactFilter("color", query.colour);
   addExactFilter("region", query.region);
-  addExactFilter("type", query.type);
+  addExactFilter("wine_type", query.type);
 
   if (query.search) {
     params.push(`%${query.search}%`);
-    clauses.push(`display_name ILIKE $${params.length}`);
+    clauses.push(`(normalized_search ILIKE $${params.length} OR display_name ILIKE $${params.length})`);
   }
 
   return {

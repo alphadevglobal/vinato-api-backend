@@ -141,6 +141,7 @@ export type WineScanner = {
 export type AppDependencies = {
   wineRepository: WineRepository;
   wineScanner: WineScanner;
+  accountRepository?: import("./account.repository.js").AccountRepository;
 };
 
 export type AsyncRequestHandler = (
