@@ -41,7 +41,19 @@ const baseSelect = `
     alcohol_percent AS alcohol,
     NULL::numeric AS price_usd,
     NULL::numeric AS rating,
-    CASE WHEN jsonb_typeof(grapes) = 'array' THEN array_to_string(ARRAY(SELECT jsonb_array_elements_text(grapes)), ', ') ELSE grapes #>> '{}' END AS grapes,
+    CASE
+      WHEN jsonb_typeof(grapes) = 'array' THEN array_to_string(ARRAY(
+        SELECT CASE
+          WHEN jsonb_typeof(grape) = 'object' AND NULLIF(grape->>'name', '') IS NOT NULL
+            THEN concat(CASE WHEN NULLIF(grape->>'percentage', '') IS NOT NULL THEN (grape->>'percentage') || '% ' ELSE '' END, grape->>'name')
+          WHEN jsonb_typeof(grape) = 'string' THEN grape #>> '{}'
+        END
+        FROM jsonb_array_elements(grapes) grape
+      ), ', ')
+      WHEN jsonb_typeof(grapes) = 'object' AND NULLIF(grapes->>'name', '') IS NOT NULL
+        THEN concat(CASE WHEN NULLIF(grapes->>'percentage', '') IS NOT NULL THEN (grapes->>'percentage') || '% ' ELSE '' END, grapes->>'name')
+      ELSE grapes #>> '{}'
+    END AS grapes,
     NULL::text AS image_path,
     CASE
       WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 AND jsonb_typeof(images->0) = 'string' THEN images->>0

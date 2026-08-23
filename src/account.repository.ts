@@ -283,7 +283,19 @@ function mapCatalogWine(row: Record<string, unknown>) {
     colour: typeof row.color === "string" ? row.color : null,
     vintageYear: typeof row.vintage === "number" ? row.vintage : null,
     rating: null,
-    grapes: Array.isArray(row.grapes) ? row.grapes.map((item) => typeof item === "string" ? item : item && typeof item === "object" && "name" in item ? String((item as { name: unknown }).name) : "").filter(Boolean).join(", ") : null,
+    grapes: formatGrapes(row.grapes),
     imageUrl: firstImage(row.images), imagePath: null,
   };
+}
+
+function formatGrapes(value: unknown) {
+  if (!Array.isArray(value)) return null;
+  return value.map((item) => {
+    if (typeof item === "string") return item;
+    if (!item || typeof item !== "object" || !("name" in item)) return "";
+    const grape = item as { name: unknown; percentage?: unknown };
+    const name = typeof grape.name === "string" ? grape.name : "";
+    const percentage = typeof grape.percentage === "number" || typeof grape.percentage === "string" ? String(grape.percentage) : "";
+    return name ? `${percentage ? `${percentage}% ` : ""}${name}` : "";
+  }).filter(Boolean).join(", ");
 }

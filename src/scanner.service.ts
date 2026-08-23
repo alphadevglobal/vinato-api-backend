@@ -14,7 +14,7 @@ Use null quando uma informacao nao estiver visivel. confidence deve ser numero d
 export class OpenRouterWineScanner implements WineScanner {
   async scanWineLabel(file: Express.Multer.File): Promise<ScanWineLabelResult> {
     if (!config.openRouterApiKey) {
-      throw internalServerError("OPENROUTER_API_KEY não configurada.");
+      throw internalServerError("Serviço de reconhecimento temporariamente indisponível.");
     }
 
     const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
