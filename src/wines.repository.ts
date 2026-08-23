@@ -50,6 +50,9 @@ const baseSelect = `
     END AS image_url,
     NULL::text AS source_url,
     0::integer AS review_count,
+    COALESCE((SELECT awarded.awards_count FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id), 0)::integer AS awards_count,
+    (SELECT awarded.latest_award_year FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id) AS latest_award_year,
+    (SELECT awarded.award_symbol FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id) AS award_symbol,
     created_at,
     updated_at
   FROM catalog_wines
@@ -122,7 +125,7 @@ export class PgWineRepository implements WineRepository {
 
   async explore(): Promise<ExploreCatalog> {
     if (this.exploreCache && this.exploreCache.expiresAt > Date.now()) return this.exploreCache.value;
-    const [countries, regions, grapes, styles] = await Promise.all([
+    const [countries, regions, grapes, styles, awarded] = await Promise.all([
       this.pool.query(`
         SELECT country AS name, COUNT(*)::int AS count
         FROM catalog_wines WHERE length(btrim(country)) > 0
@@ -166,13 +169,14 @@ export class PgWineRepository implements WineRepository {
         WHERE COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), '')) IS NOT NULL
         GROUP BY 1 ORDER BY COUNT(*) DESC, 1 ASC LIMIT 20
       `),
+      this.pool.query(`SELECT COUNT(*)::int AS count FROM catalog_awarded_wines`),
     ]);
     const value = {
       countries: countries.rows.map(mapFacet),
       regions: regions.rows.map(mapFacet),
       grapes: grapes.rows.map(mapFacet),
       styles: styles.rows.map(mapFacet),
-      awarded: { ready: false, count: 0 },
+      awarded: { ready: true, count: Number(awarded.rows[0]?.count ?? 0) },
     };
     this.exploreCache = { value, expiresAt: Date.now() + 10 * 60 * 1000 };
     return value;
@@ -197,6 +201,8 @@ function buildWhere(query: WineListQuery) {
   addExactFilter("color", query.colour);
   addExactFilter("region", query.region);
   addExactFilter("wine_type", query.type);
+
+  if (query.awarded) clauses.push("EXISTS (SELECT 1 FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id)");
 
   if (query.grape) {
     params.push(query.grape);

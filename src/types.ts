@@ -35,6 +35,9 @@ export type Wine = {
   imageUrl?: string | null;
   sourceUrl?: string | null;
   reviewCount?: number;
+  awardsCount?: number;
+  latestAwardYear?: number | null;
+  awardSymbol?: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -74,6 +77,9 @@ export type WineRow = {
   image_url: string | null;
   source_url: string | null;
   review_count: number;
+  awards_count: number;
+  latest_award_year: number | null;
+  award_symbol: string | null;
   created_at: string | Date;
   updated_at: string | Date;
 };
@@ -85,6 +91,7 @@ export type WineListQuery = {
   grape?: string;
   type?: string;
   search?: string;
+  awarded?: boolean;
   page: number;
   limit: number;
 };

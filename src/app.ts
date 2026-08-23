@@ -310,6 +310,7 @@ function parseWineListQuery(query: Record<string, unknown>): WineListQuery {
     grape: asString(query.grape),
     type: asString(query.type),
     search: asString(query.search),
+    awarded: asString(query.awarded) === "true",
     page,
     limit,
   };

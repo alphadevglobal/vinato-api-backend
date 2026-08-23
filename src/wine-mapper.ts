@@ -38,6 +38,9 @@ export const mapWineRow = (row: WineRow): Wine => ({
   imageUrl: row.image_url,
   sourceUrl: row.source_url,
   reviewCount: row.review_count,
+  awardsCount: row.awards_count,
+  latestAwardYear: row.latest_award_year,
+  awardSymbol: row.award_symbol,
   createdAt: toIsoString(row.created_at),
   updatedAt: toIsoString(row.updated_at),
 });
