@@ -33,7 +33,7 @@ export class OpenRouterWineScanner implements WineScanner {
     if (primary.ok) return primary.payload;
 
     if (
-      shouldFallbackForInsufficientCredits(primary) &&
+      shouldTryFallback(primary) &&
       config.openRouterFallbackModel !== config.openRouterModel
     ) {
       const fallback = await callOpenRouter(
@@ -69,6 +69,7 @@ async function callOpenRouter(
     },
     body: JSON.stringify({
       model,
+      max_tokens: 2500,
       response_format: { type: "json_object" },
       messages: [
         {
@@ -94,9 +95,9 @@ async function callOpenRouter(
   }
 }
 
-function shouldFallbackForInsufficientCredits(result: OpenRouterResult) {
-  if (result.ok || result.status !== 402) return false;
-  return /insufficient credits/i.test(result.body);
+function shouldTryFallback(result: OpenRouterResult) {
+  if (result.ok) return false;
+  return [402, 404, 408, 429, 500, 502, 503, 504].includes(result.status);
 }
 
 function parseModelJson(content: unknown): Record<string, unknown> {
@@ -115,11 +116,17 @@ function parseModelJson(content: unknown): Record<string, unknown> {
             .join("")
         : "";
 
-  const cleaned = text
+  let cleaned = text
     .trim()
     .replace(/^```(?:json)?/i, "")
     .replace(/```$/i, "")
     .trim();
+
+  const objectStart = cleaned.indexOf("{");
+  const objectEnd = cleaned.lastIndexOf("}");
+  if (objectStart >= 0 && objectEnd > objectStart) {
+    cleaned = cleaned.slice(objectStart, objectEnd + 1);
+  }
 
   try {
     const parsed = JSON.parse(cleaned);
