@@ -101,6 +101,15 @@ export type AutocompleteWine = Pick<
   "id" | "lwin" | "displayName" | "country" | "colour" | "imageUrl" | "rating" | "grapes" | "reviewCount"
 >;
 
+export type ExploreFacet = { name: string; count: number; country?: string | null };
+export type ExploreCatalog = {
+  countries: ExploreFacet[];
+  regions: ExploreFacet[];
+  grapes: ExploreFacet[];
+  styles: ExploreFacet[];
+  awarded: { ready: boolean; count: number };
+};
+
 export type ScannedWineData = {
   displayName?: string | null;
   producerTitle?: string | null;
@@ -132,6 +141,7 @@ export type WineRepository = {
   autocomplete(term: string): Promise<AutocompleteWine[]>;
   findById(id: string): Promise<Wine | null>;
   findByLwin(lwin: string): Promise<Wine | null>;
+  explore(): Promise<ExploreCatalog>;
 };
 
 export type WineScanner = {

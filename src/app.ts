@@ -42,7 +42,7 @@ export function createApp(dependencies: AppDependencies) {
 
   app.use(cors());
   app.use(helmet({ contentSecurityPolicy: false }));
-  app.use(express.json({ limit: "1mb" }));
+  app.use(express.json({ limit: "3mb" }));
 
   app.get("/", (_req, res) => {
     res.send("Hello World!");
@@ -105,6 +105,43 @@ export function createApp(dependencies: AppDependencies) {
     asyncHandler(async (req, res) => {
       const { user } = await authenticated(req, dependencies);
       res.json(user);
+    }),
+  );
+
+  app.patch(
+    "/me/avatar",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      const avatarUrl = validateAvatar(req.body?.avatarUrl);
+      res.json(await accounts.updateAvatar(user.id, avatarUrl));
+    }),
+  );
+
+  app.get(
+    "/me/favorites",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      res.json(await accounts.getFavorites(user.id));
+    }),
+  );
+
+  app.put(
+    "/me/favorites/:wineId",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      if (!isUuid(req.params.wineId)) throw badRequest("ID do vinho inválido.");
+      if (!(await accounts.addFavorite(user.id, req.params.wineId))) throw notFound("Vinho não encontrado no catalog_wines.");
+      res.json({ wineId: req.params.wineId, favorite: true });
+    }),
+  );
+
+  app.delete(
+    "/me/favorites/:wineId",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      if (!isUuid(req.params.wineId)) throw badRequest("ID do vinho inválido.");
+      await accounts.removeFavorite(user.id, req.params.wineId);
+      res.status(204).send();
     }),
   );
 
@@ -173,6 +210,13 @@ export function createApp(dependencies: AppDependencies) {
     "/news",
     asyncHandler(async (_req, res) => {
       res.json(await requireAccounts(dependencies).getNews());
+    }),
+  );
+
+  app.get(
+    "/explore",
+    asyncHandler(async (_req, res) => {
+      res.json(await dependencies.wineRepository.explore());
     }),
   );
 
@@ -338,6 +382,15 @@ function requiredPassword(value: unknown) {
   const password = typeof value === "string" ? value : "";
   if (password.length < 8) throw badRequest("A senha deve ter pelo menos 8 caracteres.");
   return password;
+}
+
+function validateAvatar(value: unknown) {
+  if (value === null) return null;
+  if (typeof value !== "string" || !/^data:image\/(jpeg|png|webp);base64,[a-z0-9+/=]+$/i.test(value)) {
+    throw badRequest("Foto de perfil inválida.");
+  }
+  if (value.length > 2_500_000) throw badRequest("A foto de perfil deve ter no máximo 2 MB.");
+  return value;
 }
 
 function isUuid(value: string) {

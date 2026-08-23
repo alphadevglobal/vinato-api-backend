@@ -3,7 +3,7 @@ import type pg from "pg";
 
 const SESSION_DAYS = 30;
 
-export type PublicUser = { id: string; email: string; displayName: string; role: string };
+export type PublicUser = { id: string; email: string; displayName: string; role: string; avatarUrl: string | null };
 
 export class AccountRepository {
   constructor(private readonly pool: pg.Pool) {}
@@ -14,7 +14,7 @@ export class AccountRepository {
       const result = await this.pool.query(
         `INSERT INTO app_users (display_name, email, password_hash)
          VALUES ($1, $2, $3)
-         RETURNING id, email::text, display_name, role`,
+         RETURNING id, email::text, display_name, role, avatar_url`,
         [displayName.trim(), email.trim().toLowerCase(), passwordHash],
       );
       return this.createSession(mapUser(result.rows[0]));
@@ -27,7 +27,7 @@ export class AccountRepository {
   async login(email: string, password: string) {
     const normalizedEmail = email.trim().toLowerCase();
     const result = await this.pool.query(
-      `SELECT id, email::text, display_name, role, password_hash FROM app_users WHERE email = $1 LIMIT 1`,
+      `SELECT id, email::text, display_name, role, password_hash, avatar_url FROM app_users WHERE email = $1 LIMIT 1`,
       [normalizedEmail],
     );
     const row = result.rows[0];
@@ -61,7 +61,7 @@ export class AccountRepository {
          password_hash = EXCLUDED.password_hash,
          role = EXCLUDED.role,
          updated_at = now()
-       RETURNING id, email::text, display_name, role`,
+       RETURNING id, email::text, display_name, role, avatar_url`,
       [legacy.id, email, legacy.display_name, hashPassword(password), mapLegacyRole(legacy.role)],
     );
 
@@ -79,7 +79,7 @@ export class AccountRepository {
 
   async getUser(token: string): Promise<PublicUser | null> {
     const result = await this.pool.query(
-      `SELECT users.id, users.email::text, users.display_name, users.role
+      `SELECT users.id, users.email::text, users.display_name, users.role, users.avatar_url
        FROM user_sessions sessions
        JOIN app_users users ON users.id = sessions.user_id
        WHERE sessions.token_hash = $1 AND sessions.expires_at > now()
@@ -91,6 +91,48 @@ export class AccountRepository {
 
   async logout(token: string) {
     await this.pool.query(`DELETE FROM user_sessions WHERE token_hash = $1`, [tokenHash(token)]);
+  }
+
+  async updateAvatar(userId: string, avatarUrl: string | null) {
+    const result = await this.pool.query(
+      `UPDATE app_users SET avatar_url = $2, updated_at = now()
+       WHERE id = $1 RETURNING id, email::text, display_name, role, avatar_url`,
+      [userId, avatarUrl],
+    );
+    return mapUser(result.rows[0]);
+  }
+
+  async getFavorites(userId: string) {
+    const result = await this.pool.query(
+      `SELECT favorites.created_at, wines.id,
+              COALESCE(wines.scan_code, 'catalog-' || wines.id::text) AS lwin,
+              wines.display_name, wines.producer_manufacturer, wines.country, wines.region,
+              wines.color, wines.vintage, wines.grapes, wines.images
+       FROM user_favorites favorites
+       JOIN catalog_wines wines ON wines.id = favorites.wine_id
+       WHERE favorites.user_id = $1 ORDER BY favorites.created_at DESC`,
+      [userId],
+    );
+    return result.rows.map((row) => ({
+      favoritedAt: row.created_at,
+      wine: mapCatalogWine(row),
+    }));
+  }
+
+  async addFavorite(userId: string, wineId: string) {
+    const result = await this.pool.query(
+      `INSERT INTO user_favorites (user_id, wine_id)
+       SELECT $1, id FROM catalog_wines WHERE id = $2
+       ON CONFLICT (user_id, wine_id) DO NOTHING RETURNING wine_id`,
+      [userId, wineId],
+    );
+    if (result.rowCount) return true;
+    const exists = await this.pool.query(`SELECT 1 FROM catalog_wines WHERE id = $1`, [wineId]);
+    return Boolean(exists.rowCount);
+  }
+
+  async removeFavorite(userId: string, wineId: string) {
+    await this.pool.query(`DELETE FROM user_favorites WHERE user_id = $1 AND wine_id = $2`, [userId, wineId]);
   }
 
   async getCellar(userId: string) {
@@ -110,13 +152,7 @@ export class AccountRepository {
       quantity: row.quantity,
       addedAt: row.added_at,
       updatedAt: row.updated_at,
-      wine: {
-        id: row.id, lwin: row.lwin, displayName: row.display_name,
-        producerName: row.producer_manufacturer, country: row.country, region: row.region,
-        colour: row.color, vintageYear: row.vintage,
-        rating: null, grapes: Array.isArray(row.grapes) ? row.grapes.join(", ") : null,
-        imageUrl: firstImage(row.images), imagePath: null,
-      },
+      wine: mapCatalogWine(row),
     }));
   }
 
@@ -186,7 +222,7 @@ export class AccountRepository {
 }
 
 function mapUser(row: Record<string, unknown>): PublicUser {
-  return { id: String(row.id), email: String(row.email), displayName: String(row.display_name), role: String(row.role) };
+  return { id: String(row.id), email: String(row.email), displayName: String(row.display_name), role: String(row.role), avatarUrl: typeof row.avatar_url === "string" ? row.avatar_url : null };
 }
 function tokenHash(token: string) { return createHash("sha256").update(token).digest("hex"); }
 function hashPassword(password: string) {
@@ -236,4 +272,18 @@ function firstImage(value: unknown) {
     return typeof url === "string" && url ? url : null;
   }
   return null;
+}
+
+function mapCatalogWine(row: Record<string, unknown>) {
+  return {
+    id: String(row.id), lwin: String(row.lwin), displayName: String(row.display_name),
+    producerName: typeof row.producer_manufacturer === "string" ? row.producer_manufacturer : null,
+    country: typeof row.country === "string" ? row.country : null,
+    region: typeof row.region === "string" ? row.region : null,
+    colour: typeof row.color === "string" ? row.color : null,
+    vintageYear: typeof row.vintage === "number" ? row.vintage : null,
+    rating: null,
+    grapes: Array.isArray(row.grapes) ? row.grapes.map((item) => typeof item === "string" ? item : item && typeof item === "object" && "name" in item ? String((item as { name: unknown }).name) : "").filter(Boolean).join(", ") : null,
+    imageUrl: firstImage(row.images), imagePath: null,
+  };
 }

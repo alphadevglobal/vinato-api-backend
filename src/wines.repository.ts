@@ -1,5 +1,6 @@
 import type {
   AutocompleteWine,
+  ExploreCatalog,
   PaginatedWines,
   Wine,
   WineListQuery,
@@ -55,6 +56,8 @@ const baseSelect = `
 `;
 
 export class PgWineRepository implements WineRepository {
+  private exploreCache?: { value: ExploreCatalog; expiresAt: number };
+
   constructor(private readonly pool: pg.Pool) {}
 
   async findAll(query: WineListQuery): Promise<PaginatedWines> {
@@ -116,6 +119,57 @@ export class PgWineRepository implements WineRepository {
 
     return result.rows[0] ? mapWineRow(result.rows[0]) : null;
   }
+
+  async explore(): Promise<ExploreCatalog> {
+    if (this.exploreCache && this.exploreCache.expiresAt > Date.now()) return this.exploreCache.value;
+    const [countries, regions, grapes, styles] = await Promise.all([
+      this.pool.query(`
+        SELECT country AS name, COUNT(*)::int AS count
+        FROM catalog_wines WHERE length(btrim(country)) > 0
+        GROUP BY country ORDER BY COUNT(*) DESC, country ASC LIMIT 30
+      `),
+      this.pool.query(`
+        SELECT region AS name, country, COUNT(*)::int AS count
+        FROM catalog_wines WHERE length(btrim(region)) > 0
+        GROUP BY region, country ORDER BY COUNT(*) DESC, region ASC LIMIT 60
+      `),
+      this.pool.query(`
+        SELECT grape.name, COUNT(*)::int AS count
+        FROM catalog_wines wines
+        CROSS JOIN LATERAL (
+          SELECT CASE
+            WHEN jsonb_typeof(item) = 'object' THEN item->>'name'
+            WHEN jsonb_typeof(item) = 'string' THEN item#>>'{}'
+          END AS name
+          FROM jsonb_array_elements(
+            CASE WHEN jsonb_typeof(wines.grapes) = 'array' THEN wines.grapes ELSE '[]'::jsonb END
+          ) item
+        ) grape
+        WHERE length(btrim(grape.name)) > 0
+        GROUP BY grape.name ORDER BY COUNT(*) DESC, grape.name ASC LIMIT 60
+      `),
+      this.pool.query(`
+        SELECT COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), '')) AS name,
+               COUNT(*)::int AS count
+        FROM catalog_wines
+        WHERE COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), '')) IS NOT NULL
+        GROUP BY 1 ORDER BY COUNT(*) DESC, 1 ASC LIMIT 20
+      `),
+    ]);
+    const value = {
+      countries: countries.rows.map(mapFacet),
+      regions: regions.rows.map(mapFacet),
+      grapes: grapes.rows.map(mapFacet),
+      styles: styles.rows.map(mapFacet),
+      awarded: { ready: false, count: 0 },
+    };
+    this.exploreCache = { value, expiresAt: Date.now() + 10 * 60 * 1000 };
+    return value;
+  }
+}
+
+function mapFacet(row: Record<string, unknown>) {
+  return { name: String(row.name), count: Number(row.count), ...(row.country ? { country: String(row.country) } : {}) };
 }
 
 function buildWhere(query: WineListQuery) {

@@ -61,6 +61,16 @@ class MemoryWineRepository implements WineRepository {
   async findByLwin(lwin: string): Promise<Wine | null> {
     return this.wines.find((wine) => wine.lwin === lwin) ?? null;
   }
+
+  async explore() {
+    return {
+      countries: [{ name: "France", count: 2 }],
+      regions: [{ name: "Bordeaux", country: "France", count: 2 }],
+      grapes: [{ name: "Cabernet Sauvignon", count: 1 }],
+      styles: [{ name: "Red", count: 2 }],
+      awarded: { ready: false, count: 0 },
+    };
+  }
 }
 
 class StubWineScanner implements WineScanner {
@@ -170,6 +180,12 @@ describe("Wine API", () => {
     expect(Object.keys(response.body[0]).sort()).toEqual(
       ["colour", "country", "displayName", "id", "lwin"].sort(),
     );
+  });
+
+  it("exposes catalog-backed explore facets", async () => {
+    const response = await request(app).get("/explore").expect(200);
+    expect(response.body.regions[0]).toEqual({ name: "Bordeaux", country: "France", count: 2 });
+    expect(response.body.awarded.ready).toBe(false);
   });
 
   it("finds a wine by LWIN", async () => {
