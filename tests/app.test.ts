@@ -20,6 +20,7 @@ class MemoryWineRepository implements WineRepository {
       .filter((wine) => matches(wine.country, query.country))
       .filter((wine) => matches(wine.colour, query.colour))
       .filter((wine) => matches(wine.region, query.region))
+      .filter((wine) => query.grape ? wine.grapes?.toLowerCase().split(",").map((grape) => grape.trim()).includes(query.grape.toLowerCase()) : true)
       .filter((wine) => matches(wine.type, query.type))
       .filter((wine) =>
         query.search
@@ -65,7 +66,7 @@ class MemoryWineRepository implements WineRepository {
   async explore() {
     return {
       countries: [{ name: "France", count: 2 }],
-      regions: [{ name: "Bordeaux", country: "France", count: 2 }],
+      regions: [{ name: "Bordeaux", country: "France", count: 2, imageUrl: "https://example.com/bordeaux.jpg" }],
       grapes: [{ name: "Cabernet Sauvignon", count: 1 }],
       styles: [{ name: "Red", count: 2 }],
       awarded: { ready: false, count: 0 },
@@ -161,6 +162,16 @@ describe("Wine API", () => {
     ).toBe(true);
   });
 
+  it("filters wines by grape", async () => {
+    const grapeApp = createApp({
+      wineRepository: new MemoryWineRepository([{ ...seedWines[0], grapes: "Cabernet Sauvignon, Merlot" }]),
+      wineScanner: new StubWineScanner(),
+    });
+    const response = await request(grapeApp).get("/wines?grape=Cabernet%20Sauvignon&limit=10").expect(200);
+    expect(response.body.total).toBeGreaterThan(0);
+    expect(response.body.data.every((wine: Wine) => wine.grapes?.includes("Cabernet Sauvignon"))).toBe(true);
+  });
+
   it("validates pagination like the reference API", async () => {
     const response = await request(app).get("/wines?limit=200").expect(400);
 
@@ -184,7 +195,7 @@ describe("Wine API", () => {
 
   it("exposes catalog-backed explore facets", async () => {
     const response = await request(app).get("/explore").expect(200);
-    expect(response.body.regions[0]).toEqual({ name: "Bordeaux", country: "France", count: 2 });
+    expect(response.body.regions[0]).toEqual({ name: "Bordeaux", country: "France", count: 2, imageUrl: "https://example.com/bordeaux.jpg" });
     expect(response.body.awarded.ready).toBe(false);
   });
 

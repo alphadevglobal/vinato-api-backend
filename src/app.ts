@@ -307,6 +307,7 @@ function parseWineListQuery(query: Record<string, unknown>): WineListQuery {
     country: asString(query.country),
     colour: asString(query.colour),
     region: asString(query.region),
+    grape: asString(query.grape),
     type: asString(query.type),
     search: asString(query.search),
     page,

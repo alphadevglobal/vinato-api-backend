@@ -12,12 +12,13 @@ export const openApiDocument = {
     "/wines": {
       get: {
         description:
-          "Retorna uma lista paginada de vinhos com filtros opcionais por país, cor, região, tipo e nome.",
+          "Retorna uma lista paginada de vinhos com filtros opcionais por país, cor, região, uva, tipo e nome.",
         operationId: "WineController_findAll",
         parameters: [
           queryParam("country", "Filtrar por país", "France"),
           queryParam("colour", "Filtrar por cor do vinho", "Red"),
           queryParam("region", "Filtrar por região", "Bordeaux"),
+          queryParam("grape", "Filtrar por variedade de uva", "Merlot"),
           queryParam("type", "Filtrar por tipo", "Still"),
           queryParam("search", "Termo de busca por nome", "Margaux"),
           {

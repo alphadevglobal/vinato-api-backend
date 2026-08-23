@@ -126,12 +126,23 @@ export class PgWineRepository implements WineRepository {
       this.pool.query(`
         SELECT country AS name, COUNT(*)::int AS count
         FROM catalog_wines WHERE length(btrim(country)) > 0
-        GROUP BY country ORDER BY COUNT(*) DESC, country ASC LIMIT 30
+        GROUP BY country ORDER BY COUNT(*) DESC, country ASC LIMIT 100
       `),
       this.pool.query(`
-        SELECT region AS name, country, COUNT(*)::int AS count
-        FROM catalog_wines WHERE length(btrim(region)) > 0
-        GROUP BY region, country ORDER BY COUNT(*) DESC, region ASC LIMIT 60
+        WITH region_counts AS (
+          SELECT region AS name, country, COUNT(*)::int AS count,
+                 MAX(CASE
+                   WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 AND jsonb_typeof(images->0) = 'string' AND images->>0 NOT ILIKE '%logo%' THEN images->>0
+                   WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 AND COALESCE(images->0->>'url', images->0->>'image_url') NOT ILIKE '%logo%' THEN COALESCE(images->0->>'url', images->0->>'image_url')
+                 END) AS image_url
+          FROM catalog_wines WHERE length(btrim(region)) > 0 AND length(btrim(country)) > 0
+          GROUP BY region, country
+        ), ranked AS (
+          SELECT *, ROW_NUMBER() OVER (PARTITION BY country ORDER BY count DESC, name ASC) AS position
+          FROM region_counts
+        )
+        SELECT name, country, count, image_url FROM ranked
+        WHERE position <= 4 ORDER BY count DESC, name ASC
       `),
       this.pool.query(`
         SELECT grape.name, COUNT(*)::int AS count
@@ -169,7 +180,7 @@ export class PgWineRepository implements WineRepository {
 }
 
 function mapFacet(row: Record<string, unknown>) {
-  return { name: String(row.name), count: Number(row.count), ...(row.country ? { country: String(row.country) } : {}) };
+  return { name: String(row.name), count: Number(row.count), ...(row.country ? { country: String(row.country) } : {}), ...(row.image_url ? { imageUrl: String(row.image_url) } : {}) };
 }
 
 function buildWhere(query: WineListQuery) {
@@ -186,6 +197,19 @@ function buildWhere(query: WineListQuery) {
   addExactFilter("color", query.colour);
   addExactFilter("region", query.region);
   addExactFilter("wine_type", query.type);
+
+  if (query.grape) {
+    params.push(query.grape);
+    clauses.push(`EXISTS (
+      SELECT 1 FROM jsonb_array_elements(
+        CASE WHEN jsonb_typeof(grapes) = 'array' THEN grapes ELSE '[]'::jsonb END
+      ) grape
+      WHERE lower(CASE
+        WHEN jsonb_typeof(grape) = 'object' THEN grape->>'name'
+        WHEN jsonb_typeof(grape) = 'string' THEN grape#>>'{}'
+      END) = lower($${params.length})
+    )`);
+  }
 
   if (query.search) {
     params.push(`%${query.search}%`);

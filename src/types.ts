@@ -82,6 +82,7 @@ export type WineListQuery = {
   country?: string;
   colour?: string;
   region?: string;
+  grape?: string;
   type?: string;
   search?: string;
   page: number;
@@ -101,7 +102,7 @@ export type AutocompleteWine = Pick<
   "id" | "lwin" | "displayName" | "country" | "colour" | "imageUrl" | "rating" | "grapes" | "reviewCount"
 >;
 
-export type ExploreFacet = { name: string; count: number; country?: string | null };
+export type ExploreFacet = { name: string; count: number; country?: string | null; imageUrl?: string | null };
 export type ExploreCatalog = {
   countries: ExploreFacet[];
   regions: ExploreFacet[];
