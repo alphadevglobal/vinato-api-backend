@@ -6,6 +6,7 @@ import swaggerUi from "swagger-ui-express";
 import { badRequest, HttpError, internalServerError, notFound } from "./http-error.js";
 import { openApiDocument } from "./openapi.js";
 import type { AppDependencies, AsyncRequestHandler, WineListQuery } from "./types.js";
+import { verifySocialToken, type SocialProvider } from "./social-auth.js";
 
 const require = createRequire(import.meta.url);
 const helmet = require("helmet") as (options?: { contentSecurityPolicy?: boolean }) => RequestHandler;
@@ -94,9 +95,34 @@ export function createApp(dependencies: AppDependencies) {
     "/auth/login",
     asyncHandler(async (req, res) => {
       const accounts = requireAccounts(dependencies);
-      const result = await accounts.login(requiredEmail(req.body?.email), requiredPassword(req.body?.password));
+      let result;
+      try { result = await accounts.login(requiredEmail(req.body?.email), requiredPassword(req.body?.password)); }
+      catch (error) {
+        if ((error as Error).message === "ACCOUNT_BLOCKED") throw new HttpError(403, "Esta conta está bloqueada. Fale com o suporte VINATO.", "Forbidden");
+        throw error;
+      }
       if (!result) throw new HttpError(401, "E-mail ou senha incorretos.", "Unauthorized");
       res.json(result);
+    }),
+  );
+
+  app.post(
+    "/auth/social",
+    asyncHandler(async (req, res) => {
+      const accounts = requireAccounts(dependencies);
+      const provider = req.body?.provider;
+      if (provider !== "apple" && provider !== "google") throw badRequest("Provedor social inválido.");
+      const idToken = requiredToken(req.body?.idToken);
+      try {
+        const identity = await verifySocialToken(provider as SocialProvider, idToken);
+        if (!identity.emailVerified) throw new Error("UNVERIFIED_SOCIAL_EMAIL");
+        res.json(await accounts.socialLogin(provider, identity.subject, identity.email, asString(req.body?.displayName)));
+      } catch (error) {
+        const code = (error as Error).message;
+        if (code === "ACCOUNT_BLOCKED") throw new HttpError(403, "Esta conta está bloqueada. Fale com o suporte VINATO.", "Forbidden");
+        if (code === "GOOGLE_AUTH_NOT_CONFIGURED") throw new HttpError(503, "Login Google aguardando configuração.", "Service Unavailable");
+        throw new HttpError(401, "Não foi possível validar sua identidade.", "Unauthorized");
+      }
     }),
   );
 
@@ -158,6 +184,7 @@ export function createApp(dependencies: AppDependencies) {
     "/me/cellar",
     asyncHandler(async (req, res) => {
       const { accounts, user } = await authenticated(req, dependencies);
+      requirePremium(user);
       res.json(await accounts.getCellar(user.id));
     }),
   );
@@ -166,6 +193,7 @@ export function createApp(dependencies: AppDependencies) {
     "/me/cellar/:wineId",
     asyncHandler(async (req, res) => {
       const { accounts, user } = await authenticated(req, dependencies);
+      requirePremium(user);
       if (!isUuid(req.params.wineId)) throw badRequest("ID do vinho inválido.");
       const quantity = Number(req.body?.quantity);
       if (!Number.isInteger(quantity) || quantity < 0 || quantity > 9999) throw badRequest("Quantidade inválida.");
@@ -210,6 +238,32 @@ export function createApp(dependencies: AppDependencies) {
     "/news",
     asyncHandler(async (_req, res) => {
       res.json(await requireAccounts(dependencies).getNews());
+    }),
+  );
+
+  app.get(
+    "/admin/users",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      requireAdministrator(user);
+      res.json(await accounts.listUsers());
+    }),
+  );
+
+  app.patch(
+    "/admin/users/:userId/access",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      requireAdministrator(user);
+      if (!isUuid(req.params.userId)) throw badRequest("ID do usuário inválido.");
+      const status = req.body?.status;
+      const plan = req.body?.plan;
+      if (status !== undefined && !["active", "suspended", "banned"].includes(status)) throw badRequest("Status inválido.");
+      if (plan !== undefined && plan !== "free" && plan !== "premium") throw badRequest("Plano inválido.");
+      if (status === undefined && plan === undefined) throw badRequest("Informe status ou plano.");
+      const updated = await accounts.updateAccess(req.params.userId, { status, plan });
+      if (!updated) throw notFound("Usuário não encontrado.");
+      res.json(updated);
     }),
   );
 
@@ -384,6 +438,19 @@ function requiredPassword(value: unknown) {
   const password = typeof value === "string" ? value : "";
   if (password.length < 8) throw badRequest("A senha deve ter pelo menos 8 caracteres.");
   return password;
+}
+
+function requiredToken(value: unknown) {
+  if (typeof value !== "string" || value.length < 20) throw badRequest("Token de identidade inválido.");
+  return value;
+}
+
+function requirePremium(user: { plan: string }) {
+  if (user.plan !== "premium") throw new HttpError(403, "Recurso exclusivo do VINATO Premium.", "Forbidden");
+}
+
+function requireAdministrator(user: { role: string }) {
+  if (user.role !== "owner" && user.role !== "editor") throw new HttpError(403, "Acesso administrativo necessário.", "Forbidden");
 }
 
 function validateAvatar(value: unknown) {

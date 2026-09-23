@@ -3,7 +3,7 @@ import type pg from "pg";
 
 const SESSION_DAYS = 30;
 
-export type PublicUser = { id: string; email: string; displayName: string; role: string; avatarUrl: string | null };
+export type PublicUser = { id: string; email: string; displayName: string; role: string; plan: "free" | "premium"; status: string; avatarUrl: string | null };
 
 export class AccountRepository {
   constructor(private readonly pool: pg.Pool) {}
@@ -14,7 +14,7 @@ export class AccountRepository {
       const result = await this.pool.query(
         `INSERT INTO app_users (display_name, email, password_hash)
          VALUES ($1, $2, $3)
-         RETURNING id, email::text, display_name, role, avatar_url`,
+         RETURNING id, email::text, display_name, role, plan, status, avatar_url`,
         [displayName.trim(), email.trim().toLowerCase(), passwordHash],
       );
       return this.createSession(mapUser(result.rows[0]));
@@ -27,11 +27,12 @@ export class AccountRepository {
   async login(email: string, password: string) {
     const normalizedEmail = email.trim().toLowerCase();
     const result = await this.pool.query(
-      `SELECT id, email::text, display_name, role, password_hash, avatar_url FROM app_users WHERE email = $1 LIMIT 1`,
+      `SELECT id, email::text, display_name, role, plan, status, password_hash, avatar_url FROM app_users WHERE email = $1 LIMIT 1`,
       [normalizedEmail],
     );
     const row = result.rows[0];
     if (row) {
+      if (row.status !== "active") throw new Error("ACCOUNT_BLOCKED");
       if (!verifyPassword(password, row.password_hash)) return null;
       return this.createSession(mapUser(row));
     }
@@ -61,7 +62,7 @@ export class AccountRepository {
          password_hash = EXCLUDED.password_hash,
          role = EXCLUDED.role,
          updated_at = now()
-       RETURNING id, email::text, display_name, role, avatar_url`,
+       RETURNING id, email::text, display_name, role, plan, status, avatar_url`,
       [legacy.id, email, legacy.display_name, hashPassword(password), mapLegacyRole(legacy.role)],
     );
 
@@ -77,12 +78,56 @@ export class AccountRepository {
     return this.createSession(mapUser(migrated.rows[0]));
   }
 
+  async socialLogin(provider: "apple" | "google", subject: string, email: string, displayName?: string) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const identity = await client.query(
+        `SELECT users.id, users.email::text, users.display_name, users.role, users.plan, users.status, users.avatar_url
+         FROM user_identities identities JOIN app_users users ON users.id = identities.user_id
+         WHERE identities.provider = $1 AND identities.provider_subject = $2 LIMIT 1`,
+        [provider, subject],
+      );
+      let row = identity.rows[0];
+      if (!row) {
+        const existing = await client.query(
+          `SELECT id, email::text, display_name, role, plan, status, avatar_url FROM app_users WHERE email = $1 LIMIT 1`,
+          [email.toLowerCase()],
+        );
+        if (existing.rows[0]) row = existing.rows[0];
+        else {
+          const created = await client.query(
+            `INSERT INTO app_users (email, display_name, password_hash, role, plan, status)
+             VALUES ($1, $2, $3, 'user', 'free', 'active')
+             RETURNING id, email::text, display_name, role, plan, status, avatar_url`,
+            [email.toLowerCase(), displayName?.trim() || email.split("@")[0], `social:${provider}`],
+          );
+          row = created.rows[0];
+        }
+        await client.query(
+          `INSERT INTO user_identities (provider, provider_subject, user_id, provider_email)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (provider, provider_subject) DO UPDATE SET provider_email = EXCLUDED.provider_email, updated_at = now()`,
+          [provider, subject, row.id, email.toLowerCase()],
+        );
+      }
+      if (row.status !== "active") throw new Error("ACCOUNT_BLOCKED");
+      await client.query("COMMIT");
+      return this.createSession(mapUser(row));
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async getUser(token: string): Promise<PublicUser | null> {
     const result = await this.pool.query(
-      `SELECT users.id, users.email::text, users.display_name, users.role, users.avatar_url
+      `SELECT users.id, users.email::text, users.display_name, users.role, users.plan, users.status, users.avatar_url
        FROM user_sessions sessions
        JOIN app_users users ON users.id = sessions.user_id
-       WHERE sessions.token_hash = $1 AND sessions.expires_at > now()
+       WHERE sessions.token_hash = $1 AND sessions.expires_at > now() AND users.status = 'active'
        LIMIT 1`,
       [tokenHash(token)],
     );
@@ -96,7 +141,7 @@ export class AccountRepository {
   async updateAvatar(userId: string, avatarUrl: string | null) {
     const result = await this.pool.query(
       `UPDATE app_users SET avatar_url = $2, updated_at = now()
-       WHERE id = $1 RETURNING id, email::text, display_name, role, avatar_url`,
+       WHERE id = $1 RETURNING id, email::text, display_name, role, plan, status, avatar_url`,
       [userId, avatarUrl],
     );
     return mapUser(result.rows[0]);
@@ -198,6 +243,30 @@ export class AccountRepository {
     await this.pool.query(`DELETE FROM user_scan_history WHERE user_id = $1`, [userId]);
   }
 
+  async listUsers() {
+    const result = await this.pool.query(
+      `SELECT id, email::text, display_name, role, plan, status, avatar_url, created_at, updated_at
+       FROM app_users ORDER BY created_at DESC LIMIT 500`,
+    );
+    return result.rows.map((row) => ({ ...mapUser(row), createdAt: row.created_at, updatedAt: row.updated_at }));
+  }
+
+  async updateAccess(userId: string, access: { status?: "active" | "suspended" | "banned"; plan?: "free" | "premium" }) {
+    const result = await this.pool.query(
+      `UPDATE app_users SET status = COALESCE($2, status), plan = COALESCE($3, plan), updated_at = now()
+       WHERE id = $1 RETURNING id, email::text, display_name, role, plan, status, avatar_url`,
+      [userId, access.status ?? null, access.plan ?? null],
+    );
+    if (!result.rows[0]) return null;
+    if (access.status && access.status !== "active") await this.pool.query(`DELETE FROM user_sessions WHERE user_id = $1`, [userId]);
+    await this.pool.query(
+      `UPDATE users SET status = CASE WHEN $2 = 'banned' THEN 'deleted' ELSE COALESCE($2, status) END, updated_at = now()
+       WHERE id = $1`,
+      [userId, access.status ?? null],
+    );
+    return mapUser(result.rows[0]);
+  }
+
   async getNews() {
     const result = await this.pool.query(
       `SELECT id, title, summary, image_url, link_url, published_at
@@ -222,7 +291,7 @@ export class AccountRepository {
 }
 
 function mapUser(row: Record<string, unknown>): PublicUser {
-  return { id: String(row.id), email: String(row.email), displayName: String(row.display_name), role: String(row.role), avatarUrl: typeof row.avatar_url === "string" ? row.avatar_url : null };
+  return { id: String(row.id), email: String(row.email), displayName: String(row.display_name), role: String(row.role), plan: row.plan === "premium" ? "premium" : "free", status: String(row.status ?? "active"), avatarUrl: typeof row.avatar_url === "string" ? row.avatar_url : null };
 }
 function tokenHash(token: string) { return createHash("sha256").update(token).digest("hex"); }
 function hashPassword(password: string) {
