@@ -2,10 +2,9 @@ ALTER TABLE app_users
   ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active',
   ADD COLUMN IF NOT EXISTS plan text NOT NULL DEFAULT 'free';
 
-DO $$ BEGIN
-  ALTER TABLE app_users ADD CONSTRAINT app_users_status_check
-    CHECK (status IN ('active', 'suspended', 'banned'));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+UPDATE app_users SET status = 'blocked' WHERE status <> 'active';
+ALTER TABLE app_users DROP CONSTRAINT IF EXISTS app_users_status_check;
+ALTER TABLE app_users ADD CONSTRAINT app_users_status_check CHECK (status IN ('active', 'blocked'));
 
 DO $$ BEGIN
   ALTER TABLE app_users ADD CONSTRAINT app_users_plan_check
@@ -36,11 +35,7 @@ BEGIN
            WHEN NEW.role = 'editor' THEN 'editor'
            ELSE 'user'
          END,
-         status = CASE
-           WHEN NEW.status = 'active' THEN 'active'
-           WHEN NEW.status = 'suspended' THEN 'suspended'
-           ELSE 'banned'
-         END,
+         status = CASE WHEN NEW.status = 'active' THEN 'active' ELSE 'blocked' END,
          updated_at = now()
    WHERE id = NEW.id OR lower(email::text) = lower(NEW.email);
   RETURN NEW;
@@ -53,7 +48,7 @@ AFTER INSERT OR UPDATE OF email, display_name, avatar_url, role, status ON users
 FOR EACH ROW EXECUTE FUNCTION sync_admin_user_to_app_user();
 
 UPDATE app_users app
-SET status = CASE WHEN admin.status = 'active' THEN 'active' WHEN admin.status = 'suspended' THEN 'suspended' ELSE 'banned' END,
+SET status = CASE WHEN admin.status = 'active' THEN 'active' ELSE 'blocked' END,
     role = CASE WHEN admin.role IN ('super_admin', 'admin', 'owner') THEN 'owner' WHEN admin.role = 'editor' THEN 'editor' ELSE 'user' END,
     updated_at = now()
 FROM users admin

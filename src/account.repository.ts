@@ -251,16 +251,16 @@ export class AccountRepository {
     return result.rows.map((row) => ({ ...mapUser(row), createdAt: row.created_at, updatedAt: row.updated_at }));
   }
 
-  async updateAccess(userId: string, access: { status?: "active" | "suspended" | "banned"; plan?: "free" | "premium" }) {
+  async updateAccess(userId: string, access: { status?: "active" | "blocked"; plan?: "free" | "premium" }) {
     const result = await this.pool.query(
       `UPDATE app_users SET status = COALESCE($2, status), plan = COALESCE($3, plan), updated_at = now()
        WHERE id = $1 RETURNING id, email::text, display_name, role, plan, status, avatar_url`,
       [userId, access.status ?? null, access.plan ?? null],
     );
     if (!result.rows[0]) return null;
-    if (access.status && access.status !== "active") await this.pool.query(`DELETE FROM user_sessions WHERE user_id = $1`, [userId]);
+    if (access.status === "blocked") await this.pool.query(`DELETE FROM user_sessions WHERE user_id = $1`, [userId]);
     await this.pool.query(
-      `UPDATE users SET status = CASE WHEN $2 = 'banned' THEN 'deleted' ELSE COALESCE($2, status) END, updated_at = now()
+      `UPDATE users SET status = CASE WHEN $2 = 'blocked' THEN 'suspended' ELSE COALESCE($2, status) END, updated_at = now()
        WHERE id = $1`,
       [userId, access.status ?? null],
     );

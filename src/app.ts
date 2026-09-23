@@ -256,11 +256,12 @@ export function createApp(dependencies: AppDependencies) {
       const { accounts, user } = await authenticated(req, dependencies);
       requireAdministrator(user);
       if (!isUuid(req.params.userId)) throw badRequest("ID do usuário inválido.");
-      const status = req.body?.status;
+      const requestedStatus = req.body?.status;
       const plan = req.body?.plan;
-      if (status !== undefined && !["active", "suspended", "banned"].includes(status)) throw badRequest("Status inválido.");
+      if (requestedStatus !== undefined && !["active", "blocked", "suspended", "banned"].includes(requestedStatus)) throw badRequest("Status inválido.");
       if (plan !== undefined && plan !== "free" && plan !== "premium") throw badRequest("Plano inválido.");
-      if (status === undefined && plan === undefined) throw badRequest("Informe status ou plano.");
+      if (requestedStatus === undefined && plan === undefined) throw badRequest("Informe status ou plano.");
+      const status = requestedStatus === undefined ? undefined : requestedStatus === "active" ? "active" : "blocked";
       const updated = await accounts.updateAccess(req.params.userId, { status, plan });
       if (!updated) throw notFound("Usuário não encontrado.");
       res.json(updated);
