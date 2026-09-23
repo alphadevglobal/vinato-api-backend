@@ -142,6 +142,9 @@ export type ScannedWineData = {
 export type ScanWineLabelResult = {
   data: ScannedWineData;
   success: true;
+  catalog?:
+    | { status: "matched"; wineId: string; imageAdded: boolean }
+    | { status: "needs_registration"; code: string };
 };
 
 export type WineRepository = {
@@ -150,6 +153,9 @@ export type WineRepository = {
   findById(id: string): Promise<Wine | null>;
   findByLwin(lwin: string): Promise<Wine | null>;
   explore(): Promise<ExploreCatalog>;
+  reconcileScan?(data: ScannedWineData, file: Express.Multer.File, userId?: string): Promise<NonNullable<ScanWineLabelResult["catalog"]>>;
+  listUnlistedScans?(): Promise<unknown[]>;
+  reviewUnlistedScan?(code: string, status: "reviewing" | "registered" | "rejected", registeredWineId?: string): Promise<unknown | null>;
 };
 
 export type WineScanner = {

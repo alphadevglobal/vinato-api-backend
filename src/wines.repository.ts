@@ -6,6 +6,8 @@ import type {
   WineListQuery,
   WineRepository,
   WineRow,
+  ScannedWineData,
+  ScanWineLabelResult,
 } from "./types.js";
 import { mapWineRow } from "./wine-mapper.js";
 import type pg from "pg";
@@ -74,6 +76,65 @@ export class PgWineRepository implements WineRepository {
   private exploreCache?: { value: ExploreCatalog; expiresAt: number };
 
   constructor(private readonly pool: pg.Pool) {}
+
+  async reconcileScan(data: ScannedWineData, file: Express.Multer.File, userId?: string): Promise<NonNullable<ScanWineLabelResult["catalog"]>> {
+    const query = [data.displayName, data.producerName, data.wine, data.vintage].filter(Boolean).join(" ").trim();
+    const vintage = Number(data.vintage);
+    const match = query ? await this.pool.query<{ id: string; images: unknown; score: string }>(
+      `SELECT id, images,
+              greatest(similarity(lower(display_name), lower($1)), similarity(normalized_search, lower($1)))
+              + CASE WHEN $2::text IS NOT NULL AND lower(country) = lower($2) THEN 0.10 ELSE 0 END
+              + CASE WHEN $3::smallint IS NOT NULL AND vintage = $3 THEN 0.12 ELSE 0 END AS score
+       FROM catalog_wines
+       WHERE normalized_search % lower($1) OR lower(display_name) % lower($1)
+       ORDER BY score DESC LIMIT 1`,
+      [query, data.country ?? null, Number.isInteger(vintage) && vintage > 1800 && vintage < 2200 ? vintage : null],
+    ) : { rows: [] };
+    const candidate = match.rows[0];
+    const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
+    if (candidate && Number(candidate.score) >= 0.48) {
+      const hasImage = Array.isArray(candidate.images) && candidate.images.length > 0;
+      if (!hasImage) {
+        await this.pool.query(
+          `UPDATE catalog_wines SET images = jsonb_build_array(jsonb_build_object(
+             'url', $2, 'source', 'user_scan', 'review_status', 'pending', 'captured_at', now()
+           )), updated_at = now()
+           WHERE id = $1 AND (images IS NULL OR images = '[]'::jsonb)`,
+          [candidate.id, imageDataUrl],
+        );
+      }
+      return { status: "matched", wineId: candidate.id, imageAdded: !hasImage };
+    }
+
+    const result = await this.pool.query<{ unlisted_code: string }>(
+      `INSERT INTO unlisted_wine_scans (unlisted_code, image_data_url, extracted_data, user_id)
+       VALUES ('VINATO-UNLISTED-' || to_char(now(), 'YYYYMMDD') || '-' || upper(encode(gen_random_bytes(4), 'hex')), $1, $2::jsonb, $3)
+       RETURNING unlisted_code`,
+      [imageDataUrl, JSON.stringify(data), userId ?? null],
+    );
+    return { status: "needs_registration", code: result.rows[0].unlisted_code };
+  }
+
+  async listUnlistedScans() {
+    const result = await this.pool.query(
+      `SELECT unlisted_code AS code, status, image_data_url AS "imageUrl", extracted_data AS "extractedData",
+              user_id AS "userId", registered_wine_id AS "registeredWineId", admin_notes AS "adminNotes",
+              created_at AS "createdAt", reviewed_at AS "reviewedAt"
+       FROM unlisted_wine_scans ORDER BY (status = 'needs_registration') DESC, created_at DESC LIMIT 500`,
+    );
+    return result.rows;
+  }
+
+  async reviewUnlistedScan(code: string, status: "reviewing" | "registered" | "rejected", registeredWineId?: string) {
+    const result = await this.pool.query(
+      `UPDATE unlisted_wine_scans
+       SET status = $2, registered_wine_id = $3, reviewed_at = now()
+       WHERE unlisted_code = $1
+       RETURNING unlisted_code AS code, status, registered_wine_id AS "registeredWineId", reviewed_at AS "reviewedAt"`,
+      [code, status, registeredWineId ?? null],
+    );
+    return result.rows[0] ?? null;
+  }
 
   async findAll(query: WineListQuery): Promise<PaginatedWines> {
     const { whereSql, params } = buildWhere(query);

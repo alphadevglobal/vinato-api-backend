@@ -269,6 +269,33 @@ export function createApp(dependencies: AppDependencies) {
   );
 
   app.get(
+    "/admin/unlisted-wines",
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      requireAdministrator(user);
+      if (!dependencies.wineRepository.listUnlistedScans) throw new HttpError(503, "Fila de cadastro indisponível.", "Service Unavailable");
+      res.json(await dependencies.wineRepository.listUnlistedScans());
+    }),
+  );
+
+  app.patch(
+    "/admin/unlisted-wines/:code",
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      requireAdministrator(user);
+      const status = req.body?.status;
+      if (status !== "reviewing" && status !== "registered" && status !== "rejected") throw badRequest("Status de revisão inválido.");
+      const wineId = asString(req.body?.registeredWineId);
+      if (wineId && !isUuid(wineId)) throw badRequest("ID do vinho cadastrado inválido.");
+      if (status === "registered" && !wineId) throw badRequest("Informe o vinho cadastrado.");
+      if (!dependencies.wineRepository.reviewUnlistedScan) throw new HttpError(503, "Fila de cadastro indisponível.", "Service Unavailable");
+      const updated = await dependencies.wineRepository.reviewUnlistedScan(req.params.code, status, wineId);
+      if (!updated) throw notFound("Rótulo pendente não encontrado.");
+      res.json(updated);
+    }),
+  );
+
+  app.get(
     "/explore",
     asyncHandler(async (_req, res) => {
       res.json(await dependencies.wineRepository.explore());
@@ -317,7 +344,13 @@ export function createApp(dependencies: AppDependencies) {
         throw badRequest('Nenhum arquivo de imagem foi enviado. Use o campo "image".');
       }
 
-      res.json(await dependencies.wineScanner.scanWineLabel(req.file));
+      const result = await dependencies.wineScanner.scanWineLabel(req.file);
+      const token = bearerToken(req);
+      const user = token && dependencies.accountRepository ? await dependencies.accountRepository.getUser(token) : null;
+      if (dependencies.wineRepository.reconcileScan) {
+        result.catalog = await dependencies.wineRepository.reconcileScan(result.data, req.file, user?.id);
+      }
+      res.json(result);
     }),
   );
 
@@ -421,6 +454,11 @@ async function authenticated(req: Parameters<RequestHandler>[0], dependencies: A
   const user = await accounts.getUser(token);
   if (!user) throw new HttpError(401, "Sessão inválida ou expirada.", "Unauthorized");
   return { accounts, token, user };
+}
+
+function bearerToken(req: Parameters<RequestHandler>[0]) {
+  const header = req.header("authorization") ?? "";
+  return header.startsWith("Bearer ") ? header.slice(7).trim() : "";
 }
 
 function requiredText(value: unknown, field: string) {
