@@ -162,6 +162,17 @@ export function createApp(dependencies: AppDependencies) {
   );
 
   app.delete(
+    "/me/cellar/:wineId",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      requirePremium(user);
+      if (!isUuid(req.params.wineId)) throw badRequest("ID do vinho inválido.");
+      await accounts.deleteCellarWine(user.id, req.params.wineId);
+      res.status(204).send();
+    }),
+  );
+
+  app.delete(
     "/me/favorites/:wineId",
     asyncHandler(async (req, res) => {
       const { accounts, user } = await authenticated(req, dependencies);
@@ -240,6 +251,33 @@ export function createApp(dependencies: AppDependencies) {
       res.json(await requireAccounts(dependencies).getNews());
     }),
   );
+
+  app.get("/sommelier-selection", asyncHandler(async (_req, res) => {
+    res.json(await requireAccounts(dependencies).getSommelierSelection());
+  }));
+
+  app.get("/admin/news", asyncHandler(async (req, res) => {
+    const { accounts, user } = await authenticated(req, dependencies); requireAdministrator(user);
+    res.json(await accounts.listEditorialNews());
+  }));
+
+  app.post("/admin/news", asyncHandler(async (req, res) => {
+    const { accounts, user } = await authenticated(req, dependencies); requireAdministrator(user);
+    res.status(201).json(await accounts.createNews({ title: requiredText(req.body?.title, "Título"), summary: requiredText(req.body?.summary, "Resumo"), imageUrl: asString(req.body?.imageUrl), linkUrl: asString(req.body?.linkUrl), published: req.body?.published }));
+  }));
+
+  app.patch("/admin/news/:id", asyncHandler(async (req, res) => {
+    const { accounts, user } = await authenticated(req, dependencies); requireAdministrator(user);
+    if (!isUuid(req.params.id)) throw badRequest("ID da notícia inválido.");
+    const updated = await accounts.updateNews(req.params.id, { title: asString(req.body?.title), summary: asString(req.body?.summary), ...(Object.prototype.hasOwnProperty.call(req.body ?? {}, "imageUrl") ? { imageUrl: asString(req.body?.imageUrl) ?? null } : {}), ...(Object.prototype.hasOwnProperty.call(req.body ?? {}, "linkUrl") ? { linkUrl: asString(req.body?.linkUrl) ?? null } : {}), published: typeof req.body?.published === "boolean" ? req.body.published : undefined });
+    if (!updated) throw notFound("Notícia não encontrada."); res.json(updated);
+  }));
+
+  app.post("/admin/sommelier-selection", asyncHandler(async (req, res) => {
+    const { accounts, user } = await authenticated(req, dependencies); requireAdministrator(user);
+    const wineId = asString(req.body?.wineId); if (wineId && !isUuid(wineId)) throw badRequest("ID do vinho inválido.");
+    res.status(201).json(await accounts.upsertSommelierSelection({ wineId, eyebrow: asString(req.body?.eyebrow) ?? "SELEÇÃO DO SOMMELIER", title: requiredText(req.body?.title, "Título"), summary: requiredText(req.body?.summary, "Resumo"), imageUrl: asString(req.body?.imageUrl), ctaLabel: asString(req.body?.ctaLabel) ?? "Acessar Dossier", published: req.body?.published }));
+  }));
 
   app.get(
     "/admin/users",
@@ -344,13 +382,32 @@ export function createApp(dependencies: AppDependencies) {
         throw badRequest('Nenhum arquivo de imagem foi enviado. Use o campo "image".');
       }
 
-      const result = await dependencies.wineScanner.scanWineLabel(req.file);
       const token = bearerToken(req);
       const user = token && dependencies.accountRepository ? await dependencies.accountRepository.getUser(token) : null;
-      if (dependencies.wineRepository.reconcileScan) {
-        result.catalog = await dependencies.wineRepository.reconcileScan(result.data, req.file, user?.id);
+      try {
+        const result = await dependencies.wineScanner.scanWineLabel(req.file);
+        if (dependencies.wineRepository.reconcileScan) {
+          result.catalog = await dependencies.wineRepository.reconcileScan(result.data, req.file, user?.id);
+        }
+        res.json(result);
+      } catch (error) {
+        if (!dependencies.wineRepository.logUnlistedScan) throw error;
+        const catalog = await dependencies.wineRepository.logUnlistedScan(req.file, user?.id, {
+          recognitionStatus: "inconclusive",
+          capturedAt: new Date().toISOString(),
+        });
+        res.status(202).json({
+          success: true,
+          data: {
+            displayName: "Rótulo enviado para cadastro", producerTitle: null, producerName: null,
+            wine: null, country: null, region: null, subRegion: null, colour: null,
+            type: null, subType: null, designation: null, classification: null,
+            vintage: null, alcoholContent: null, grapes: null, volume: null,
+            confidence: 0, notes: `Nossa equipe irá revisar este rótulo. Código: ${catalog.status === "needs_registration" ? catalog.code : "VINATO-PENDENTE"}`,
+          },
+          catalog,
+        });
       }
-      res.json(result);
     }),
   );
 

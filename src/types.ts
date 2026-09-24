@@ -154,6 +154,7 @@ export type WineRepository = {
   findByLwin(lwin: string): Promise<Wine | null>;
   explore(): Promise<ExploreCatalog>;
   reconcileScan?(data: ScannedWineData, file: Express.Multer.File, userId?: string): Promise<NonNullable<ScanWineLabelResult["catalog"]>>;
+  logUnlistedScan?(file: Express.Multer.File, userId?: string, extractedData?: Record<string, unknown>): Promise<NonNullable<ScanWineLabelResult["catalog"]>>;
   listUnlistedScans?(): Promise<unknown[]>;
   reviewUnlistedScan?(code: string, status: "reviewing" | "registered" | "rejected", registeredWineId?: string): Promise<unknown | null>;
 };

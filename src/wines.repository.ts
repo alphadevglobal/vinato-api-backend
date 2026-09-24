@@ -77,12 +77,24 @@ export class PgWineRepository implements WineRepository {
 
   constructor(private readonly pool: pg.Pool) {}
 
+  async logUnlistedScan(file: Express.Multer.File, userId?: string, extractedData: Record<string, unknown> = {}) {
+    const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
+    const result = await this.pool.query<{ unlisted_code: string }>(
+      `INSERT INTO unlisted_wine_scans (unlisted_code, image_data_url, extracted_data, user_id)
+       VALUES ('VINATO-UNLISTED-' || to_char(now(), 'YYYYMMDD') || '-' || upper(encode(gen_random_bytes(4), 'hex')), $1, $2::jsonb, $3)
+       RETURNING unlisted_code`,
+      [imageDataUrl, JSON.stringify(extractedData), userId ?? null],
+    );
+    return { status: "needs_registration" as const, code: result.rows[0].unlisted_code };
+  }
+
   async reconcileScan(data: ScannedWineData, file: Express.Multer.File, userId?: string): Promise<NonNullable<ScanWineLabelResult["catalog"]>> {
-    const query = [data.displayName, data.producerName, data.wine, data.vintage].filter(Boolean).join(" ").trim();
+    const query = [data.displayName, data.producerTitle, data.producerName, data.wine, data.vintage].filter(Boolean).join(" ").trim();
     const vintage = Number(data.vintage);
     const match = query ? await this.pool.query<{ id: string; images: unknown; score: string }>(
       `SELECT id, images,
-              greatest(similarity(lower(display_name), lower($1)), similarity(normalized_search, lower($1)))
+              greatest(similarity(lower(display_name), lower($1)), similarity(normalized_search, lower($1)),
+                       word_similarity(lower(display_name), lower($1)), word_similarity(lower($1), lower(display_name)))
               + CASE WHEN $2::text IS NOT NULL AND lower(country) = lower($2) THEN 0.10 ELSE 0 END
               + CASE WHEN $3::smallint IS NOT NULL AND vintage = $3 THEN 0.12 ELSE 0 END AS score
        FROM catalog_wines
@@ -92,7 +104,7 @@ export class PgWineRepository implements WineRepository {
     ) : { rows: [] };
     const candidate = match.rows[0];
     const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
-    if (candidate && Number(candidate.score) >= 0.48) {
+    if (candidate && Number(candidate.score) >= 0.35) {
       const hasImage = Array.isArray(candidate.images) && candidate.images.length > 0;
       if (!hasImage) {
         await this.pool.query(
@@ -106,13 +118,7 @@ export class PgWineRepository implements WineRepository {
       return { status: "matched", wineId: candidate.id, imageAdded: !hasImage };
     }
 
-    const result = await this.pool.query<{ unlisted_code: string }>(
-      `INSERT INTO unlisted_wine_scans (unlisted_code, image_data_url, extracted_data, user_id)
-       VALUES ('VINATO-UNLISTED-' || to_char(now(), 'YYYYMMDD') || '-' || upper(encode(gen_random_bytes(4), 'hex')), $1, $2::jsonb, $3)
-       RETURNING unlisted_code`,
-      [imageDataUrl, JSON.stringify(data), userId ?? null],
-    );
-    return { status: "needs_registration", code: result.rows[0].unlisted_code };
+    return this.logUnlistedScan(file, userId, data as unknown as Record<string, unknown>);
   }
 
   async listUnlistedScans() {

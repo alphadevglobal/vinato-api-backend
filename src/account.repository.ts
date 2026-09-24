@@ -213,6 +213,10 @@ export class AccountRepository {
     return result.rows[0]?.quantity ?? null;
   }
 
+  async deleteCellarWine(userId: string, wineId: string) {
+    await this.pool.query(`DELETE FROM user_cellars WHERE user_id = $1 AND wine_id = $2`, [userId, wineId]);
+  }
+
   async getHistory(userId: string) {
     const result = await this.pool.query(
       `SELECT history.id, history.wine_id, history.status, history.image_uri,
@@ -277,6 +281,53 @@ export class AccountRepository {
       id: row.id, title: row.title, summary: row.summary,
       imageUrl: row.image_url, linkUrl: row.link_url, publishedAt: row.published_at,
     }));
+  }
+
+  async getSommelierSelection() {
+    const result = await this.pool.query(
+      `SELECT selections.id, selections.wine_id, selections.eyebrow, selections.title,
+              selections.summary, selections.image_url, selections.cta_label,
+              wines.display_name AS wine_name
+       FROM sommelier_selections selections
+       LEFT JOIN catalog_wines wines ON wines.id = selections.wine_id
+       WHERE selections.published = true
+       ORDER BY selections.sort_order ASC, selections.updated_at DESC LIMIT 1`,
+    );
+    const row = result.rows[0];
+    return row ? { id: row.id, wineId: row.wine_id, eyebrow: row.eyebrow, title: row.title,
+      summary: row.summary, imageUrl: row.image_url, ctaLabel: row.cta_label, wineName: row.wine_name } : null;
+  }
+
+  async listEditorialNews() {
+    return (await this.pool.query(`SELECT * FROM news_posts ORDER BY published_at DESC`)).rows;
+  }
+
+  async createNews(input: { title: string; summary: string; imageUrl?: string; linkUrl?: string; published?: boolean }) {
+    return (await this.pool.query(
+      `INSERT INTO news_posts (title, summary, image_url, link_url, published, published_at)
+       VALUES ($1,$2,$3,$4,COALESCE($5,true),now()) RETURNING *`,
+      [input.title, input.summary, input.imageUrl ?? null, input.linkUrl ?? null, input.published ?? true],
+    )).rows[0];
+  }
+
+  async updateNews(id: string, input: { title?: string; summary?: string; imageUrl?: string | null; linkUrl?: string | null; published?: boolean }) {
+    return (await this.pool.query(
+      `UPDATE news_posts SET title = COALESCE($2,title), summary = COALESCE($3,summary),
+       image_url = CASE WHEN $6 THEN $4 ELSE image_url END, link_url = CASE WHEN $7 THEN $5 ELSE link_url END,
+       published = COALESCE($8,published), published_at = CASE WHEN $8 = true AND published = false THEN now() ELSE published_at END
+       WHERE id = $1 RETURNING *`,
+      [id, input.title ?? null, input.summary ?? null, input.imageUrl ?? null, input.linkUrl ?? null,
+       Object.prototype.hasOwnProperty.call(input, "imageUrl"), Object.prototype.hasOwnProperty.call(input, "linkUrl"), input.published ?? null],
+    )).rows[0] ?? null;
+  }
+
+  async upsertSommelierSelection(input: { wineId?: string; eyebrow: string; title: string; summary: string; imageUrl?: string; ctaLabel: string; published?: boolean }) {
+    if (input.published !== false) await this.pool.query(`UPDATE sommelier_selections SET published = false WHERE published = true`);
+    return (await this.pool.query(
+      `INSERT INTO sommelier_selections (wine_id, eyebrow, title, summary, image_url, cta_label, published)
+       VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,true)) RETURNING *`,
+      [input.wineId ?? null, input.eyebrow, input.title, input.summary, input.imageUrl ?? null, input.ctaLabel, input.published ?? true],
+    )).rows[0];
   }
 
   private async createSession(user: PublicUser) {
