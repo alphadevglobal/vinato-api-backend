@@ -247,6 +247,28 @@ describe("Wine API", () => {
     expect(response.body.success).toBe(true);
     expect(response.body.data.displayName).toBe("Chateau Test 2019");
   });
+
+  it("does not register an unknown wine when the recognition provider fails", async () => {
+    const failingApp = createApp({
+      wineRepository: new MemoryWineRepository(seedWines),
+      wineScanner: {
+        async scanWineLabel() {
+          throw new Error("vision provider unavailable");
+        },
+      },
+    });
+
+    const response = await request(failingApp)
+      .post("/wine-scanner/scan")
+      .attach("image", Buffer.from("fake-png"), {
+        filename: "label.png",
+        contentType: "image/png",
+      })
+      .expect(500);
+
+    expect(response.body.statusCode).toBe(500);
+    expect(response.body).not.toHaveProperty("catalog");
+  });
 });
 
 function matches(actual: string | null, expected?: string) {

@@ -391,22 +391,10 @@ export function createApp(dependencies: AppDependencies) {
         }
         res.json(result);
       } catch (error) {
-        if (!dependencies.wineRepository.logUnlistedScan) throw error;
-        const catalog = await dependencies.wineRepository.logUnlistedScan(req.file, user?.id, {
-          recognitionStatus: "inconclusive",
-          capturedAt: new Date().toISOString(),
-        });
-        res.status(202).json({
-          success: true,
-          data: {
-            displayName: "Rótulo enviado para cadastro", producerTitle: null, producerName: null,
-            wine: null, country: null, region: null, subRegion: null, colour: null,
-            type: null, subType: null, designation: null, classification: null,
-            vintage: null, alcoholContent: null, grapes: null, volume: null,
-            confidence: 0, notes: `Nossa equipe irá revisar este rótulo. Código: ${catalog.status === "needs_registration" ? catalog.code : "VINATO-PENDENTE"}`,
-          },
-          catalog,
-        });
+        // Falhas de rede/provedor não significam que o vinho não existe.
+        // O cadastro pendente é criado exclusivamente por reconcileScan quando
+        // a IA identifica o rótulo, mas não encontra correspondência no catálogo.
+        throw error;
       }
     }),
   );
