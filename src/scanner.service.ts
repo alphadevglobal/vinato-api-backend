@@ -18,33 +18,27 @@ export class OpenRouterWineScanner implements WineScanner {
     }
 
     const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
-    const payload = await this.scanWithFallback(imageDataUrl);
-    const content = payload.choices?.[0]?.message?.content;
-    const parsed = parseModelJson(content);
-
-    return {
-      data: normalizeScannedWineData(parsed),
-      success: true,
-    };
-  }
-
-  private async scanWithFallback(imageDataUrl: string): Promise<OpenRouterPayload> {
-    const primary = await callOpenRouter(config.openRouterModel, imageDataUrl);
-    if (primary.ok) return primary.payload;
-
-    if (
-      shouldTryFallback(primary) &&
-      config.openRouterFallbackModel !== config.openRouterModel
-    ) {
-      const fallback = await callOpenRouter(
-        config.openRouterFallbackModel,
-        imageDataUrl,
-      );
-      if (fallback.ok) return fallback.payload;
+    // Free vision providers can be temporarily rate-limited. Try independent
+    // providers and only accept a response that actually identifies a label.
+    const preferredModels = [...new Set([config.openRouterModel, config.openRouterFallbackModel])];
+    try {
+      const data = await Promise.any(preferredModels.map((model) => identifyWithModel(model, imageDataUrl)));
+      return { data, success: true };
+    } catch {
+      // Keep the endpoint responsive. The route records the label for manual
+      // review when both independent providers are unavailable.
+      throw internalServerError("Não foi possível concluir a leitura do rótulo agora.");
     }
-
-    throw internalServerError("Falha na comunicação com a API OpenRouter.");
   }
+}
+
+async function identifyWithModel(model: string, imageDataUrl: string) {
+  const response = await callOpenRouter(model, imageDataUrl);
+  if (!response.ok) throw new Error(`MODEL_${response.status}`);
+  const parsed = parseModelJson(response.payload.choices?.[0]?.message?.content);
+  const data = normalizeScannedWineData(parsed);
+  if (!hasWineIdentity(data)) throw new Error("EMPTY_WINE_IDENTITY");
+  return data;
 }
 
 type OpenRouterPayload = {
@@ -59,8 +53,13 @@ async function callOpenRouter(
   model: string,
   imageDataUrl: string,
 ): Promise<OpenRouterResult> {
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12_000);
+  let response: Response;
+  try {
+    response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
+    signal: controller.signal,
     headers: {
       Authorization: `Bearer ${config.openRouterApiKey}`,
       "Content-Type": "application/json",
@@ -80,7 +79,12 @@ async function callOpenRouter(
         },
       ],
     }),
-  });
+    });
+  } catch {
+    return { ok: false, status: 408, body: "request_timeout" };
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const body = await response.text();
   if (!response.ok) {
@@ -92,11 +96,6 @@ async function callOpenRouter(
   } catch {
     throw internalServerError("Resposta inválida da API OpenRouter.");
   }
-}
-
-function shouldTryFallback(result: OpenRouterResult) {
-  if (result.ok) return false;
-  return [402, 404, 408, 429, 500, 502, 503, 504].includes(result.status);
 }
 
 function parseModelJson(content: unknown): Record<string, unknown> {
@@ -169,4 +168,8 @@ function confidence(value: unknown): number {
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(parsed)) return 0;
   return Math.min(1, Math.max(0, parsed));
+}
+
+function hasWineIdentity(data: ScannedWineData) {
+  return Boolean(data.displayName || data.producerName || data.producerTitle || data.wine);
 }

@@ -89,22 +89,30 @@ export class PgWineRepository implements WineRepository {
   }
 
   async reconcileScan(data: ScannedWineData, file: Express.Multer.File, userId?: string): Promise<NonNullable<ScanWineLabelResult["catalog"]>> {
-    const query = [data.displayName, data.producerTitle, data.producerName, data.wine, data.vintage].filter(Boolean).join(" ").trim();
+    const query = [data.displayName, data.producerTitle, data.producerName, data.wine].filter(Boolean).join(" ").trim();
+    const producer = data.producerName ?? data.producerTitle;
+    const wineName = data.wine ?? data.displayName;
     const vintage = Number(data.vintage);
     const match = query ? await this.pool.query<{ id: string; images: unknown; score: string }>(
       `SELECT id, images,
-              greatest(similarity(lower(display_name), lower($1)), similarity(normalized_search, lower($1)),
-                       word_similarity(lower(display_name), lower($1)), word_similarity(lower($1), lower(display_name)))
-              + CASE WHEN $2::text IS NOT NULL AND lower(country) = lower($2) THEN 0.10 ELSE 0 END
-              + CASE WHEN $3::smallint IS NOT NULL AND vintage = $3 THEN 0.12 ELSE 0 END AS score
+              (CASE WHEN $2::text IS NOT NULL AND lower(producer_manufacturer) = lower($2) THEN 0.55
+                    WHEN $2::text IS NOT NULL AND position(lower($2) in normalized_search) > 0 THEN 0.48
+                    WHEN $2::text IS NOT NULL THEN COALESCE(similarity(lower(producer_manufacturer), lower($2)), 0) * 0.45 ELSE 0 END)
+              + greatest(COALESCE(similarity(lower(wine_name), lower(COALESCE($3, $1))), 0),
+                         COALESCE(word_similarity(lower(wine_name), lower(COALESCE($3, $1))), 0),
+                         COALESCE(word_similarity(lower(COALESCE($3, $1)), lower(wine_name)), 0)) * 0.35
+              + COALESCE(similarity(lower(display_name), lower($1)), 0) * 0.10
+              + CASE WHEN $4::text IS NOT NULL AND lower(country) = lower($4) THEN 0.05 ELSE 0 END
+              + CASE WHEN $5::smallint IS NOT NULL AND vintage = $5 THEN 0.08 ELSE 0 END AS score
        FROM catalog_wines
-       WHERE normalized_search % lower($1) OR lower(display_name) % lower($1)
+       WHERE ($2::text IS NOT NULL AND (lower(producer_manufacturer) = lower($2) OR position(lower($2) in normalized_search) > 0 OR COALESCE(similarity(lower(producer_manufacturer), lower($2)), 0) >= 0.45))
+          OR normalized_search % lower($1) OR lower(display_name) % lower($1)
        ORDER BY score DESC LIMIT 1`,
-      [query, data.country ?? null, Number.isInteger(vintage) && vintage > 1800 && vintage < 2200 ? vintage : null],
+      [query, producer ?? null, wineName ?? null, data.country ?? null, Number.isInteger(vintage) && vintage > 1800 && vintage < 2200 ? vintage : null],
     ) : { rows: [] };
     const candidate = match.rows[0];
     const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
-    if (candidate && Number(candidate.score) >= 0.35) {
+    if (candidate && Number(candidate.score) >= 0.42) {
       const hasImage = Array.isArray(candidate.images) && candidate.images.length > 0;
       if (!hasImage) {
         await this.pool.query(
