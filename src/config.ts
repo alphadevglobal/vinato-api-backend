@@ -7,6 +7,6 @@ export const config = {
   openRouterModel:
     process.env.OPENROUTER_MODEL ?? "nex-agi/nex-n2.5-mini:free",
   openRouterFallbackModel:
-    process.env.OPENROUTER_FALLBACK_MODEL ?? "openrouter/free",
+    process.env.OPENROUTER_FALLBACK_MODEL ?? "dots-studio/dots-3-note-preview:free",
   sourceApiUrl: process.env.SOURCE_API_URL ?? "https://wine-api-two.vercel.app",
 };
