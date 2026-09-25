@@ -105,8 +105,9 @@ export class PgWineRepository implements WineRepository {
               + CASE WHEN $4::text IS NOT NULL AND lower(country) = lower($4) THEN 0.05 ELSE 0 END
               + CASE WHEN $5::smallint IS NOT NULL AND vintage = $5 THEN 0.08 ELSE 0 END AS score
        FROM catalog_wines
-       WHERE ($2::text IS NOT NULL AND (lower(producer_manufacturer) = lower($2) OR position(lower($2) in normalized_search) > 0 OR COALESCE(similarity(lower(producer_manufacturer), lower($2)), 0) >= 0.45))
-          OR normalized_search % lower($1) OR lower(display_name) % lower($1)
+       WHERE ($5::smallint IS NULL OR vintage = $5)
+         AND (($2::text IS NOT NULL AND (lower(producer_manufacturer) = lower($2) OR position(lower($2) in normalized_search) > 0 OR COALESCE(similarity(lower(producer_manufacturer), lower($2)), 0) >= 0.45))
+          OR normalized_search % lower($1) OR lower(display_name) % lower($1))
        ORDER BY score DESC LIMIT 1`,
       [query, producer ?? null, wineName ?? null, data.country ?? null, Number.isInteger(vintage) && vintage > 1800 && vintage < 2200 ? vintage : null],
     ) : { rows: [] };
