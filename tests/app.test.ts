@@ -1,5 +1,5 @@
 import request from "supertest";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
 import { seedWines } from "../src/seed-data.js";
 import type {
@@ -246,6 +246,35 @@ describe("Wine API", () => {
 
     expect(response.body.success).toBe(true);
     expect(response.body.data.displayName).toBe("Chateau Test 2019");
+  });
+
+  it("returns catalog feedback for scanned labels", async () => {
+    const repository = new MemoryWineRepository(seedWines);
+    const reconcileScan = vi.fn(async () => ({ status: "needs_registration" as const, code: "VINATO-UNLISTED-TEST" }));
+    const feedbackApp = createApp({ wineRepository: Object.assign(repository, { reconcileScan }), wineScanner: new StubWineScanner() });
+    const response = await request(feedbackApp)
+      .post("/wine-scanner/scan")
+      .attach("image", Buffer.from("fake-jpeg"), { filename: "label.jpg", contentType: "image/jpeg" })
+      .expect(200);
+
+    expect(reconcileScan).toHaveBeenCalledOnce();
+    expect(response.body.catalog).toEqual({ status: "needs_registration", code: "VINATO-UNLISTED-TEST" });
+  });
+
+  it("keeps the scan result when catalog reconciliation fails", async () => {
+    const repository = new MemoryWineRepository(seedWines);
+    const reconcileScan = vi.fn(async () => { throw new Error("relation \"unlisted_wine_scans\" does not exist"); });
+    const failingApp = createApp({ wineRepository: Object.assign(repository, { reconcileScan }), wineScanner: new StubWineScanner() });
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const response = await request(failingApp)
+      .post("/wine-scanner/scan")
+      .attach("image", Buffer.from("fake-jpeg"), { filename: "label.jpg", contentType: "image/jpeg" })
+      .expect(200);
+    errorLog.mockRestore();
+
+    expect(response.body.success).toBe(true);
+    expect(response.body.data.displayName).toBe("Chateau Test 2019");
+    expect(response.body.catalog).toBeUndefined();
   });
 });
 

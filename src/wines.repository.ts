@@ -78,7 +78,10 @@ export class PgWineRepository implements WineRepository {
   constructor(private readonly pool: pg.Pool) {}
 
   async reconcileScan(data: ScannedWineData, file: Express.Multer.File, userId?: string): Promise<NonNullable<ScanWineLabelResult["catalog"]>> {
-    const query = [data.displayName, data.producerName, data.wine, data.vintage].filter(Boolean).join(" ").trim();
+    // displayName already carries producer + wine; repeating them (and the
+    // vintage, scored separately below) dilutes trigram similarity and sends
+    // catalogued wines to the unlisted queue.
+    const query = (data.displayName?.trim() || [data.producerTitle, data.producerName, data.wine].filter(Boolean).join(" ")).trim();
     const vintage = Number(data.vintage);
     const match = query ? await this.pool.query<{ id: string; images: unknown; score: string }>(
       `SELECT id, images,

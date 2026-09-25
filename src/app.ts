@@ -345,10 +345,16 @@ export function createApp(dependencies: AppDependencies) {
       }
 
       const result = await dependencies.wineScanner.scanWineLabel(req.file);
-      const token = bearerToken(req);
-      const user = token && dependencies.accountRepository ? await dependencies.accountRepository.getUser(token) : null;
       if (dependencies.wineRepository.reconcileScan) {
-        result.catalog = await dependencies.wineRepository.reconcileScan(result.data, req.file, user?.id);
+        // Catalog feedback (missing photo / unlisted queue) must never discard a
+        // label the scanner already read: on failure the app still shows the data.
+        try {
+          const token = bearerToken(req);
+          const user = token && dependencies.accountRepository ? await dependencies.accountRepository.getUser(token) : null;
+          result.catalog = await dependencies.wineRepository.reconcileScan(result.data, req.file, user?.id);
+        } catch (error) {
+          console.error("[wine-scanner] catalog reconciliation failed", error);
+        }
       }
       res.json(result);
     }),
