@@ -5,7 +5,7 @@ import multer from "multer";
 import swaggerUi from "swagger-ui-express";
 import { badRequest, HttpError, internalServerError, notFound } from "./http-error.js";
 import { openApiDocument } from "./openapi.js";
-import type { AppDependencies, AsyncRequestHandler, WineListQuery } from "./types.js";
+import type { AppDependencies, AsyncRequestHandler, ScannedWineData, Wine, WineListQuery } from "./types.js";
 import { verifySocialToken, type SocialProvider } from "./social-auth.js";
 
 const require = createRequire(import.meta.url);
@@ -388,6 +388,13 @@ export function createApp(dependencies: AppDependencies) {
         const result = await dependencies.wineScanner.scanWineLabel(req.file);
         if (dependencies.wineRepository.reconcileScan) {
           result.catalog = await dependencies.wineRepository.reconcileScan(result.data, req.file, user?.id);
+          if (result.catalog.status === "matched") {
+            const catalogWine = await dependencies.wineRepository.findById(result.catalog.wineId);
+            if (!catalogWine) {
+              throw internalServerError("O vinho identificado não pôde ser carregado do catálogo.");
+            }
+            result.data = catalogWineToScanData(catalogWine, result.data.confidence);
+          }
         }
         res.json(result);
       } catch (error) {
@@ -406,6 +413,29 @@ export function createApp(dependencies: AppDependencies) {
   app.use(errorHandler);
 
   return app;
+}
+
+function catalogWineToScanData(wine: Wine, recognitionConfidence: number): ScannedWineData {
+  return {
+    displayName: wine.displayName,
+    producerTitle: wine.producerTitle,
+    producerName: wine.producerName,
+    wine: wine.wine,
+    country: wine.country,
+    region: wine.region,
+    subRegion: wine.subRegion,
+    colour: wine.colour,
+    type: wine.type,
+    subType: wine.subType,
+    designation: wine.designation,
+    classification: wine.classification,
+    vintage: wine.vintageYear?.toString() ?? wine.firstVintage ?? wine.finalVintage,
+    alcoholContent: wine.alcohol === null || wine.alcohol === undefined ? null : `${wine.alcohol}%`,
+    grapes: wine.grapes,
+    volume: null,
+    confidence: recognitionConfidence,
+    notes: wine.reference ?? "",
+  };
 }
 
 function uploadSingleImage(): RequestHandler {

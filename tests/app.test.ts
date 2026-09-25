@@ -248,6 +248,32 @@ describe("Wine API", () => {
     expect(response.body.data.displayName).toBe("Chateau Test 2019");
   });
 
+  it("returns catalog data instead of vision-generated fields after a match", async () => {
+    const catalogWine = seedWines[0];
+    class MatchedCatalogRepository extends MemoryWineRepository {
+      async reconcileScan() {
+        return { status: "matched" as const, wineId: catalogWine.id, imageAdded: false };
+      }
+    }
+    const catalogApp = createApp({
+      wineRepository: new MatchedCatalogRepository(seedWines),
+      wineScanner: new StubWineScanner(),
+    });
+
+    const response = await request(catalogApp)
+      .post("/wine-scanner/scan")
+      .attach("image", Buffer.from("fake-png"), {
+        filename: "label.png",
+        contentType: "image/png",
+      })
+      .expect(200);
+
+    expect(response.body.catalog).toEqual({ status: "matched", wineId: catalogWine.id, imageAdded: false });
+    expect(response.body.data.displayName).toBe(catalogWine.displayName);
+    expect(response.body.data.producerName).toBe(catalogWine.producerName);
+    expect(response.body.data.displayName).not.toBe("Chateau Test 2019");
+  });
+
   it("does not register an unknown wine when the recognition provider fails", async () => {
     const failingApp = createApp({
       wineRepository: new MemoryWineRepository(seedWines),

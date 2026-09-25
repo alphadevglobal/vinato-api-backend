@@ -4,6 +4,11 @@ import type { ScanWineLabelResult, ScannedWineData, WineScanner } from "./types.
 
 const scannerPrompt = `
 Extraia dados estruturados de um rotulo de vinho.
+Observe cuidadosamente todo o texto visivel, incluindo produtor, nome da cuvee,
+safra, pais, regiao, classificacao, uvas, volume e teor alcoolico.
+Transcreva somente o que estiver realmente legivel na imagem. Nao complete,
+deduza ou invente informacoes ausentes. Diferencie produtor, nome do vinho e
+classificacao. Preserve acentos e a grafia exibida no rotulo.
 Responda somente JSON valido, sem markdown, com estas chaves:
 displayName, producerTitle, producerName, wine, country, region, subRegion,
 colour, type, subType, designation, classification, vintage, alcoholContent,
