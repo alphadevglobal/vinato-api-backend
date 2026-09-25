@@ -5,8 +5,8 @@ export const config = {
   databaseUrl: process.env.DATABASE_URL,
   openRouterApiKey: process.env.OPENROUTER_API_KEY,
   openRouterModel:
-    process.env.OPENROUTER_MODEL ?? "nex-agi/nex-n2.5-mini:free",
+    process.env.OPENROUTER_MODEL ?? "google/gemini-3.1-flash-lite",
   openRouterFallbackModel:
-    process.env.OPENROUTER_FALLBACK_MODEL ?? "dots-studio/dots-3-note-preview:free",
+    process.env.OPENROUTER_FALLBACK_MODEL ?? "nex-agi/nex-n2.5-mini:free",
   sourceApiUrl: process.env.SOURCE_API_URL ?? "https://wine-api-two.vercel.app",
 };
