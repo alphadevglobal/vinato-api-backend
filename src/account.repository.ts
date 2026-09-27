@@ -272,6 +272,26 @@ export class AccountRepository {
   }
 
   async getNews() {
+    // The editorial CMS (vinato-web) writes full articles to news_articles: video,
+    // body blocks, subtitle. The news_posts mirror only keeps title/summary/image,
+    // so read the articles and fall back to the mirror on older databases.
+    const articles = await this.pool.query(`SELECT to_regclass('public.news_articles') IS NOT NULL AS ready`);
+    if (articles.rows[0]?.ready) {
+      const result = await this.pool.query(
+        `SELECT id, title, subtitle, summary, content, author_name, category, cover_image, cover_caption,
+                video_url, video_thumbnail, video_caption, published_at
+         FROM news_articles
+         WHERE status = 'published' AND published_at IS NOT NULL AND published_at <= now()
+         ORDER BY featured DESC, published_at DESC LIMIT 20`,
+      );
+      return result.rows.map((row) => ({
+        id: row.id, title: row.title, subtitle: row.subtitle, summary: row.summary ?? "",
+        content: Array.isArray(row.content) ? row.content : [], authorName: row.author_name, category: row.category,
+        imageUrl: row.cover_image ?? row.video_thumbnail, imageCaption: row.cover_caption,
+        videoUrl: row.video_url, videoThumbnail: row.video_thumbnail, videoCaption: row.video_caption,
+        linkUrl: null, publishedAt: row.published_at,
+      }));
+    }
     const result = await this.pool.query(
       `SELECT id, title, summary, image_url, link_url, published_at
        FROM news_posts WHERE published = true AND published_at <= now()
