@@ -73,6 +73,16 @@ const baseSelect = `
   FROM catalog_wines
 `;
 
+// One canonical style per wine, whatever the source spelling ("Rosé"/"Rose",
+// "Fortified"/"fortified", colour missing but type present). The explore
+// facet and the /wines?colour= filter use the same expression.
+const STYLE_SQL = `CASE lower(btrim(COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), ''))))
+  WHEN 'red' THEN 'Red' WHEN 'white' THEN 'White' WHEN 'sparkling' THEN 'Sparkling'
+  WHEN 'rose' THEN 'Rosé' WHEN 'rosé' THEN 'Rosé' WHEN 'fortified' THEN 'Fortified'
+  WHEN 'dessert' THEN 'Dessert' WHEN 'sweet' THEN 'Dessert' WHEN 'amber' THEN 'Amber' WHEN 'orange' THEN 'Amber'
+  ELSE initcap(btrim(COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), ''))))
+END`;
+
 export class PgWineRepository implements WineRepository {
   private exploreCache?: { value: ExploreCatalog; expiresAt: number };
 
@@ -266,8 +276,7 @@ export class PgWineRepository implements WineRepository {
         GROUP BY grape.name ORDER BY COUNT(*) DESC, grape.name ASC LIMIT 60
       `),
       this.pool.query(`
-        SELECT COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), '')) AS name,
-               COUNT(*)::int AS count
+        SELECT ${STYLE_SQL} AS name, COUNT(*)::int AS count
         FROM catalog_wines
         WHERE COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), '')) IS NOT NULL
         GROUP BY 1 ORDER BY COUNT(*) DESC, 1 ASC LIMIT 20
@@ -301,7 +310,10 @@ function buildWhere(query: WineListQuery) {
   };
 
   addExactFilter("country", query.country);
-  addExactFilter("color", query.colour);
+  if (query.colour) {
+    params.push(query.colour);
+    clauses.push(`lower(${STYLE_SQL}) = lower($${params.length})`);
+  }
   addExactFilter("region", query.region);
   addExactFilter("wine_type", query.type);
 
