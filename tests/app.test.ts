@@ -1,5 +1,5 @@
 import request from "supertest";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
 import { seedWines } from "../src/seed-data.js";
 import type {
@@ -301,3 +301,60 @@ function matches(actual: string | null, expected?: string) {
   if (!expected) return true;
   return actual?.toLowerCase() === expected.toLowerCase();
 }
+
+describe("scan audit log", () => {
+  const reading = { displayName: "Chateau Test 2019", producerTitle: null, producerName: "Chateau Test", wine: null, country: null, region: null, subRegion: null, colour: null, type: null, subType: null, designation: null, classification: null, vintage: "2019", alcoholContent: null, grapes: null, volume: null, confidence: 0.9, notes: "" };
+  const post = (app: ReturnType<typeof createApp>) => request(app).post("/wine-scanner/scan")
+    .set("X-Vinato-Platform", "ios").set("X-Vinato-App-Version", "0.1.0")
+    .attach("image", Buffer.from("fake-jpeg"), { filename: "label.jpg", contentType: "image/jpeg" });
+
+  it("records the model, the catalog lookup and the match", async () => {
+    const record = vi.fn(async () => undefined);
+    const repository = Object.assign(new MemoryWineRepository(seedWines), {
+      reconcileScan: vi.fn(async (_data: unknown, _file: unknown, _user: unknown, trace?: { catalogQueried: boolean; catalogCandidates?: number }) => {
+        if (trace) { trace.catalogQueried = true; trace.catalogCandidates = 3; }
+        return { status: "matched" as const, wineId: seedWines[0].id, imageAdded: false, matchScore: 0.97 };
+      }),
+    });
+    const scanner = { scanWineLabel: vi.fn(async (_file: unknown, trace?: { modelsTried: unknown[]; modelUsed?: string }) => {
+      trace?.modelsTried.push({ model: "google/gemini-3.1-flash-lite", ok: true, ms: 1200, status: 200 });
+      if (trace) trace.modelUsed = "google/gemini-3.1-flash-lite";
+      return { success: true as const, data: reading };
+    }) };
+    await post(createApp({ wineRepository: repository, wineScanner: scanner, scanAudit: { record } })).expect(200);
+
+    expect(record).toHaveBeenCalledOnce();
+    expect(record.mock.calls[0][0]).toMatchObject({
+      success: true, outcome: "matched", catalogWineId: seedWines[0].id, matchScore: 0.97, platform: "ios", appVersion: "0.1.0",
+      trace: { modelUsed: "google/gemini-3.1-flash-lite", catalogQueried: true, catalogCandidates: 3 },
+    });
+    expect(record.mock.calls[0][0].reading.displayName).toBe("Chateau Test 2019");
+  });
+
+  it("records recognition failures without touching the catalog", async () => {
+    const record = vi.fn(async () => undefined);
+    const scanner = { scanWineLabel: vi.fn(async () => { throw new Error("MODEL_402: insufficient credits"); }) };
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await post(createApp({ wineRepository: new MemoryWineRepository(seedWines), wineScanner: scanner, scanAudit: { record } })).expect(500);
+    errorLog.mockRestore();
+
+    expect(record.mock.calls[0][0]).toMatchObject({ success: false, outcome: "recognition_failed", errorStage: "recognition", trace: { catalogQueried: false } });
+  });
+
+  it("records catalog failures with the AI reading", async () => {
+    const record = vi.fn(async () => undefined);
+    const repository = Object.assign(new MemoryWineRepository(seedWines), { reconcileScan: vi.fn(async () => { throw new Error("db down"); }) });
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await post(createApp({ wineRepository: repository, wineScanner: { scanWineLabel: async () => ({ success: true as const, data: reading }) }, scanAudit: { record } })).expect(500);
+    errorLog.mockRestore();
+
+    expect(record.mock.calls[0][0]).toMatchObject({ success: false, outcome: "catalog_failed", errorStage: "catalog", errorMessage: "db down" });
+  });
+
+  it("never fails the scan when the audit write fails", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const response = await post(createApp({ wineRepository: new MemoryWineRepository(seedWines), wineScanner: { scanWineLabel: async () => ({ success: true as const, data: reading }) }, scanAudit: { record: async () => { throw new Error("audit table missing"); } } })).expect(200);
+    errorLog.mockRestore();
+    expect(response.body.success).toBe(true);
+  });
+});

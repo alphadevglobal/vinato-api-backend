@@ -5,7 +5,8 @@ import multer from "multer";
 import swaggerUi from "swagger-ui-express";
 import { badRequest, HttpError, internalServerError, notFound } from "./http-error.js";
 import { openApiDocument } from "./openapi.js";
-import type { AppDependencies, AsyncRequestHandler, ScannedWineData, Wine, WineListQuery } from "./types.js";
+import { newScanTrace, type ScanAuditEntry } from "./scan-audit.repository.js";
+import type { AppDependencies, AsyncRequestHandler, ScannedWineData, ScanWineLabelResult, Wine, WineListQuery } from "./types.js";
 import { verifySocialToken, type SocialProvider } from "./social-auth.js";
 
 const require = createRequire(import.meta.url);
@@ -382,12 +383,36 @@ export function createApp(dependencies: AppDependencies) {
         throw badRequest('Nenhum arquivo de imagem foi enviado. Use o campo "image".');
       }
 
+      const file = req.file;
+      const startedAt = Date.now();
+      const trace = newScanTrace();
       const token = bearerToken(req);
-      const user = token && dependencies.accountRepository ? await dependencies.accountRepository.getUser(token) : null;
+      const user = token && dependencies.accountRepository ? await dependencies.accountRepository.getUser(token).catch(() => null) : null;
+      // Every scan leaves one audit row (photo, model, catalog lookup, outcome).
+      // Auditing is best effort: it never changes what the user receives.
+      const audit = async (entry: Omit<ScanAuditEntry, "file" | "trace" | "durationMs" | "userId" | "platform" | "appVersion">) => {
+        if (!dependencies.scanAudit) return;
+        try {
+          await dependencies.scanAudit.record({
+            ...entry, file, trace, userId: user?.id, durationMs: Date.now() - startedAt,
+            platform: req.header("x-vinato-platform") ?? undefined, appVersion: req.header("x-vinato-app-version") ?? undefined,
+          });
+        } catch (error) {
+          console.error("[wine-scanner] could not write the scan audit log", error);
+        }
+      };
+
+      let result: ScanWineLabelResult;
       try {
-        const result = await dependencies.wineScanner.scanWineLabel(req.file);
+        result = await dependencies.wineScanner.scanWineLabel(file, trace);
+      } catch (error) {
+        await audit({ success: false, outcome: "recognition_failed", errorStage: "recognition", errorMessage: (error as Error).message });
+        throw error;
+      }
+      const reading = result.data;
+      try {
         if (dependencies.wineRepository.reconcileScan) {
-          result.catalog = await dependencies.wineRepository.reconcileScan(result.data, req.file, user?.id);
+          result.catalog = await dependencies.wineRepository.reconcileScan(result.data, file, user?.id, trace);
           if (result.catalog.status === "matched") {
             const catalogWine = await dependencies.wineRepository.findById(result.catalog.wineId);
             if (!catalogWine) {
@@ -396,13 +421,21 @@ export function createApp(dependencies: AppDependencies) {
             result.data = catalogWineToScanData(catalogWine, result.data);
           }
         }
-        res.json(result);
       } catch (error) {
-        // Falhas de rede/provedor não significam que o vinho não existe.
-        // O cadastro pendente é criado exclusivamente por reconcileScan quando
-        // a IA identifica o rótulo, mas não encontra correspondência no catálogo.
+        await audit({ success: false, outcome: "catalog_failed", errorStage: "catalog", errorMessage: (error as Error).message, reading });
         throw error;
       }
+      const catalog = result.catalog;
+      await audit({
+        success: true,
+        outcome: catalog?.status === "needs_registration" ? "needs_registration" : "matched",
+        reading,
+        catalogWineId: catalog?.status === "matched" ? catalog.wineId : undefined,
+        matchScore: catalog?.status === "matched" ? catalog.matchScore : undefined,
+        unlistedCode: catalog?.status === "needs_registration" ? catalog.code : undefined,
+        imageAdded: catalog?.status === "matched" ? catalog.imageAdded : undefined,
+      });
+      res.json(result);
     }),
   );
 

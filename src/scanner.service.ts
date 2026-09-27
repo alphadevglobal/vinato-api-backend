@@ -1,5 +1,6 @@
 import { config } from "./config.js";
 import { internalServerError } from "./http-error.js";
+import type { ScanTrace } from "./scan-audit.repository.js";
 import type { ScanWineLabelResult, ScannedWineData, WineScanner } from "./types.js";
 
 const scannerPrompt = `
@@ -29,7 +30,7 @@ grapes, volume, confidence, notes. confidence e um numero de 0 a 1.
 `;
 
 export class OpenRouterWineScanner implements WineScanner {
-  async scanWineLabel(file: Express.Multer.File): Promise<ScanWineLabelResult> {
+  async scanWineLabel(file: Express.Multer.File, trace?: ScanTrace): Promise<ScanWineLabelResult> {
     if (!config.openRouterApiKey) {
       throw internalServerError("Serviço de reconhecimento temporariamente indisponível.");
     }
@@ -38,32 +39,45 @@ export class OpenRouterWineScanner implements WineScanner {
     // Primary model first; the stronger fallback only reads the label when the
     // primary fails or returns a weak reading. (Racing both returned whichever
     // answered first, not whichever read better.)
+    const startedAt = Date.now();
     let data: ScannedWineData | undefined;
+    let modelUsed: string | undefined;
     try {
-      data = await identifyWithModel(config.openRouterModel, imageDataUrl);
+      data = await identifyWithModel(config.openRouterModel, imageDataUrl, trace);
+      modelUsed = config.openRouterModel;
     } catch {
       data = undefined;
     }
     if ((!data || isWeakReading(data)) && config.openRouterFallbackModel !== config.openRouterModel) {
       try {
-        const second = await identifyWithModel(config.openRouterFallbackModel, imageDataUrl);
-        if (!data || readingScore(second) > readingScore(data)) data = second;
+        const second = await identifyWithModel(config.openRouterFallbackModel, imageDataUrl, trace);
+        if (!data || readingScore(second) > readingScore(data)) { data = second; modelUsed = config.openRouterFallbackModel; }
       } catch {
         // Keep the primary reading, if any.
       }
     }
+    if (trace) { trace.modelUsed = modelUsed; trace.recognitionMs = Date.now() - startedAt; }
     if (!data) throw internalServerError("Não foi possível concluir a leitura do rótulo agora.");
     return { data, success: true };
   }
 }
 
-async function identifyWithModel(model: string, imageDataUrl: string) {
-  const response = await callOpenRouter(model, imageDataUrl);
-  if (!response.ok) throw new Error(`MODEL_${response.status}`);
-  const parsed = parseModelJson(response.payload.choices?.[0]?.message?.content);
-  const data = normalizeScannedWineData(parsed);
-  if (!hasWineIdentity(data)) throw new Error("EMPTY_WINE_IDENTITY");
-  return data;
+async function identifyWithModel(model: string, imageDataUrl: string, trace?: ScanTrace) {
+  const startedAt = Date.now();
+  const attempt = (ok: boolean, extra: { status?: number; error?: string } = {}) =>
+    trace?.modelsTried.push({ model, ok, ms: Date.now() - startedAt, ...extra });
+  try {
+    const response = await callOpenRouter(model, imageDataUrl);
+    if (!response.ok) throw Object.assign(new Error(`MODEL_${response.status}: ${response.body.slice(0, 200)}`), { status: response.status });
+    const parsed = parseModelJson(response.payload.choices?.[0]?.message?.content);
+    const data = normalizeScannedWineData(parsed);
+    if (!hasWineIdentity(data)) throw new Error("EMPTY_WINE_IDENTITY: o modelo não identificou produtor nem vinho");
+    attempt(true, { status: 200 });
+    return data;
+  } catch (error) {
+    attempt(false, { status: (error as { status?: number }).status, error: (error as Error).message });
+    throw error;
+  }
 }
 
 type OpenRouterPayload = {

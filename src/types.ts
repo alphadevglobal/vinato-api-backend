@@ -155,20 +155,21 @@ export type WineRepository = {
   findById(id: string): Promise<Wine | null>;
   findByLwin(lwin: string): Promise<Wine | null>;
   explore(): Promise<ExploreCatalog>;
-  reconcileScan?(data: ScannedWineData, file: Express.Multer.File, userId?: string): Promise<NonNullable<ScanWineLabelResult["catalog"]>>;
+  reconcileScan?(data: ScannedWineData, file: Express.Multer.File, userId?: string, trace?: import("./scan-audit.repository.js").ScanTrace): Promise<NonNullable<ScanWineLabelResult["catalog"]>>;
   logUnlistedScan?(file: Express.Multer.File, userId?: string, extractedData?: Record<string, unknown>): Promise<NonNullable<ScanWineLabelResult["catalog"]>>;
   listUnlistedScans?(): Promise<unknown[]>;
   reviewUnlistedScan?(code: string, status: "reviewing" | "registered" | "rejected", registeredWineId?: string): Promise<unknown | null>;
 };
 
 export type WineScanner = {
-  scanWineLabel(file: Express.Multer.File): Promise<ScanWineLabelResult>;
+  scanWineLabel(file: Express.Multer.File, trace?: import("./scan-audit.repository.js").ScanTrace): Promise<ScanWineLabelResult>;
 };
 
 export type AppDependencies = {
   wineRepository: WineRepository;
   wineScanner: WineScanner;
   accountRepository?: import("./account.repository.js").AccountRepository;
+  scanAudit?: import("./scan-audit.repository.js").ScanAuditLog;
 };
 
 export type AsyncRequestHandler = (

@@ -1,3 +1,4 @@
+import type { ScanTrace } from "./scan-audit.repository.js";
 import { decideMatch, searchTerms, type CatalogCandidate } from "./catalog-matcher.js";
 import type {
   AutocompleteWine,
@@ -132,8 +133,12 @@ export class PgWineRepository implements WineRepository {
     }
   }
 
-  async reconcileScan(data: ScannedWineData, file: Express.Multer.File, userId?: string): Promise<NonNullable<ScanWineLabelResult["catalog"]>> {
-    const decision = decideMatch(data, await this.findScanCandidates(data));
+  async reconcileScan(data: ScannedWineData, file: Express.Multer.File, userId?: string, trace?: ScanTrace): Promise<NonNullable<ScanWineLabelResult["catalog"]>> {
+    const startedAt = Date.now();
+    if (trace) trace.catalogQueried = true;
+    const candidates = await this.findScanCandidates(data);
+    if (trace) { trace.catalogCandidates = candidates.length; trace.catalogMs = Date.now() - startedAt; }
+    const decision = decideMatch(data, candidates);
     const alternatives = decision.alternatives.map((candidate) => ({ wineId: candidate.id, displayName: candidate.displayName }));
 
     if (decision.status === "matched") {
