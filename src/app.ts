@@ -7,6 +7,7 @@ import { badRequest, HttpError, internalServerError, notFound } from "./http-err
 import { openApiDocument } from "./openapi.js";
 import type { AppDependencies, AsyncRequestHandler, ScannedWineData, Wine, WineListQuery } from "./types.js";
 import { verifySocialToken, type SocialProvider } from "./social-auth.js";
+import { DISPOSABLE_EMAIL_MESSAGE, isDisposableEmailAddress } from "./email-policy.js";
 
 const require = createRequire(import.meta.url);
 const helmet = require("helmet") as (options?: { contentSecurityPolicy?: boolean }) => RequestHandler;
@@ -79,6 +80,7 @@ export function createApp(dependencies: AppDependencies) {
       const accounts = requireAccounts(dependencies);
       const displayName = requiredText(req.body?.displayName, "Nome");
       const email = requiredEmail(req.body?.email);
+      rejectDisposableEmail(email);
       const password = requiredPassword(req.body?.password);
       try {
         res.status(201).json(await accounts.register(displayName, email, password));
@@ -116,10 +118,12 @@ export function createApp(dependencies: AppDependencies) {
       try {
         const identity = await verifySocialToken(provider as SocialProvider, idToken);
         if (!identity.emailVerified) throw new Error("UNVERIFIED_SOCIAL_EMAIL");
+        if (isDisposableEmailAddress(identity.email)) throw new Error("DISPOSABLE_EMAIL");
         res.json(await accounts.socialLogin(provider, identity.subject, identity.email, asString(req.body?.displayName)));
       } catch (error) {
         const code = (error as Error).message;
         if (code === "ACCOUNT_BLOCKED") throw new HttpError(403, "Esta conta está bloqueada. Fale com o suporte VINATO.", "Forbidden");
+        if (code === "DISPOSABLE_EMAIL") throw new HttpError(400, DISPOSABLE_EMAIL_MESSAGE, "Bad Request");
         if (code === "GOOGLE_AUTH_NOT_CONFIGURED") throw new HttpError(503, "Login Google aguardando configuração.", "Service Unavailable");
         throw new HttpError(401, "Não foi possível validar sua identidade.", "Unauthorized");
       }
@@ -549,6 +553,10 @@ function requiredEmail(value: unknown) {
   const email = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw badRequest("Digite um e-mail válido.");
   return email;
+}
+
+function rejectDisposableEmail(email: string) {
+  if (isDisposableEmailAddress(email)) throw new HttpError(400, DISPOSABLE_EMAIL_MESSAGE, "Bad Request");
 }
 
 function requiredPassword(value: unknown) {
