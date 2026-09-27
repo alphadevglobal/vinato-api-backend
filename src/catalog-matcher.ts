@@ -62,6 +62,9 @@ export function normalizeText(value: string | null | undefined) {
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
+    // Portuguese labels print "Bruto"/"Bruto Natural"; the catalog uses Brut/Brut Nature.
+    .replace(/\bbruto natural\b/g, "brut nature")
+    .replace(/\bbruto\b/g, "brut")
     .trim();
 }
 

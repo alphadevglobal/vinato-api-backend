@@ -72,6 +72,14 @@ describe("catalog matcher", () => {
     expect(decision.status).toBe("no_match");
   });
 
+  it("reads the Portuguese Bruto / Bruto Natural as Brut / Brut Nature", () => {
+    const decision = decideMatch(
+      reading({ displayName: "Soalheiro Bruto Natural Alvarinho", producerName: "Soalheiro", wine: "Bruto Natural Alvarinho", type: "Espumante" }),
+      [row("nature", "Soalheiro, Brut Nature Alvarinho, Minho", { producer: "Soalheiro" }), row("brut", "Soalheiro, Brut Alvarinho, Minho", { producer: "Soalheiro" })],
+    );
+    expect(decision).toMatchObject({ status: "matched", best: { id: "nature" } });
+  });
+
   it("searches accented and unaccented spellings, without a producer-only term", () => {
     const terms = searchTerms(reading({ displayName: "Casa Perini Fração Única", producerName: "Casa Perini", wine: "Fração Única" }));
     expect(terms).toContain("perini fracao unica");
