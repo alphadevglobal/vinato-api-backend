@@ -138,17 +138,26 @@ export class PgWineRepository implements WineRepository {
 
     if (decision.status === "matched") {
       const { best } = decision;
+      let imageAdded = false;
       if (!best.hasImage) {
         const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
-        await this.pool.query(
-          `UPDATE catalog_wines SET images = jsonb_build_array(jsonb_build_object(
-             'url', $2, 'source', 'user_scan', 'review_status', 'pending', 'captured_at', now()
-           )), updated_at = now()
-           WHERE id = $1 AND (images IS NULL OR images = '[]'::jsonb)`,
-          [best.id, imageDataUrl],
-        );
+        // jsonb_build_object takes "any": the parameter must be typed ($2::text),
+        // otherwise Postgres rejects it (42P18) and every such scan failed.
+        // The photo is a bonus: failing to store it must not fail the scan.
+        try {
+          const updated = await this.pool.query(
+            `UPDATE catalog_wines SET images = jsonb_build_array(jsonb_build_object(
+               'url', $2::text, 'source', 'user_scan', 'review_status', 'pending', 'captured_at', now()
+             )), updated_at = now()
+             WHERE id = $1 AND (images IS NULL OR images = '[]'::jsonb)`,
+            [best.id, imageDataUrl],
+          );
+          imageAdded = (updated.rowCount ?? 0) > 0;
+        } catch (error) {
+          console.error("[wine-scanner] could not store the scan photo", error);
+        }
       }
-      return { status: "matched", wineId: best.id, imageAdded: !best.hasImage, matchScore: best.score, alternatives };
+      return { status: "matched", wineId: best.id, imageAdded, matchScore: best.score, alternatives };
     }
 
     const logged = await this.logUnlistedScan(file, userId, { ...data, catalogCandidates: alternatives });

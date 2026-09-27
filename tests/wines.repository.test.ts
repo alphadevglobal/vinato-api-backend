@@ -32,6 +32,21 @@ describe("scan image enrichment", () => {
     expect(result).toMatchObject({ status: "matched", wineId: "wine-id", imageAdded: true });
     expect(clientQuery.mock.calls.some(([sql]) => String(sql).includes("word_similarity_threshold"))).toBe(true);
     expect(poolQuery.mock.calls[0][1]).toEqual(["wine-id", "data:image/jpeg;base64,dXNlci1waG90bw=="]);
+    // Untyped parameters inside jsonb_build_object are rejected by Postgres (42P18).
+    expect(poolQuery.mock.calls[0][0]).toContain("'url', $2::text");
+  });
+
+  it("still returns the match when storing the scan photo fails", async () => {
+    const { repository, poolQuery } = repositoryWith([
+      { id: "wine-id", display_name: "Almaviva 2017", wine_name: "Almaviva", producer_manufacturer: "Almaviva", vintage: 2017, has_image: false },
+    ]);
+    poolQuery.mockRejectedValueOnce(Object.assign(new Error("could not determine data type of parameter $2"), { code: "42P18" }));
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await repository.reconcileScan(almaviva, file);
+    errorLog.mockRestore();
+
+    expect(result).toMatchObject({ status: "matched", wineId: "wine-id", imageAdded: false });
   });
 
   it("queues the label with catalog alternatives when nothing matches", async () => {

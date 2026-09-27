@@ -8,9 +8,11 @@ Transcreva com fidelidade o texto impresso: produtor, nome do vinho (cuvee/linha
 safra, pais, regiao, classificacao, uvas, volume e teor alcoolico. Preserve acentos
 e a grafia do rotulo. Diferencie produtor, nome do vinho e classificacao.
 
-Rotulos artisticos (ilustracao/gravura, nome pequeno ou curvado): se voce
-reconhecer com seguranca o vinho pela arte ou pelo logotipo, preencha
-displayName e producerName com o nome conhecido e use confidence no maximo 0.6.
+Rotulos artisticos (ilustracao/gravura, nome pequeno ou curvado): NAO tente
+adivinhar o vinho pela arte. Transcreva os trechos de texto que estiverem legiveis
+(ex.: "MALBEC ARGENTINO", "BODEGA ...") nos campos correspondentes e deixe o
+produtor como null se o nome dele nao estiver escrito. Um nome inventado impede
+que o vinho seja encontrado no catalogo; um campo vazio nao.
 
 Regras:
 - Ignore marcacoes feitas a mao, etiquetas de preco ou de loja: numeros escritos a
@@ -18,7 +20,7 @@ Regras:
 - vintage: somente o ano de 4 digitos impresso no rotulo, ou null.
 - displayName: "Produtor + Nome do vinho", sem safra e sem volume.
 - colour: tinto, branco, rose ou espumante, quando indicado.
-- Use null quando nao estiver visivel. Nao invente.
+- Use null quando nao estiver visivel. Nunca invente produtor, vinho ou safra.
 
 Responda somente JSON valido, sem markdown, com estas chaves:
 displayName, producerTitle, producerName, wine, country, region, subRegion,
