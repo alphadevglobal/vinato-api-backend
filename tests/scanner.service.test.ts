@@ -75,4 +75,26 @@ describe("OpenRouterWineScanner", () => {
     expect(JSON.parse(fetchMock.mock.calls[0][1].body).model).toBe("paid-model");
     expect(JSON.parse(fetchMock.mock.calls[1][1].body).model).toBe("free-model");
   });
+  it("drops placeholder words the model writes for missing values", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(modelReply('{"displayName":"null MALBEC ARGENTINO","producerName":"null","wine":"MALBEC ARGENTINO","region":"N/A","vintage":"null","confidence":0.8,"notes":""}'));
+    const result = await scanWith(fetchMock);
+
+    expect(result.data.displayName).toBe("MALBEC ARGENTINO");
+    expect(result.data.producerName).toBeNull();
+    expect(result.data.region).toBeNull();
+    expect(result.data.vintage).toBeNull();
+  });
 });
+
+function modelReply(content: string) {
+  return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+}
+
+async function scanWith(fetchMock: ReturnType<typeof vi.fn>) {
+  process.env.OPENROUTER_API_KEY = "test-key";
+  process.env.OPENROUTER_MODEL = "primary-model";
+  process.env.OPENROUTER_FALLBACK_MODEL = "second-model";
+  vi.stubGlobal("fetch", fetchMock);
+  const { OpenRouterWineScanner } = await import("../src/scanner.service.js");
+  return new OpenRouterWineScanner().scanWineLabel({ buffer: Buffer.from("fake-image"), mimetype: "image/jpeg" } as Express.Multer.File);
+}

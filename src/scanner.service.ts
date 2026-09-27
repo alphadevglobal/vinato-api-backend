@@ -196,11 +196,16 @@ function normalizeScannedWineData(data: Record<string, unknown>): ScannedWineDat
   };
 }
 
+// Models sometimes write missing values as text ("null", "N/A") or glue them
+// into a name ("null MALBEC ARGENTINO"), which breaks the catalog match.
+const EMPTY_WORDS = /\b(null|undefined|none|n\/a|n\/d|nao informado|não informado|desconhecido|unknown)\b/gi;
+
 function nullableString(value: unknown): string | null {
   if (value === null || value === undefined) return null;
-  if (typeof value === "string") return value;
   if (typeof value === "number") return String(value);
-  return null;
+  if (typeof value !== "string") return null;
+  const cleaned = value.replace(EMPTY_WORDS, " ").replace(/\s+/g, " ").trim();
+  return cleaned && !/^[-–—.]+$/.test(cleaned) ? cleaned : null;
 }
 
 function confidence(value: unknown): number {

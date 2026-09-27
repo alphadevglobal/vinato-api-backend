@@ -144,6 +144,9 @@ export function scoreCandidate(data: ScannedWineData, candidate: CatalogCandidat
 
   if (labelIsStandardBottle(data) && LARGE_OR_SMALL_FORMAT.test(normalizeText(candidate.displayName))) score -= 0.35;
 
+  // Tie-breakers only. No vintage on the label: prefer the row without vintage
+  // (the wine itself) over one specific vintage. Then prefer the richer row.
+  if (!vintage && candidate.vintage === null) score += 0.02;
   // Tie-breaker only: prefer the richer row for the same wine.
   if (candidate.hasImage) score += 0.01;
   if (candidate.producer) score += 0.01;
@@ -152,7 +155,9 @@ export function scoreCandidate(data: ScannedWineData, candidate: CatalogCandidat
   // keep it below the match threshold so it is offered as an alternative.
   if (vintage && candidate.vintage && candidate.vintage !== vintage) score = Math.min(score, 0.6);
 
-  return Math.max(0, Math.min(1, score));
+  // Not capped at 1 here: a perfect name match with the same vintage must still
+  // outrank a perfect name match without it. decideMatch caps what it reports.
+  return Math.max(0, score);
 }
 
 function tierWords(text: string) {
@@ -164,19 +169,24 @@ const AMBIGUITY_MARGIN = 0.04;
 
 export function decideMatch(data: ScannedWineData, candidates: CatalogCandidate[]): MatchDecision {
   const scored = candidates
-    .map((candidate) => ({ ...candidate, score: Number(scoreCandidate(data, candidate).toFixed(3)) }))
-    .sort((a, b) => b.score - a.score);
+    .map((candidate) => ({ candidate, raw: scoreCandidate(data, candidate) }))
+    .sort((a, b) => b.raw - a.raw)
+    .map(({ candidate, raw }) => ({ ...candidate, score: Number(Math.min(1, raw).toFixed(3)), raw }));
   const [best, second] = scored;
   const alternatives = scored.filter((candidate) => candidate.score >= 0.45).slice(0, 4);
 
-  if (!best || best.score < MATCH_THRESHOLD) return { status: "no_match", alternatives };
+  if (!best || best.raw < MATCH_THRESHOLD) return { status: "no_match", alternatives: strip(alternatives) };
   // Two different wines scoring the same means the label did not tell them apart.
   // Near-perfect ties are the same wine catalogued twice (different sources);
   // the tie-breakers already put the richer row first.
-  if (second && best.score < 0.9 && best.score - second.score < AMBIGUITY_MARGIN && !sameWine(best, second)) {
-    return { status: "no_match", alternatives };
+  if (second && best.raw < 0.9 && best.raw - second.raw < AMBIGUITY_MARGIN && !sameWine(best, second)) {
+    return { status: "no_match", alternatives: strip(alternatives) };
   }
-  return { status: "matched", best, alternatives: alternatives.filter((candidate) => candidate.id !== best.id) };
+  return { status: "matched", best: strip([best])[0], alternatives: strip(alternatives.filter((candidate) => candidate.id !== best.id)) };
+}
+
+function strip(list: Array<ScoredCandidate & { raw: number }>): ScoredCandidate[] {
+  return list.map(({ raw: _raw, ...candidate }) => candidate);
 }
 
 function sameWine(a: CatalogCandidate, b: CatalogCandidate) {
