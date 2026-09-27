@@ -1,3 +1,4 @@
+import { decideMatch, searchTerms, type CatalogCandidate } from "./catalog-matcher.js";
 import type {
   AutocompleteWine,
   ExploreCatalog,
@@ -88,46 +89,60 @@ export class PgWineRepository implements WineRepository {
     return { status: "needs_registration" as const, code: result.rows[0].unlisted_code };
   }
 
+  async findScanCandidates(data: ScannedWineData): Promise<CatalogCandidate[]> {
+    const terms = searchTerms(data);
+    if (!terms.length) return [];
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Short label terms against long normalized_search rows: word similarity,
+      // served by the normalized_search GIN trigram index through %>.
+      await client.query("SELECT set_config('pg_trgm.word_similarity_threshold', '0.6', true)");
+      const where = terms.map((_, index) => `normalized_search %> $${index + 1}`).join(" OR ");
+      const rank = terms.map((_, index) => `word_similarity($${index + 1}, normalized_search)`).join(" + ");
+      const result = await client.query<{ id: string; display_name: string; wine_name: string | null; producer_manufacturer: string | null; vintage: number | null; has_image: boolean }>(
+        `SELECT id, display_name, wine_name, producer_manufacturer, vintage,
+                (jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0) AS has_image
+         FROM catalog_wines
+         WHERE ${where}
+         ORDER BY (${rank}) DESC
+         LIMIT 40`,
+        terms,
+      );
+      await client.query("COMMIT");
+      return result.rows.map((row) => ({
+        id: row.id, displayName: row.display_name, wineName: row.wine_name,
+        producer: row.producer_manufacturer, vintage: row.vintage, hasImage: row.has_image,
+      }));
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   async reconcileScan(data: ScannedWineData, file: Express.Multer.File, userId?: string): Promise<NonNullable<ScanWineLabelResult["catalog"]>> {
-    const query = [data.displayName, data.producerTitle, data.producerName, data.wine].filter(Boolean).join(" ").trim();
-    const producer = data.producerName ?? data.producerTitle;
-    const wineName = data.wine ?? data.displayName;
-    const vintage = Number(data.vintage);
-    const match = query ? await this.pool.query<{ id: string; images: unknown; score: string }>(
-      `SELECT id, images,
-              (CASE WHEN $2::text IS NOT NULL AND lower(producer_manufacturer) = lower($2) THEN 0.55
-                    WHEN $2::text IS NOT NULL AND position(lower($2) in normalized_search) > 0 THEN 0.48
-                    WHEN $2::text IS NOT NULL THEN COALESCE(similarity(lower(producer_manufacturer), lower($2)), 0) * 0.45 ELSE 0 END)
-              + greatest(COALESCE(similarity(lower(wine_name), lower(COALESCE($3, $1))), 0),
-                         COALESCE(word_similarity(lower(wine_name), lower(COALESCE($3, $1))), 0),
-                         COALESCE(word_similarity(lower(COALESCE($3, $1)), lower(wine_name)), 0)) * 0.35
-              + COALESCE(similarity(lower(display_name), lower($1)), 0) * 0.10
-              + CASE WHEN $4::text IS NOT NULL AND lower(country) = lower($4) THEN 0.05 ELSE 0 END
-              + CASE WHEN $5::smallint IS NOT NULL AND vintage = $5 THEN 0.08 ELSE 0 END AS score
-       FROM catalog_wines
-       WHERE ($5::smallint IS NULL OR vintage = $5)
-         AND (($2::text IS NOT NULL AND (lower(producer_manufacturer) = lower($2) OR position(lower($2) in normalized_search) > 0 OR COALESCE(similarity(lower(producer_manufacturer), lower($2)), 0) >= 0.45))
-          OR normalized_search % lower($1) OR lower(display_name) % lower($1))
-       ORDER BY score DESC LIMIT 1`,
-      [query, producer ?? null, wineName ?? null, data.country ?? null, Number.isInteger(vintage) && vintage > 1800 && vintage < 2200 ? vintage : null],
-    ) : { rows: [] };
-    const candidate = match.rows[0];
-    const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
-    if (candidate && Number(candidate.score) >= 0.42) {
-      const hasImage = Array.isArray(candidate.images) && candidate.images.length > 0;
-      if (!hasImage) {
+    const decision = decideMatch(data, await this.findScanCandidates(data));
+    const alternatives = decision.alternatives.map((candidate) => ({ wineId: candidate.id, displayName: candidate.displayName }));
+
+    if (decision.status === "matched") {
+      const { best } = decision;
+      if (!best.hasImage) {
+        const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
         await this.pool.query(
           `UPDATE catalog_wines SET images = jsonb_build_array(jsonb_build_object(
              'url', $2, 'source', 'user_scan', 'review_status', 'pending', 'captured_at', now()
            )), updated_at = now()
            WHERE id = $1 AND (images IS NULL OR images = '[]'::jsonb)`,
-          [candidate.id, imageDataUrl],
+          [best.id, imageDataUrl],
         );
       }
-      return { status: "matched", wineId: candidate.id, imageAdded: !hasImage };
+      return { status: "matched", wineId: best.id, imageAdded: !best.hasImage, matchScore: best.score, alternatives };
     }
 
-    return this.logUnlistedScan(file, userId, data as unknown as Record<string, unknown>);
+    const logged = await this.logUnlistedScan(file, userId, { ...data, catalogCandidates: alternatives });
+    return { ...logged, alternatives };
   }
 
   async listUnlistedScans() {

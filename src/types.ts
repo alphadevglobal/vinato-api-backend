@@ -139,12 +139,14 @@ export type ScannedWineData = {
   notes: string;
 };
 
+export type CatalogAlternative = { wineId: string; displayName: string };
+
 export type ScanWineLabelResult = {
   data: ScannedWineData;
   success: true;
   catalog?:
-    | { status: "matched"; wineId: string; imageAdded: boolean }
-    | { status: "needs_registration"; code: string };
+    | { status: "matched"; wineId: string; imageAdded: boolean; matchScore?: number; alternatives?: CatalogAlternative[] }
+    | { status: "needs_registration"; code: string; alternatives?: CatalogAlternative[] };
 };
 
 export type WineRepository = {

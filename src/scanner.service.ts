@@ -3,17 +3,27 @@ import { internalServerError } from "./http-error.js";
 import type { ScanWineLabelResult, ScannedWineData, WineScanner } from "./types.js";
 
 const scannerPrompt = `
-Extraia dados estruturados de um rotulo de vinho.
-Observe cuidadosamente todo o texto visivel, incluindo produtor, nome da cuvee,
-safra, pais, regiao, classificacao, uvas, volume e teor alcoolico.
-Transcreva somente o que estiver realmente legivel na imagem. Nao complete,
-deduza ou invente informacoes ausentes. Diferencie produtor, nome do vinho e
-classificacao. Preserve acentos e a grafia exibida no rotulo.
+Voce le rotulos de vinho para localizar o vinho no catalogo Vinato.
+Transcreva com fidelidade o texto impresso: produtor, nome do vinho (cuvee/linha),
+safra, pais, regiao, classificacao, uvas, volume e teor alcoolico. Preserve acentos
+e a grafia do rotulo. Diferencie produtor, nome do vinho e classificacao.
+
+Rotulos artisticos (ilustracao/gravura, nome pequeno ou curvado): se voce
+reconhecer com seguranca o vinho pela arte ou pelo logotipo, preencha
+displayName e producerName com o nome conhecido e use confidence no maximo 0.6.
+
+Regras:
+- Ignore marcacoes feitas a mao, etiquetas de preco ou de loja: numeros escritos a
+  mao NAO sao a safra.
+- vintage: somente o ano de 4 digitos impresso no rotulo, ou null.
+- displayName: "Produtor + Nome do vinho", sem safra e sem volume.
+- colour: tinto, branco, rose ou espumante, quando indicado.
+- Use null quando nao estiver visivel. Nao invente.
+
 Responda somente JSON valido, sem markdown, com estas chaves:
 displayName, producerTitle, producerName, wine, country, region, subRegion,
 colour, type, subType, designation, classification, vintage, alcoholContent,
-grapes, volume, confidence, notes.
-Use null quando uma informacao nao estiver visivel. confidence deve ser numero de 0 a 1.
+grapes, volume, confidence, notes. confidence e um numero de 0 a 1.
 `;
 
 export class OpenRouterWineScanner implements WineScanner {
@@ -23,17 +33,25 @@ export class OpenRouterWineScanner implements WineScanner {
     }
 
     const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
-    // Free vision providers can be temporarily rate-limited. Try independent
-    // providers and only accept a response that actually identifies a label.
-    const preferredModels = [...new Set([config.openRouterModel, config.openRouterFallbackModel])];
+    // Primary model first; the stronger fallback only reads the label when the
+    // primary fails or returns a weak reading. (Racing both returned whichever
+    // answered first, not whichever read better.)
+    let data: ScannedWineData | undefined;
     try {
-      const data = await Promise.any(preferredModels.map((model) => identifyWithModel(model, imageDataUrl)));
-      return { data, success: true };
+      data = await identifyWithModel(config.openRouterModel, imageDataUrl);
     } catch {
-      // Keep the endpoint responsive. The route records the label for manual
-      // review when both independent providers are unavailable.
-      throw internalServerError("Não foi possível concluir a leitura do rótulo agora.");
+      data = undefined;
     }
+    if ((!data || isWeakReading(data)) && config.openRouterFallbackModel !== config.openRouterModel) {
+      try {
+        const second = await identifyWithModel(config.openRouterFallbackModel, imageDataUrl);
+        if (!data || readingScore(second) > readingScore(data)) data = second;
+      } catch {
+        // Keep the primary reading, if any.
+      }
+    }
+    if (!data) throw internalServerError("Não foi possível concluir a leitura do rótulo agora.");
+    return { data, success: true };
   }
 }
 
@@ -59,7 +77,7 @@ async function callOpenRouter(
   imageDataUrl: string,
 ): Promise<OpenRouterResult> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12_000);
+  const timeout = setTimeout(() => controller.abort(), 18_000);
   let response: Response;
   try {
     response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -153,7 +171,7 @@ function normalizeScannedWineData(data: Record<string, unknown>): ScannedWineDat
     subType: nullableString(data.subType),
     designation: nullableString(data.designation),
     classification: nullableString(data.classification),
-    vintage: nullableString(data.vintage),
+    vintage: printedVintage(data.vintage),
     alcoholContent: nullableString(data.alcoholContent),
     grapes: nullableString(data.grapes),
     volume: nullableString(data.volume),
@@ -173,6 +191,22 @@ function confidence(value: unknown): number {
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(parsed)) return 0;
   return Math.min(1, Math.max(0, parsed));
+}
+
+function isWeakReading(data: ScannedWineData) {
+  return data.confidence < 0.6 || !(data.displayName || (data.producerName && data.wine));
+}
+
+function readingScore(data: ScannedWineData) {
+  return (data.displayName ? 1 : data.producerName && data.wine ? 0.8 : 0) + data.confidence;
+}
+
+// Handwritten store/cellar marks (e.g. "2.040" on the glass) are often read as the
+// vintage, which then breaks the catalog match. Keep only plausible years.
+function printedVintage(value: unknown): string | null {
+  const year = nullableString(value)?.match(/\b(1[89]\d{2}|20\d{2})\b/)?.[1];
+  if (!year) return null;
+  return Number(year) <= new Date().getFullYear() ? year : null;
 }
 
 function hasWineIdentity(data: ScannedWineData) {

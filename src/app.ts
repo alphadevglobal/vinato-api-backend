@@ -393,7 +393,7 @@ export function createApp(dependencies: AppDependencies) {
             if (!catalogWine) {
               throw internalServerError("O vinho identificado não pôde ser carregado do catálogo.");
             }
-            result.data = catalogWineToScanData(catalogWine, result.data.confidence);
+            result.data = catalogWineToScanData(catalogWine, result.data);
           }
         }
         res.json(result);
@@ -415,7 +415,10 @@ export function createApp(dependencies: AppDependencies) {
   return app;
 }
 
-function catalogWineToScanData(wine: Wine, recognitionConfidence: number): ScannedWineData {
+// Every fact comes from the catalog row. The only label facts kept are the ones
+// that describe this physical bottle and that generic catalog rows lack
+// (vintage, volume), plus how confident the reading was.
+function catalogWineToScanData(wine: Wine, reading: ScannedWineData): ScannedWineData {
   return {
     displayName: wine.displayName,
     producerTitle: wine.producerTitle,
@@ -429,11 +432,11 @@ function catalogWineToScanData(wine: Wine, recognitionConfidence: number): Scann
     subType: wine.subType,
     designation: wine.designation,
     classification: wine.classification,
-    vintage: wine.vintageYear?.toString() ?? wine.firstVintage ?? wine.finalVintage,
+    vintage: wine.vintageYear?.toString() ?? reading.vintage ?? null,
     alcoholContent: wine.alcohol === null || wine.alcohol === undefined ? null : `${wine.alcohol}%`,
     grapes: wine.grapes,
-    volume: null,
-    confidence: recognitionConfidence,
+    volume: reading.volume,
+    confidence: reading.confidence,
     notes: wine.reference ?? "",
   };
 }
