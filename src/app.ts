@@ -5,6 +5,7 @@ import multer from "multer";
 import swaggerUi from "swagger-ui-express";
 import { badRequest, HttpError, internalServerError, notFound } from "./http-error.js";
 import { openApiDocument } from "./openapi.js";
+import { validRating } from "./reviews.repository.js";
 import { newScanTrace, type ScanAuditEntry } from "./scan-audit.repository.js";
 import type { AppDependencies, AsyncRequestHandler, ScannedWineData, ScanWineLabelResult, Wine, WineListQuery } from "./types.js";
 import { verifySocialToken, type SocialProvider } from "./social-auth.js";
@@ -376,6 +377,47 @@ export function createApp(dependencies: AppDependencies) {
         throw notFound(`Vinho com ID "${req.params.id}" não encontrado.`);
       }
       res.json(wine);
+    }),
+  );
+
+  // Wine reviews: public list (with the viewer's own review when logged in),
+  // one review per user, editable (previous versions kept in history).
+  const reviews = () => {
+    if (!dependencies.reviews) throw new HttpError(503, "Avaliações indisponíveis.", "Service Unavailable");
+    return dependencies.reviews;
+  };
+
+  app.get(
+    "/wines/:id/reviews",
+    asyncHandler(async (req, res) => {
+      if (!isUuid(req.params.id)) throw badRequest("Validation failed (uuid is expected)");
+      const token = bearerToken(req);
+      const viewer = token && dependencies.accountRepository ? await dependencies.accountRepository.getUser(token).catch(() => null) : null;
+      res.json(await reviews().list(req.params.id, viewer?.id));
+    }),
+  );
+
+  app.put(
+    "/wines/:id/reviews/me",
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      if (!isUuid(req.params.id)) throw badRequest("Validation failed (uuid is expected)");
+      const rating = validRating(req.body?.rating);
+      if (rating === null) throw badRequest("A nota deve ser de 1 a 5, em passos de meio ponto.");
+      const comment = typeof req.body?.comment === "string" ? req.body.comment.trim() : "";
+      if (comment.length > 500) throw badRequest("O comentário pode ter no máximo 500 caracteres.");
+      if (!(await dependencies.wineRepository.findById(req.params.id))) throw notFound("Vinho não encontrado.");
+      res.json(await reviews().upsert(req.params.id, user.id, rating, comment || null));
+    }),
+  );
+
+  // Where to buy: offers from approved stores only (see wine_merchants).
+  app.get(
+    "/wines/:id/offers",
+    asyncHandler(async (req, res) => {
+      if (!isUuid(req.params.id)) throw badRequest("Validation failed (uuid is expected)");
+      if (!dependencies.offers) throw new HttpError(503, "Ofertas indisponíveis.", "Service Unavailable");
+      res.json(await dependencies.offers.forWine(req.params.id));
     }),
   );
 

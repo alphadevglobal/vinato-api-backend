@@ -1,4 +1,6 @@
 import { createApp } from "../src/app.js";
+import { OfferRepository } from "../src/offers.repository.js";
+import { ReviewRepository } from "../src/reviews.repository.js";
 import { SommelierAgent } from "../src/sommelier.service.js";
 import { pool } from "../src/db.js";
 import { OpenRouterWineScanner } from "../src/scanner.service.js";
@@ -12,6 +14,8 @@ const app = createApp({
   accountRepository: new AccountRepository(pool),
   scanAudit: new PgScanAuditRepository(pool),
   sommelier: new SommelierAgent(pool),
+  reviews: new ReviewRepository(pool),
+  offers: new OfferRepository(pool),
 });
 
 export default app;

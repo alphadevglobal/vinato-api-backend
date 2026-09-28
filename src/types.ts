@@ -171,6 +171,8 @@ export type AppDependencies = {
   accountRepository?: import("./account.repository.js").AccountRepository;
   scanAudit?: import("./scan-audit.repository.js").ScanAuditLog;
   sommelier?: import("./sommelier.service.js").SommelierAgent;
+  reviews?: import("./reviews.repository.js").ReviewRepository;
+  offers?: import("./offers.repository.js").OfferRepository;
 };
 
 export type AsyncRequestHandler = (

@@ -44,7 +44,8 @@ const baseSelect = `
     vintage AS vintage_year,
     alcohol_percent AS alcohol,
     NULL::numeric AS price_usd,
-    NULL::numeric AS rating,
+    -- "Nota Crítica": average of the users' reviews (1 to 5), from wine_review_stats.
+    (SELECT round(stats.rating_sum / NULLIF(stats.review_count, 0), 1) FROM wine_review_stats stats WHERE stats.wine_id = catalog_wines.id) AS rating,
     CASE
       WHEN jsonb_typeof(grapes) = 'array' THEN array_to_string(ARRAY(
         SELECT CASE
@@ -65,7 +66,7 @@ const baseSelect = `
       ELSE NULL
     END AS image_url,
     NULL::text AS source_url,
-    0::integer AS review_count,
+    COALESCE((SELECT stats.review_count FROM wine_review_stats stats WHERE stats.wine_id = catalog_wines.id), 0)::integer AS review_count,
     COALESCE((SELECT awarded.awards_count FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id), 0)::integer AS awards_count,
     (SELECT awarded.latest_award_year FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id) AS latest_award_year,
     (SELECT awarded.award_symbol FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id) AS award_symbol,

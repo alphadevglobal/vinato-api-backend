@@ -1,4 +1,6 @@
 import { createApp } from "./app.js";
+import { OfferRepository } from "./offers.repository.js";
+import { ReviewRepository } from "./reviews.repository.js";
 import { SommelierAgent } from "./sommelier.service.js";
 import { PgScanAuditRepository } from "./scan-audit.repository.js";
 import { config } from "./config.js";
@@ -13,6 +15,8 @@ const app = createApp({
   accountRepository: new AccountRepository(pool),
   scanAudit: new PgScanAuditRepository(pool),
   sommelier: new SommelierAgent(pool),
+  reviews: new ReviewRepository(pool),
+  offers: new OfferRepository(pool),
 });
 
 app.listen(config.port, () => {
