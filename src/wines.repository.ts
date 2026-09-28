@@ -111,8 +111,8 @@ export class PgWineRepository implements WineRepository {
       await client.query("SELECT set_config('pg_trgm.word_similarity_threshold', '0.6', true)");
       const where = terms.map((_, index) => `normalized_search %> $${index + 1}`).join(" OR ");
       const rank = terms.map((_, index) => `word_similarity($${index + 1}, normalized_search)`).join(" + ");
-      const result = await client.query<{ id: string; display_name: string; wine_name: string | null; producer_manufacturer: string | null; vintage: number | null; has_image: boolean }>(
-        `SELECT id, display_name, wine_name, producer_manufacturer, vintage,
+      const result = await client.query<{ id: string; display_name: string; wine_name: string | null; producer_manufacturer: string | null; vintage: number | null; has_image: boolean; region: string | null; sub_region: string | null; country: string | null }>(
+        `SELECT id, display_name, wine_name, producer_manufacturer, vintage, region, sub_region, country,
                 (jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0) AS has_image
          FROM catalog_wines
          WHERE ${where}
@@ -124,6 +124,7 @@ export class PgWineRepository implements WineRepository {
       return result.rows.map((row) => ({
         id: row.id, displayName: row.display_name, wineName: row.wine_name,
         producer: row.producer_manufacturer, vintage: row.vintage, hasImage: row.has_image,
+        places: [row.region, row.sub_region, row.country].filter((place): place is string => Boolean(place)),
       }));
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);

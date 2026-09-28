@@ -14,6 +14,7 @@ export type CatalogCandidate = {
   producer: string | null;
   vintage: number | null;
   hasImage: boolean;
+  places?: string[]; // region, sub-region, country of the catalog row
 };
 
 export type ScoredCandidate = CatalogCandidate & { score: number };
@@ -30,6 +31,8 @@ const GENERIC_WORDS = new Set([
   "safra", "vintage", "ml", "cl", "l", "vol", "garrafa", "bottle", "regional", "denominacao", "origem", "doc", "do", "aoc", "igp", "dop",
   "vinhedo", "vinhedos", "bodega", "bodegas", "vina", "vinedos", "winery", "cantina", "domaine", "chateau", "casa", "quinta", "vinicola",
   "valley", "vale", "valle", "region",
+  // Company suffixes printed on back labels ("Rutini Wines", "Cinque Segni Srl", "& Figli").
+  "wines", "vinos", "vins", "finos", "sa", "srl", "spa", "sas", "sca", "scav", "ltda", "ltd", "inc", "co", "company", "figli", "hijos", "filhos",
 ]);
 
 // Words that separate different wines of the same producer and line.
@@ -52,6 +55,13 @@ function colourOf(text: string) {
   for (const [colour, pattern] of COLOURS) if (pattern.test(normalized)) return colour;
   return null;
 }
+
+const GRAPE_WORDS = new Set([
+  "cabernet", "franc", "sauvignon", "malbec", "merlot", "syrah", "shiraz", "pinot", "noir", "chardonnay", "carmenere", "tannat",
+  "bonarda", "tempranillo", "sangiovese", "primitivo", "nebbiolo", "touriga", "marselan", "montepulciano", "riesling", "viognier",
+  "verdot", "grenache", "garnacha", "zinfandel", "barbera", "aglianico", "carignan", "mourvedre", "monastrell", "torrontes",
+  "alvarinho", "albarino", "gewurztraminer", "semillon", "moscato", "moscatel", "nero", "avola", "negroamaro", "trincadeira", "aragonez",
+]);
 
 // Bottle formats that make a catalog row a different product from a standard 750 ml bottle.
 const LARGE_OR_SMALL_FORMAT = /\b(magnum|imperial|jeroboam|rehoboam|methuselah|salmanazar|nabucodonosor|double|split|demi|half|piccolo|(1[,.]5|3|4[,.]5|5|6|9|12|15)\s?l(itros?)?|(187|375|500)\s?ml)\b/;
@@ -127,6 +137,10 @@ export function scoreCandidate(data: ScannedWineData, candidate: CatalogCandidat
 
   const producerTokens = tokens(producer);
   if (producerTokens.length && producerTokens.every((token) => candidateIdentity.has(token))) score += 0.08;
+  // The producer read on the label appears nowhere in the row: another producer's
+  // wine with the same name ("Absurdo, Cabernet Franc Malbec" for a Rutini).
+  // Only rows that name a producer can contradict the label.
+  const producerMissing = producerTokens.length > 0 && Boolean(candidate.producer) && !producerTokens.some((token) => candidateIdentity.has(token));
 
   const vintage = labelVintage(data);
   if (vintage && candidate.vintage === vintage) score += 0.1;
@@ -150,6 +164,23 @@ export function scoreCandidate(data: ScannedWineData, candidate: CatalogCandidat
   // Tie-breaker only: prefer the richer row for the same wine.
   if (candidate.hasImage) score += 0.01;
   if (candidate.producer) score += 0.01;
+
+  // "Producer, Wine, Region" rows: a word of the wine's own name that the label
+  // does not show ("Rutini, Dominio Malbec Cabernet Franc" for a plain
+  // "Rutini Cabernet Franc - Malbec") means another wine of the producer.
+  // Producer and region words are ignored here ("Hacienda" Los Haroldos).
+  const segments = candidate.displayName.split(",");
+  if (segments.length >= 2) {
+    const places = new Set((candidate.places ?? []).flatMap((place) => tokens(place)));
+    const producerWords = new Set(tokens(candidate.producer ?? segments[0]));
+    const unshown = tokens(segments[1]).filter((token) => !everythingRead.has(token) && !places.has(token) && !producerWords.has(token) && !TIER_WORDS.has(token));
+    if (unshown.length) score = Math.min(score, 0.65);
+  }
+
+  // A grape on the label that the catalog row does not name: a varietal row
+  // ("Rutini, Cabernet Franc") is not the blend on the label ("Cabernet Franc - Malbec").
+  const missingGrape = [...labelIdentity].some((token) => GRAPE_WORDS.has(token) && !candidateIdentity.has(token));
+  if (missingGrape || producerMissing) score = Math.min(score, 0.65);
 
   // A row for another vintage is another bottle (its notes and scores differ):
   // keep it below the match threshold so it is offered as an alternative.
@@ -189,7 +220,10 @@ function strip(list: Array<ScoredCandidate & { raw: number }>): ScoredCandidate[
   return list.map(({ raw: _raw, ...candidate }) => candidate);
 }
 
+// The same wine catalogued twice ("Vinho Rutini Cabernet / Malbec" and
+// "Rutini, Cabernet Malbec, Mendoza") differs only by generic and place words.
 function sameWine(a: CatalogCandidate, b: CatalogCandidate) {
-  const name = (candidate: CatalogCandidate) => tokens([candidate.displayName, candidate.producer].join(" ")).sort().join(" ");
+  const places = new Set([...(a.places ?? []), ...(b.places ?? [])].flatMap((place) => tokens(place)));
+  const name = (candidate: CatalogCandidate) => [...new Set(tokens([candidate.displayName, candidate.producer].join(" ")))].filter((token) => !places.has(token)).sort().join(" ");
   return name(a) === name(b);
 }

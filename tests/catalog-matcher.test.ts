@@ -80,6 +80,38 @@ describe("catalog matcher", () => {
     expect(decision).toMatchObject({ status: "matched", best: { id: "nature" } });
   });
 
+  it("ignores company suffixes and duplicate rows that differ only by region", () => {
+    const decision = decideMatch(
+      reading({ displayName: "Rutini Cabernet - Malbec", producerName: "Rutini Wines", wine: "Cabernet - Malbec", vintage: "2018" }),
+      [row("shop", "Vinho Rutini Cabernet / Malbec"), row("lwin", "Rutini, Cabernet Malbec, Mendoza", { producer: "Rutini", hasImage: false, places: ["Mendoza", "Argentina"] })],
+    );
+    expect(decision).toMatchObject({ status: "matched", best: { id: "shop" } });
+  });
+
+  it("does not match another wine of the producer whose name the label does not show", () => {
+    const decision = decideMatch(
+      reading({ displayName: "Rutini Cabernet Franc Malbec", producerName: "Rutini Wines", wine: "Cabernet Franc Malbec", vintage: "2022" }),
+      [row("dominio", "Rutini, Dominio Malbec Cabernet Franc, Uco Valley", { producer: "Rutini", places: ["Uco Valley", "Argentina"] })],
+    );
+    expect(decision.status).toBe("no_match");
+  });
+
+  it("does not match a varietal row when the label names a blend", () => {
+    const decision = decideMatch(
+      reading({ displayName: "Rutini Cabernet Franc Malbec", producerName: "Rutini Wines", wine: "Cabernet Franc Malbec", region: "Mendoza", vintage: "2022" }),
+      [row("varietal", "Rutini, Cabernet Franc, Mendoza", { producer: "Rutini", places: ["Mendoza", "Argentina"] })],
+    );
+    expect(decision.status).toBe("no_match");
+  });
+
+  it("does not match the same wine name from another producer", () => {
+    const decision = decideMatch(
+      reading({ displayName: "Rutini Cabernet Franc Malbec", producerName: "Rutini Wines", wine: "Cabernet Franc Malbec", region: "Mendoza" }),
+      [row("absurdo", "Absurdo, Cabernet Franc Malbec, Mendoza", { producer: "Absurdo", places: ["Mendoza", "Argentina"] })],
+    );
+    expect(decision.status).toBe("no_match");
+  });
+
   it("searches accented and unaccented spellings, without a producer-only term", () => {
     const terms = searchTerms(reading({ displayName: "Casa Perini Fração Única", producerName: "Casa Perini", wine: "Fração Única" }));
     expect(terms).toContain("perini fracao unica");
