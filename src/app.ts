@@ -379,6 +379,51 @@ export function createApp(dependencies: AppDependencies) {
     }),
   );
 
+  // Sommelier VINATO: Premium-only chat agent.
+  const sommelier = () => {
+    if (!dependencies.sommelier) throw new HttpError(503, "Sommelier indisponível.", "Service Unavailable");
+    return dependencies.sommelier;
+  };
+
+  app.get(
+    "/sommelier/conversations",
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      requirePremium(user);
+      res.json(await sommelier().listConversations(user.id));
+    }),
+  );
+
+  app.get(
+    "/sommelier/conversations/:id/messages",
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      requirePremium(user);
+      res.json(await sommelier().getMessages(user.id, req.params.id));
+    }),
+  );
+
+  app.delete(
+    "/sommelier/conversations/:id",
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      requirePremium(user);
+      await sommelier().deleteConversation(user.id, req.params.id);
+      res.status(204).send();
+    }),
+  );
+
+  app.post(
+    "/sommelier/chat",
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      requirePremium(user);
+      const message = typeof req.body?.message === "string" ? req.body.message : "";
+      const conversationId = typeof req.body?.conversationId === "string" && req.body.conversationId ? req.body.conversationId : undefined;
+      res.json(await sommelier().chat(user.id, { conversationId, message }));
+    }),
+  );
+
   app.post(
     "/wine-scanner/scan",
     uploadSingleImage(),

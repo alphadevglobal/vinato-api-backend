@@ -1,4 +1,5 @@
 import { createApp } from "./app.js";
+import { SommelierAgent } from "./sommelier.service.js";
 import { PgScanAuditRepository } from "./scan-audit.repository.js";
 import { config } from "./config.js";
 import { pool } from "./db.js";
@@ -11,6 +12,7 @@ const app = createApp({
   wineScanner: new OpenRouterWineScanner(),
   accountRepository: new AccountRepository(pool),
   scanAudit: new PgScanAuditRepository(pool),
+  sommelier: new SommelierAgent(pool),
 });
 
 app.listen(config.port, () => {

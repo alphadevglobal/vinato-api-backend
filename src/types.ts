@@ -170,6 +170,7 @@ export type AppDependencies = {
   wineScanner: WineScanner;
   accountRepository?: import("./account.repository.js").AccountRepository;
   scanAudit?: import("./scan-audit.repository.js").ScanAuditLog;
+  sommelier?: import("./sommelier.service.js").SommelierAgent;
 };
 
 export type AsyncRequestHandler = (

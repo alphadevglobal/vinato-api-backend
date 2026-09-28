@@ -1,0 +1,184 @@
+import type pg from "pg";
+import { config } from "./config.js";
+import { HttpError, internalServerError, notFound } from "./http-error.js";
+
+export type SommelierConfig = {
+  model: string;
+  systemPrompt: string;
+  reasoningEnabled: boolean;
+  temperature: number;
+  maxOutputTokens: number;
+  historyMessages: number;
+  dailyMessageLimit: number;
+};
+
+export type ChatTurn = { role: "system" | "user" | "assistant"; content: string; reasoning_details?: unknown };
+export type Completion = { content: string; reasoningDetails: unknown; model: string; promptTokens?: number; completionTokens?: number };
+export type CompleteChat = (messages: ChatTurn[], settings: SommelierConfig) => Promise<Completion>;
+
+export type SommelierMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
+export type SommelierConversation = { id: string; title: string; createdAt: string; updatedAt: string };
+
+const DEFAULT_CONFIG: SommelierConfig = {
+  model: "deepseek/deepseek-v3.2",
+  systemPrompt: "Você é o Sommelier VINATO. Responda em português do Brasil, apenas sobre vinhos, com responsabilidade.",
+  reasoningEnabled: true,
+  temperature: 0.7,
+  maxOutputTokens: 1200,
+  historyMessages: 20,
+  dailyMessageLimit: 60,
+};
+const MAX_MESSAGE_LENGTH = 2000;
+const REQUEST_TIMEOUT_MS = 50_000; // below Vercel's 60 s function limit
+
+/** OpenRouter chat completion, preserving reasoning_details between turns. */
+export const openRouterChat: CompleteChat = async (messages, settings) => {
+  if (!config.sommelierApiKey) throw internalServerError("Sommelier temporariamente indisponível.");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { Authorization: `Bearer ${config.sommelierApiKey}`, "Content-Type": "application/json", "HTTP-Referer": "https://vinatoapp.com", "X-Title": "VINATO Sommelier" },
+      body: JSON.stringify({
+        model: settings.model,
+        messages,
+        temperature: settings.temperature,
+        max_tokens: settings.maxOutputTokens,
+        ...(settings.reasoningEnabled ? { reasoning: { enabled: true } } : {}),
+      }),
+    });
+  } catch (error) {
+    if ((error as Error).name === "AbortError") throw new HttpError(504, "O Sommelier demorou para responder. Tente novamente.", "Gateway Timeout");
+    throw internalServerError("Não foi possível falar com o Sommelier agora.");
+  } finally {
+    clearTimeout(timeout);
+  }
+  const body = await response.text();
+  if (!response.ok) {
+    console.error("[sommelier] OpenRouter error", response.status, body.slice(0, 300));
+    throw internalServerError("Não foi possível falar com o Sommelier agora.");
+  }
+  const payload = JSON.parse(body) as {
+    model?: string;
+    choices?: Array<{ message?: { content?: string | null; reasoning_details?: unknown } }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number };
+  };
+  const message = payload.choices?.[0]?.message;
+  const content = message?.content?.trim();
+  if (!content) throw internalServerError("O Sommelier não conseguiu responder agora.");
+  return { content, reasoningDetails: message?.reasoning_details ?? null, model: payload.model ?? settings.model, promptTokens: payload.usage?.prompt_tokens, completionTokens: payload.usage?.completion_tokens };
+};
+
+export class SommelierAgent {
+  constructor(private readonly pool: pg.Pool, private readonly complete: CompleteChat = openRouterChat) {}
+
+  async getConfig(): Promise<SommelierConfig> {
+    const row = (await this.pool.query(`SELECT * FROM sommelier_agent_config WHERE id = 1`)).rows[0];
+    if (!row) return DEFAULT_CONFIG;
+    return {
+      model: row.model, systemPrompt: row.system_prompt, reasoningEnabled: row.reasoning_enabled, temperature: Number(row.temperature),
+      maxOutputTokens: row.max_output_tokens, historyMessages: row.history_messages, dailyMessageLimit: row.daily_message_limit,
+    };
+  }
+
+  async listConversations(userId: string): Promise<SommelierConversation[]> {
+    const result = await this.pool.query(
+      `SELECT id, title, created_at AS "createdAt", updated_at AS "updatedAt" FROM sommelier_conversations WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 50`,
+      [userId],
+    );
+    return result.rows;
+  }
+
+  async getMessages(userId: string, conversationId: string): Promise<SommelierMessage[]> {
+    await this.ownedConversation(userId, conversationId);
+    const result = await this.pool.query(
+      `SELECT id, role, content, created_at AS "createdAt" FROM sommelier_messages WHERE conversation_id = $1 ORDER BY created_at ASC`,
+      [conversationId],
+    );
+    return result.rows;
+  }
+
+  async deleteConversation(userId: string, conversationId: string) {
+    await this.ownedConversation(userId, conversationId);
+    await this.pool.query(`DELETE FROM sommelier_conversations WHERE id = $1`, [conversationId]);
+  }
+
+  async chat(userId: string, input: { conversationId?: string; message: string }) {
+    const text = input.message.trim();
+    if (!text) throw new HttpError(400, "Escreva sua pergunta para o Sommelier.", "Bad Request");
+    if (text.length > MAX_MESSAGE_LENGTH) throw new HttpError(400, `Mensagem muito longa (máximo de ${MAX_MESSAGE_LENGTH} caracteres).`, "Bad Request");
+    const settings = await this.getConfig();
+
+    const sentToday = (await this.pool.query(
+      `SELECT count(*)::int AS n FROM sommelier_messages m JOIN sommelier_conversations c ON c.id = m.conversation_id
+       WHERE c.user_id = $1 AND m.role = 'user' AND m.created_at >= date_trunc('day', now() AT TIME ZONE 'America/Sao_Paulo') AT TIME ZONE 'America/Sao_Paulo'`,
+      [userId],
+    )).rows[0]?.n ?? 0;
+    if (sentToday >= settings.dailyMessageLimit) {
+      throw new HttpError(429, `Você atingiu o limite de ${settings.dailyMessageLimit} mensagens por dia com o Sommelier. Volte amanhã.`, "Too Many Requests");
+    }
+
+    const existing = input.conversationId ? await this.ownedConversation(userId, input.conversationId) : null;
+    const history = existing ? (await this.pool.query(
+      `SELECT role, content, reasoning_details FROM (
+         SELECT role, content, reasoning_details, created_at FROM sommelier_messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2
+       ) recent ORDER BY created_at ASC`,
+      [existing.id, settings.historyMessages],
+    )).rows as Array<{ role: "user" | "assistant"; content: string; reasoning_details: unknown }> : [];
+
+    const messages: ChatTurn[] = [
+      { role: "system", content: settings.systemPrompt },
+      ...history.map((turn) => (turn.role === "assistant" && turn.reasoning_details ? { role: turn.role, content: turn.content, reasoning_details: turn.reasoning_details } : { role: turn.role, content: turn.content })),
+      { role: "user", content: text },
+    ];
+
+    // Ask the model first: nothing is stored (and nothing counts toward the
+    // daily limit) when the model fails.
+    const startedAt = Date.now();
+    const completion = await this.complete(messages, settings);
+    const durationMs = Date.now() - startedAt;
+
+    const client = await this.pool.connect();
+    let conversation: SommelierConversation;
+    let userMessage: SommelierMessage;
+    let reply: SommelierMessage;
+    try {
+      await client.query("BEGIN");
+      conversation = existing ?? (await client.query(
+        `INSERT INTO sommelier_conversations (user_id, title) VALUES ($1, $2) RETURNING id, title, created_at AS "createdAt", updated_at AS "updatedAt"`,
+        [userId, text.length > 60 ? `${text.slice(0, 57)}...` : text],
+      )).rows[0];
+      userMessage = (await client.query(
+        `INSERT INTO sommelier_messages (conversation_id, role, content, created_at) VALUES ($1, 'user', $2, now() - interval '1 millisecond') RETURNING id, role, content, created_at AS "createdAt"`,
+        [conversation.id, text],
+      )).rows[0];
+      reply = (await client.query(
+        `INSERT INTO sommelier_messages (conversation_id, role, content, reasoning_details, model, prompt_tokens, completion_tokens, duration_ms)
+         VALUES ($1, 'assistant', $2, $3::jsonb, $4, $5, $6, $7) RETURNING id, role, content, created_at AS "createdAt"`,
+        [conversation.id, completion.content, completion.reasoningDetails == null ? null : JSON.stringify(completion.reasoningDetails), completion.model, completion.promptTokens ?? null, completion.completionTokens ?? null, durationMs],
+      )).rows[0];
+      await client.query(`UPDATE sommelier_conversations SET updated_at = now() WHERE id = $1`, [conversation.id]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    return { conversation, userMessage, reply, remainingToday: Math.max(0, settings.dailyMessageLimit - sentToday - 1) };
+  }
+
+  private async ownedConversation(userId: string, conversationId: string): Promise<SommelierConversation> {
+    if (!/^[0-9a-f-]{36}$/i.test(conversationId)) throw notFound("Conversa não encontrada.");
+    const row = (await this.pool.query(
+      `SELECT id, title, created_at AS "createdAt", updated_at AS "updatedAt" FROM sommelier_conversations WHERE id = $1 AND user_id = $2`,
+      [conversationId, userId],
+    )).rows[0];
+    if (!row) throw notFound("Conversa não encontrada.");
+    return row;
+  }
+}
