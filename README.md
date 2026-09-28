@@ -53,4 +53,6 @@ A licença informada pelo dataset é `CC BY-NC-ND 4.0`. Estes dados são marcado
 
 O endpoint `POST /wine-scanner/scan` recebe `multipart/form-data` no campo `image`. Quando `OPENROUTER_API_KEY` está configurado, a API chama o modelo definido em `OPENROUTER_MODEL` para extrair os dados do rótulo.
 
-O modelo primário padrão é `google/gemini-2.5-flash`. Se o OpenRouter responder `402 Insufficient credits`, a API tenta automaticamente o modelo configurado em `OPENROUTER_FALLBACK_MODEL`, cujo padrão é `google/gemma-4-26b-a4b-it:free`.
+Os modelos definidos em `OPENROUTER_MODEL` e `OPENROUTER_FALLBACK_MODEL` são os padrões de inicialização. Depois da migration `013_ai_model_settings.sql`, o painel administrativo grava o modelo principal e o fallback em `scanner_agent_config`; a API lê essa configuração a cada scan, portanto alterações feitas no painel entram em vigor sem deploy. Se o modelo principal falhar ou produzir uma leitura fraca, a API tenta o fallback configurado.
+
+O modelo do Sommelier também é dinâmico e fica em `sommelier_agent_config`. O painel consulta o catálogo público do OpenRouter, permite apenas modelos com entrada de imagem para o scanner e registra cada alteração em `admin_audit_log`.

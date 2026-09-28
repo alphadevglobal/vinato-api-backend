@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { defaultScannerModels, type ScannerModelSettingsProvider } from "./ai-model-settings.js";
 import { internalServerError } from "./http-error.js";
 import type { ScanTrace } from "./scan-audit.repository.js";
 import type { ScanWineLabelResult, ScannedWineData, WineScanner } from "./types.js";
@@ -30,12 +31,15 @@ grapes, volume, confidence, notes. confidence e um numero de 0 a 1.
 `;
 
 export class OpenRouterWineScanner implements WineScanner {
+  constructor(private readonly settings?: ScannerModelSettingsProvider) {}
+
   async scanWineLabel(file: Express.Multer.File, trace?: ScanTrace): Promise<ScanWineLabelResult> {
     if (!config.openRouterApiKey) {
       throw internalServerError("Serviço de reconhecimento temporariamente indisponível.");
     }
 
     const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
+    const models = this.settings ? await this.settings.getScannerModels() : defaultScannerModels();
     // Primary model first; the stronger fallback only reads the label when the
     // primary fails or returns a weak reading. (Racing both returned whichever
     // answered first, not whichever read better.)
@@ -43,15 +47,15 @@ export class OpenRouterWineScanner implements WineScanner {
     let data: ScannedWineData | undefined;
     let modelUsed: string | undefined;
     try {
-      data = await identifyWithModel(config.openRouterModel, imageDataUrl, trace);
-      modelUsed = config.openRouterModel;
+      data = await identifyWithModel(models.model, imageDataUrl, trace);
+      modelUsed = models.model;
     } catch {
       data = undefined;
     }
-    if ((!data || isWeakReading(data)) && config.openRouterFallbackModel !== config.openRouterModel) {
+    if ((!data || isWeakReading(data)) && models.fallbackModel !== models.model) {
       try {
-        const second = await identifyWithModel(config.openRouterFallbackModel, imageDataUrl, trace);
-        if (!data || readingScore(second) > readingScore(data)) { data = second; modelUsed = config.openRouterFallbackModel; }
+        const second = await identifyWithModel(models.fallbackModel, imageDataUrl, trace);
+        if (!data || readingScore(second) > readingScore(data)) { data = second; modelUsed = models.fallbackModel; }
       } catch {
         // Keep the primary reading, if any.
       }

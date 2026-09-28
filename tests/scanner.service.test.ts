@@ -84,6 +84,19 @@ describe("OpenRouterWineScanner", () => {
     expect(result.data.region).toBeNull();
     expect(result.data.vintage).toBeNull();
   });
+
+  it("uses models selected at runtime for each scan", async () => {
+    process.env.OPENROUTER_API_KEY = "test-key";
+    const fetchMock = vi.fn().mockResolvedValueOnce(modelReply('{"displayName":"Runtime Wine","confidence":0.9,"notes":""}'));
+    vi.stubGlobal("fetch", fetchMock);
+    const { OpenRouterWineScanner } = await import("../src/scanner.service.js");
+    const getScannerModels = vi.fn(async () => ({ model: "runtime/vision-model", fallbackModel: "runtime/fallback" }));
+
+    await new OpenRouterWineScanner({ getScannerModels }).scanWineLabel({ buffer: Buffer.from("image"), mimetype: "image/jpeg" } as Express.Multer.File);
+
+    expect(getScannerModels).toHaveBeenCalledOnce();
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).model).toBe("runtime/vision-model");
+  });
 });
 
 function modelReply(content: string) {

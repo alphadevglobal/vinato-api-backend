@@ -6,11 +6,14 @@ import { pool } from "../src/db.js";
 import { OpenRouterWineScanner } from "../src/scanner.service.js";
 import { PgWineRepository } from "../src/wines.repository.js";
 import { AccountRepository } from "../src/account.repository.js";
+import { PgAiModelSettings } from "../src/ai-model-settings.js";
+
+const aiModelSettings = new PgAiModelSettings(pool);
 import { PgScanAuditRepository } from "../src/scan-audit.repository.js";
 
 const app = createApp({
   wineRepository: new PgWineRepository(pool),
-  wineScanner: new OpenRouterWineScanner(),
+  wineScanner: new OpenRouterWineScanner(aiModelSettings),
   accountRepository: new AccountRepository(pool),
   scanAudit: new PgScanAuditRepository(pool),
   sommelier: new SommelierAgent(pool),
