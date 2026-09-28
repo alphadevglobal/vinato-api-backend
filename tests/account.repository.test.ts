@@ -21,3 +21,14 @@ describe("legacy account password migration", () => {
     expect(verifyLegacyPassword(password, `pbkdf2_sha256$100000$${salt}$${hash}`)).toBe(true);
   });
 });
+
+describe("effective plan", () => {
+  it("keeps permanent premium, honours the end date and downgrades after it", async () => {
+    const { effectivePlan } = await import("../src/account.repository.js");
+    const now = new Date("2026-09-28T12:00:00Z");
+    expect(effectivePlan("premium", null, now)).toBe("premium");
+    expect(effectivePlan("premium", new Date("2026-10-28T23:59:59Z"), now)).toBe("premium");
+    expect(effectivePlan("premium", new Date("2026-09-27T23:59:59Z"), now)).toBe("free");
+    expect(effectivePlan("free", null, now)).toBe("free");
+  });
+});
