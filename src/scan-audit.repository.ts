@@ -1,7 +1,16 @@
 import type pg from "pg";
 import type { ScannedWineData } from "./types.js";
 
-export type ModelAttempt = { model: string; ok: boolean; ms: number; status?: number; error?: string };
+export type ModelAttempt = {
+  model: string;
+  ok: boolean;
+  ms: number;
+  status?: number;
+  error?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+};
 
 /** Filled in by the scanner and the catalog matcher while a scan runs. */
 export type ScanTrace = {

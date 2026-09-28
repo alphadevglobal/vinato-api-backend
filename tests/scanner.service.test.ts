@@ -97,10 +97,34 @@ describe("OpenRouterWineScanner", () => {
     expect(getScannerModels).toHaveBeenCalledOnce();
     expect(JSON.parse(fetchMock.mock.calls[0][1].body).model).toBe("runtime/vision-model");
   });
+
+  it("records OpenRouter token usage in the scan trace", async () => {
+    process.env.OPENROUTER_API_KEY = "test-key";
+    const fetchMock = vi.fn().mockResolvedValueOnce(modelReply(
+      '{"displayName":"Token Wine","confidence":0.9,"notes":""}',
+      { prompt_tokens: 812, completion_tokens: 143, total_tokens: 955 },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const { OpenRouterWineScanner } = await import("../src/scanner.service.js");
+    const trace = { modelsTried: [], catalogQueried: false };
+
+    await new OpenRouterWineScanner({ getScannerModels: async () => ({ model: "token-model", fallbackModel: "fallback-model" }) }).scanWineLabel(
+      { buffer: Buffer.from("image"), mimetype: "image/jpeg" } as Express.Multer.File,
+      trace,
+    );
+
+    expect(trace.modelsTried).toEqual([expect.objectContaining({
+      model: "token-model",
+      ok: true,
+      promptTokens: 812,
+      completionTokens: 143,
+      totalTokens: 955,
+    })]);
+  });
 });
 
-function modelReply(content: string) {
-  return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+function modelReply(content: string, usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }) {
+  return new Response(JSON.stringify({ choices: [{ message: { content } }], usage }), { status: 200 });
 }
 
 async function scanWith(fetchMock: ReturnType<typeof vi.fn>) {

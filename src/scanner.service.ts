@@ -68,7 +68,7 @@ export class OpenRouterWineScanner implements WineScanner {
 
 async function identifyWithModel(model: string, imageDataUrl: string, trace?: ScanTrace) {
   const startedAt = Date.now();
-  const attempt = (ok: boolean, extra: { status?: number; error?: string } = {}) =>
+  const attempt = (ok: boolean, extra: { status?: number; error?: string; promptTokens?: number; completionTokens?: number; totalTokens?: number } = {}) =>
     trace?.modelsTried.push({ model, ok, ms: Date.now() - startedAt, ...extra });
   try {
     const response = await callOpenRouter(model, imageDataUrl);
@@ -76,7 +76,12 @@ async function identifyWithModel(model: string, imageDataUrl: string, trace?: Sc
     const parsed = parseModelJson(response.payload.choices?.[0]?.message?.content);
     const data = normalizeScannedWineData(parsed);
     if (!hasWineIdentity(data)) throw new Error("EMPTY_WINE_IDENTITY: o modelo não identificou produtor nem vinho");
-    attempt(true, { status: 200 });
+    attempt(true, {
+      status: 200,
+      promptTokens: response.payload.usage?.prompt_tokens,
+      completionTokens: response.payload.usage?.completion_tokens,
+      totalTokens: response.payload.usage?.total_tokens,
+    });
     return data;
   } catch (error) {
     attempt(false, { status: (error as { status?: number }).status, error: (error as Error).message });
@@ -86,6 +91,7 @@ async function identifyWithModel(model: string, imageDataUrl: string, trace?: Sc
 
 type OpenRouterPayload = {
   choices?: Array<{ message?: { content?: unknown } }>;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
 };
 
 type OpenRouterResult =
