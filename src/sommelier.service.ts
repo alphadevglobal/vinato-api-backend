@@ -29,6 +29,35 @@ const DEFAULT_CONFIG: SommelierConfig = {
   dailyMessageLimit: 60,
 };
 const MAX_MESSAGE_LENGTH = 2000;
+const BURST_LIMIT_PER_MINUTE = 6;
+export const GUARDED_REPLY = "Esse não é o meu trabalho: sou o sommelier do VINATO e só converso sobre vinhos. Posso te ajudar a escolher um vinho ou uma harmonização?";
+
+// Secret-shaped text that must never reach the user, whatever the model says.
+const SECRET_PATTERNS = [
+  /\bsk-(or-v1-|ant-|proj-)?[A-Za-z0-9_-]{16,}/i,                 // API keys (OpenRouter, OpenAI, Anthropic...)
+  /\b(postgres(ql)?|mysql|mongodb(\+srv)?|redis):\/\/\S+/i,         // database URLs
+  /\bnpg_[A-Za-z0-9]{8,}/,                                          // Neon passwords
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/, // JWTs
+  /\bBearer\s+[A-Za-z0-9._-]{20,}/i,
+  /\b(OPENROUTER|SOMMELIER_OPENROUTER|DATABASE|GOOGLE_CLIENT|APPLE)_[A-Z_]*\s*[=:]/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+];
+
+/**
+ * Last line of defence after the model: blocks replies that contain secrets
+ * or reproduce the agent's instructions (prompt extraction), and strips the
+ * markdown the app cannot render. The model never receives secrets or user
+ * data, so this should never trigger; if it does, the reply is replaced.
+ */
+export function guardReply(reply: string, systemPrompt: string): { content: string; blocked: boolean } {
+  if (SECRET_PATTERNS.some((pattern) => pattern.test(reply))) return { content: GUARDED_REPLY, blocked: true };
+  const normalize = (text: string) => text.toLowerCase().replace(/\s+/g, " ").trim();
+  const replyText = normalize(reply);
+  const leakedLines = systemPrompt.split("\n").map(normalize).filter((line) => line.length >= 40 && replyText.includes(line));
+  if (leakedLines.length >= 2) return { content: GUARDED_REPLY, blocked: true };
+  const content = reply.replace(/```[\s\S]*?```/g, "").replace(/\*\*(.+?)\*\*/g, "$1").replace(/^#{1,6}\s+/gm, "").trim();
+  return { content: content || GUARDED_REPLY, blocked: !content };
+}
 const REQUEST_TIMEOUT_MS = 50_000; // below Vercel's 60 s function limit
 
 /** OpenRouter chat completion, preserving reasoning_details between turns. */
@@ -117,6 +146,14 @@ export class SommelierAgent {
        WHERE c.user_id = $1 AND m.role = 'user' AND m.created_at >= date_trunc('day', now() AT TIME ZONE 'America/Sao_Paulo') AT TIME ZONE 'America/Sao_Paulo'`,
       [userId],
     )).rows[0]?.n ?? 0;
+    const lastMinute = (await this.pool.query(
+      `SELECT count(*)::int AS n FROM sommelier_messages m JOIN sommelier_conversations c ON c.id = m.conversation_id
+       WHERE c.user_id = $1 AND m.role = 'user' AND m.created_at >= now() - interval '1 minute'`,
+      [userId],
+    )).rows[0]?.n ?? 0;
+    if (lastMinute >= BURST_LIMIT_PER_MINUTE) {
+      throw new HttpError(429, "Muitas mensagens em sequência. Aguarde um minuto e tente novamente.", "Too Many Requests");
+    }
     if (sentToday >= settings.dailyMessageLimit) {
       throw new HttpError(429, `Você atingiu o limite de ${settings.dailyMessageLimit} mensagens por dia com o Sommelier. Volte amanhã.`, "Too Many Requests");
     }
@@ -140,6 +177,8 @@ export class SommelierAgent {
     const startedAt = Date.now();
     const completion = await this.complete(messages, settings);
     const durationMs = Date.now() - startedAt;
+    const guarded = guardReply(completion.content, settings.systemPrompt);
+    if (guarded.blocked) console.warn("[sommelier] reply blocked by the output guard");
 
     const client = await this.pool.connect();
     let conversation: SommelierConversation;
@@ -158,7 +197,7 @@ export class SommelierAgent {
       reply = (await client.query(
         `INSERT INTO sommelier_messages (conversation_id, role, content, reasoning_details, model, prompt_tokens, completion_tokens, duration_ms)
          VALUES ($1, 'assistant', $2, $3::jsonb, $4, $5, $6, $7) RETURNING id, role, content, created_at AS "createdAt"`,
-        [conversation.id, completion.content, completion.reasoningDetails == null ? null : JSON.stringify(completion.reasoningDetails), completion.model, completion.promptTokens ?? null, completion.completionTokens ?? null, durationMs],
+        [conversation.id, guarded.content, guarded.blocked || completion.reasoningDetails == null ? null : JSON.stringify(completion.reasoningDetails), completion.model, completion.promptTokens ?? null, completion.completionTokens ?? null, durationMs],
       )).rows[0];
       await client.query(`UPDATE sommelier_conversations SET updated_at = now() WHERE id = $1`, [conversation.id]);
       await client.query("COMMIT");
