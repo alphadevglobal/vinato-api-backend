@@ -12,6 +12,7 @@ import type {
   ScanWineLabelResult,
 } from "./types.js";
 import { mapWineRow } from "./wine-mapper.js";
+import { createHash } from "node:crypto";
 import type pg from "pg";
 
 const baseSelect = `
@@ -85,13 +86,15 @@ const STYLE_SQL = `CASE lower(btrim(COALESCE(NULLIF(btrim(color), ''), NULLIF(bt
   ELSE initcap(btrim(COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), ''))))
 END`;
 
+const scanImageDataUrl = (file: Express.Multer.File) => `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
+
 export class PgWineRepository implements WineRepository {
   private exploreCache?: { value: ExploreCatalog; expiresAt: number };
 
   constructor(private readonly pool: pg.Pool) {}
 
   async logUnlistedScan(file: Express.Multer.File, userId?: string, extractedData: Record<string, unknown> = {}) {
-    const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
+    const imageDataUrl = scanImageDataUrl(file);
     const result = await this.pool.query<{ unlisted_code: string }>(
       `INSERT INTO unlisted_wine_scans (unlisted_code, image_data_url, extracted_data, user_id)
        VALUES ('VINATO-UNLISTED-' || to_char(now(), 'YYYYMMDD') || '-' || upper(encode(gen_random_bytes(4), 'hex')), $1, $2::jsonb, $3)
@@ -99,6 +102,46 @@ export class PgWineRepository implements WineRepository {
       [imageDataUrl, JSON.stringify(extractedData), userId ?? null],
     );
     return { status: "needs_registration" as const, code: result.rows[0].unlisted_code };
+  }
+
+  /**
+   * The newest unmatched scan with this exact photo (md5 of the data URL, the
+   * generated image_md5 column). Retries and re-uploads of the same file used to
+   * store the photo again on every scan.
+   */
+  private async findIdenticalScan(imageHash: string) {
+    const result = await this.pool.query<{ unlisted_code: string; status: string; registered_wine_id: string | null }>(
+      `SELECT unlisted_code, status, registered_wine_id FROM unlisted_wine_scans
+       WHERE image_md5 = $1 ORDER BY (registered_wine_id IS NOT NULL) DESC, created_at DESC LIMIT 1`,
+      [imageHash],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  private async countResubmission(code: string) {
+    await this.pool.query(
+      `UPDATE unlisted_wine_scans SET resubmissions = resubmissions + 1, last_submitted_at = now() WHERE unlisted_code = $1`,
+      [code],
+    );
+  }
+
+  // The photo is a bonus: failing to store it must not fail the scan.
+  private async attachScanImage(wineId: string, file: Express.Multer.File) {
+    try {
+      // jsonb_build_object takes "any": the parameter must be typed ($2::text),
+      // otherwise Postgres rejects it (42P18) and every such scan failed.
+      const updated = await this.pool.query(
+        `UPDATE catalog_wines SET images = jsonb_build_array(jsonb_build_object(
+           'url', $2::text, 'source', 'user_scan', 'review_status', 'pending', 'captured_at', now()
+         )), updated_at = now()
+         WHERE id = $1 AND (images IS NULL OR images = '[]'::jsonb)`,
+        [wineId, scanImageDataUrl(file)],
+      );
+      return (updated.rowCount ?? 0) > 0;
+    } catch (error) {
+      console.error("[wine-scanner] could not store the scan photo", error);
+      return false;
+    }
   }
 
   async findScanCandidates(data: ScannedWineData): Promise<CatalogCandidate[]> {
@@ -137,6 +180,16 @@ export class PgWineRepository implements WineRepository {
 
   async reconcileScan(data: ScannedWineData, file: Express.Multer.File, userId?: string, trace?: ScanTrace): Promise<NonNullable<ScanWineLabelResult["catalog"]>> {
     const startedAt = Date.now();
+    const imageHash = createHash("md5").update(scanImageDataUrl(file)).digest("hex");
+    const identical = await this.findIdenticalScan(imageHash);
+    // The admin already linked this exact photo to a catalog wine: that is the answer,
+    // even when the label reading still does not match the catalog on its own.
+    if (identical?.registered_wine_id) {
+      await this.countResubmission(identical.unlisted_code);
+      const imageAdded = await this.attachScanImage(identical.registered_wine_id, file);
+      return { status: "matched", wineId: identical.registered_wine_id, imageAdded, alternatives: [] };
+    }
+
     if (trace) trace.catalogQueried = true;
     const candidates = await this.findScanCandidates(data);
     if (trace) { trace.catalogCandidates = candidates.length; trace.catalogMs = Date.now() - startedAt; }
@@ -145,26 +198,14 @@ export class PgWineRepository implements WineRepository {
 
     if (decision.status === "matched") {
       const { best } = decision;
-      let imageAdded = false;
-      if (!best.hasImage) {
-        const imageDataUrl = `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
-        // jsonb_build_object takes "any": the parameter must be typed ($2::text),
-        // otherwise Postgres rejects it (42P18) and every such scan failed.
-        // The photo is a bonus: failing to store it must not fail the scan.
-        try {
-          const updated = await this.pool.query(
-            `UPDATE catalog_wines SET images = jsonb_build_array(jsonb_build_object(
-               'url', $2::text, 'source', 'user_scan', 'review_status', 'pending', 'captured_at', now()
-             )), updated_at = now()
-             WHERE id = $1 AND (images IS NULL OR images = '[]'::jsonb)`,
-            [best.id, imageDataUrl],
-          );
-          imageAdded = (updated.rowCount ?? 0) > 0;
-        } catch (error) {
-          console.error("[wine-scanner] could not store the scan photo", error);
-        }
-      }
+      const imageAdded = best.hasImage ? false : await this.attachScanImage(best.id, file);
       return { status: "matched", wineId: best.id, imageAdded, matchScore: best.score, alternatives };
+    }
+
+    // Same photo already waiting in the queue (or rejected): reuse its code instead of storing it again.
+    if (identical) {
+      await this.countResubmission(identical.unlisted_code);
+      return { status: "needs_registration", code: identical.unlisted_code, alternatives };
     }
 
     const logged = await this.logUnlistedScan(file, userId, { ...data, catalogCandidates: alternatives });
