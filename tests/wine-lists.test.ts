@@ -291,6 +291,29 @@ describe("WineListRepository (migration 017)", () => {
     expect((await repository.listsOf(owner)).map((list) => list.restaurantId)).toEqual([mine.restaurant.id]);
   });
 
+  it("transcribes a saved list again: same list and files, new items, every attempt kept", async () => {
+    const failed = await repository.saveList(record({ items: [], status: "failed", errorMessage: "vision: answer_cut_by_token_limit", attempts: [{ model: "vision", ok: false, ms: 50000, error: "answer_cut_by_token_limit", costUsd: 0.01 }], usage: { totalTokens: 16000, costUsd: 0.01 } }));
+    const source = await repository.retranscriptionSource(failed.id);
+    expect(source).toMatchObject({ restaurantName: "Fasano", city: "São Paulo", checks: 0, usage: { totalTokens: 16000, costUsd: 0.01 } });
+    expect(source!.files).toEqual([{ mimetype: "image/jpeg", dataUrl: record().files[0].dataUrl }]);
+
+    const again = await repository.replaceTranscription(failed.id, {
+      items: [item], status: "transcribed", model: "vision", attempts: [{ model: "vision", ok: true, ms: 9000, page: 1, costUsd: 0.004 }],
+      usage: { totalTokens: 19000, costUsd: 0.014 }, errorMessage: null, durationMs: 9100,
+    });
+    expect(again).toMatchObject({ id: failed.id, status: "transcribed", restaurant: { name: "Fasano" }, items: [{ name: "Catena Zapata Malbec Argentino" }] });
+    const row = (await db.query<{ attempts: { ok: boolean }[]; item_count: number; error_message: string | null; files: number }>(
+      `select models_tried as attempts, item_count, error_message, (select count(*)::int from wine_list_files f where f.wine_list_id = l.id) as files from wine_lists l where id = $1`, [failed.id])).rows[0];
+    expect(row).toEqual({ attempts: [expect.objectContaining({ ok: false, costUsd: 0.01 }), expect.objectContaining({ ok: true, page: 1 })], item_count: 1, error_message: null, files: 1 });
+    expect(await repository.retranscriptionSource("00000000-0000-4000-8000-000000000000")).toBeNull();
+  });
+
+  it("counts the bottle checks of a list, which a new transcription would remove", async () => {
+    const saved = await repository.saveList(record());
+    await repository.saveCheck({ listId: saved.id, itemId: saved.items[0].id, imageDataUrl: "data:x", durationMs: 1, check: { verdict: "match", confidence: 1, explanation: "", observed: { producer: null, wine: null, vintage: null, region: null, country: null, volume: null }, differences: [], model: "vision", attempts: [], usage: {} } });
+    expect((await repository.retranscriptionSource(saved.id))?.checks).toBe(1);
+  });
+
   it("creates the default wine list AI model", async () => {
     expect((await db.query(`select model, fallback_model from wine_list_agent_config`)).rows).toEqual([{ model: "google/gemini-3.8-flash", fallback_model: "google/gemini-3.1-flash-lite" }]);
   });
@@ -301,13 +324,15 @@ describe("wine list routes", () => {
   const LIST = "aaaaaaaa-0000-4000-8000-000000000001", ITEM = "aaaaaaaa-0000-4000-8000-000000000002", OTHER = "aaaaaaaa-0000-4000-8000-000000000099";
   const RESTAURANT = "aaaaaaaa-0000-4000-8000-000000000003";
   const saved = { id: LIST, status: "transcribed", source: "photo", createdAt: "2026-09-29T00:00:00.000Z", restaurant: { id: "r1", name: "Fasano", city: "São Paulo", address: null }, items: [{ ...item, id: ITEM, position: 0 }] };
-  function appFor(plan: "free" | "premium", overrides: { items?: WineListItem[]; checkModel?: string | null; unreadPages?: number[]; attempts?: object[] } = {}) {
-    const transcribe = vi.fn(async () => ({ restaurant: { name: "Fasano", city: null }, items: overrides.items ?? [item], model: "vision", attempts: overrides.attempts ?? [], usage: { totalTokens: 1500 }, unreadPages: overrides.unreadPages ?? [], pages: 2 }));
+  function appFor(plan: "free" | "premium", overrides: { items?: WineListItem[]; checkModel?: string | null; unreadPages?: number[]; attempts?: object[]; checks?: number } = {}) {
+    const transcribe = vi.fn(async () => ({ restaurant: { name: "Fasano", city: null }, items: overrides.items ?? [item], model: "vision", attempts: overrides.attempts ?? [], usage: { totalTokens: 1500, costUsd: 0.004 }, unreadPages: overrides.unreadPages ?? [], pages: 2 }));
     const checkBottle = vi.fn(async () => ({ verdict: "match" as const, confidence: 0.9, explanation: "Confere.", observed: { producer: "Catena Zapata", wine: "Malbec Argentino", vintage: "2020", region: null, country: null, volume: null }, differences: [], model: overrides.checkModel === undefined ? "vision" : overrides.checkModel, attempts: [], usage: {} }));
     const repository = {
       saveList: vi.fn(async () => saved), findList: vi.fn(async (id: string) => id === LIST ? saved : null), listsOf: vi.fn(async () => [{ id: LIST }]),
       findItem: vi.fn(async (_list: string, id: string) => id === ITEM ? saved.items[0] : null), saveCheck: vi.fn(async () => ({ id: "check-1", createdAt: "2026-09-29T00:00:00.000Z" })),
       canUse: vi.fn(async (id: string) => id === LIST), restaurantExists: vi.fn(async (id: string) => id === RESTAURANT),
+      retranscriptionSource: vi.fn(async (id: string) => id === LIST ? { restaurantName: "Casa Nostra", city: "Recife", usage: { totalTokens: 24978, costUsd: 0.05 }, checks: overrides.checks ?? 0, files: [{ mimetype: "image/jpeg", dataUrl: "data:image/jpeg;base64,AA" }] } : null),
+      replaceTranscription: vi.fn(async () => saved),
     };
     const adminSessions = { adminFor: vi.fn(async (token: string) => token === "admin-token" ? { userId: "admin-1", role: "admin" } : null) };
     const accountRepository = { getUser: vi.fn(async () => user(plan)) };
@@ -373,6 +398,39 @@ describe("wine list routes", () => {
     transcribe.mockRejectedValueOnce(new Error("connection terminated"));
     await request(app).post("/wine-lists").set("Authorization", "Bearer t").attach("files", Buffer.from("x"), { filename: "a.jpg", contentType: "image/jpeg" }).expect(500);
     expect(repository.saveList.mock.calls[0][0]).toMatchObject({ status: "failed", items: [], errorMessage: "erro interno: connection terminated" });
+  });
+
+  it("lets the admin transcribe again a list a user sent, with its saved files", async () => {
+    const { app, transcribe, repository } = appFor("premium");
+    const response = await request(app).post(`/admin/wine-lists/${LIST}/retranscribe`).set("Authorization", "Bearer admin-token").expect(200);
+    expect(response.body).toMatchObject({ id: LIST, items: [{ name: "Catena Zapata Malbec Argentino" }], pages: 2, unreadPages: [] });
+    expect(transcribe.mock.calls[0][0]).toEqual([{ mimetype: "image/jpeg", dataUrl: "data:image/jpeg;base64,AA" }]);
+    expect(transcribe.mock.calls[0][1]).toEqual({ restaurantName: "Casa Nostra", city: "Recife" });
+    // The earlier (billed) attempt still counts.
+    const [id, replaced] = repository.replaceTranscription.mock.calls[0] as unknown as [string, { status: string; errorMessage: string | null; usage: { totalTokens: number; costUsd: number } }];
+    expect(id).toBe(LIST);
+    expect(replaced).toMatchObject({ status: "transcribed", errorMessage: null, usage: { totalTokens: 26478 } });
+    expect(replaced.usage.costUsd).toBeCloseTo(0.054, 6);
+  });
+
+  it("keeps the list failed with the new errors when the models still cannot read it", async () => {
+    const { app, repository } = appFor("premium", { items: [], attempts: [{ model: "vision", ok: false, ms: 9000, error: "invalid_json_answer", page: 1 }] });
+    const response = await request(app).post(`/admin/wine-lists/${LIST}/retranscribe`).set("Authorization", "Bearer admin-token").expect(422);
+    expect(response.body.message).toContain("Não conseguimos ler os vinhos desta carta");
+    expect(repository.replaceTranscription.mock.calls[0][1]).toMatchObject({ status: "failed", items: [], errorMessage: "página 1 · vision: invalid_json_answer" });
+  });
+
+  it("never transcribes again a list with bottle checks, nor without an admin session", async () => {
+    const withChecks = appFor("premium", { checks: 2 });
+    const conflict = await request(withChecks.app).post(`/admin/wine-lists/${LIST}/retranscribe`).set("Authorization", "Bearer admin-token").expect(409);
+    expect(conflict.body.message).toContain("verificações de garrafa");
+    expect(withChecks.transcribe).not.toHaveBeenCalled();
+    const { app, transcribe } = appFor("premium");
+    await request(app).post(`/admin/wine-lists/${LIST}/retranscribe`).expect(401);
+    await request(app).post(`/admin/wine-lists/${LIST}/retranscribe`).set("Authorization", "Bearer user-token").expect(401);
+    await request(app).post(`/admin/wine-lists/${OTHER}/retranscribe`).set("Authorization", "Bearer admin-token").expect(404);
+    await request(app).post("/admin/wine-lists/not-a-uuid/retranscribe").set("Authorization", "Bearer admin-token").expect(404);
+    expect(transcribe).not.toHaveBeenCalled();
   });
 
   it("is a Premium feature and needs a session", async () => {

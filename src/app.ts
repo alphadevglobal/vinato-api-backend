@@ -9,7 +9,7 @@ import { validRating } from "./reviews.repository.js";
 import { newScanTrace, type ScanAuditEntry } from "./scan-audit.repository.js";
 import type { AppDependencies, AsyncRequestHandler, ScannedWineData, ScanWineLabelResult, Wine, WineListQuery } from "./types.js";
 import { verifySocialToken, type SocialProvider } from "./social-auth.js";
-import { requestJson } from "./openrouter.js";
+import { requestJson, type ModelAttempt, type OpenRouterUsage } from "./openrouter.js";
 import { openRouterAccount } from "./openrouter-account.js";
 import { CHECK_BUDGET_MS, TRANSCRIPTION_BUDGET_MS } from "./wine-list.service.js";
 import { DISPOSABLE_EMAIL_MESSAGE, isDisposableEmailAddress } from "./email-policy.js";
@@ -558,24 +558,49 @@ export function createApp(dependencies: AppDependencies) {
       throw error;
     }
     const failed = !transcription.items.length;
-    const pageLabel = (page?: number) => page ? `página ${page} · ` : "";
-    const problems = transcription.attempts.filter((attempt) => !attempt.ok).map((attempt) => `${pageLabel(attempt.page)}${attempt.model}: ${attempt.error ?? "nenhum vinho encontrado"}`);
     const saved = await repository.saveList({
       ...owner,
       restaurant: { ...restaurant, name: restaurant.name ?? transcription.restaurant.name, city: restaurant.city ?? transcription.restaurant.city },
       source, files: listFiles, items: transcription.items,
       status: failed ? "failed" : "transcribed", model: transcription.model, attempts: transcription.attempts, usage: transcription.usage,
-      errorMessage: failed || transcription.unreadPages.length ? (problems.join(" | ") || "nenhum vinho encontrado") : null,
-      durationMs: Date.now() - startedAt,
+      errorMessage: transcriptionProblems(transcription), durationMs: Date.now() - startedAt,
     });
-    if (failed) {
-      const timedOut = transcription.attempts.some((attempt) => attempt.error === "request_timeout" || attempt.error === "no_time_left");
-      throw new HttpError(422, timedOut
-        ? "A leitura da carta demorou demais. Envie menos páginas por vez (as que têm os vinhos que você quer escolher)."
-        : "Não conseguimos ler os vinhos desta carta. Confira se as fotos mostram a lista de vinhos, uma página por foto.", "Unprocessable Entity");
-    }
+    if (failed) throw transcriptionFailure(transcription);
     return { ...saved, pages: transcription.pages, unreadPages: transcription.unreadPages };
   };
+
+  const adminOf = async (req: express.Request) => {
+    const header = req.header("authorization") ?? "";
+    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+    const admin = token && dependencies.adminSessions ? await dependencies.adminSessions.adminFor(token) : null;
+    if (!admin) throw new HttpError(401, "Sessão administrativa inválida.", "Unauthorized");
+    return admin;
+  };
+
+  // Admin "Curadoria Carta de Vinhos" → "Transcrever novamente": reads again the files a
+  // user already sent (e.g. a list that failed), updating the same list.
+  app.post(
+    "/admin/wine-lists/:id/retranscribe",
+    asyncHandler(async (req, res) => {
+      await adminOf(req);
+      const listId = String(req.params.id);
+      const { agent, repository } = wineLists();
+      const source = isUuid(listId) ? await repository.retranscriptionSource(listId) : null;
+      if (!source) throw notFound("Carta não encontrada.");
+      if (!source.files.length) throw badRequest("Esta carta não tem fotos nem PDF salvos para transcrever.");
+      // Checks point at the items a new transcription replaces: they would be lost.
+      if (source.checks > 0) throw new HttpError(409, "Esta carta já tem verificações de garrafa feitas pelos clientes; transcrever de novo apagaria essas verificações.", "Conflict");
+      const startedAt = Date.now();
+      const transcription = await agent.transcribe(source.files, { restaurantName: source.restaurantName, city: source.city }, { deadline: startedAt + TRANSCRIPTION_BUDGET_MS });
+      const failed = !transcription.items.length;
+      const saved = await repository.replaceTranscription(listId, {
+        items: transcription.items, status: failed ? "failed" : "transcribed", model: transcription.model, attempts: transcription.attempts,
+        usage: addUsage(source.usage ?? {}, transcription.usage), errorMessage: transcriptionProblems(transcription), durationMs: Date.now() - startedAt,
+      });
+      if (failed) throw transcriptionFailure(transcription);
+      res.json({ ...saved, pages: transcription.pages, unreadPages: transcription.unreadPages });
+    }),
+  );
 
   // Verificação de carta: the AI transcribes the wine list (photos or one PDF).
   app.post(
@@ -595,10 +620,7 @@ export function createApp(dependencies: AppDependencies) {
     "/admin/wine-lists",
     uploadListFiles(),
     asyncHandler(async (req, res) => {
-      const header = req.header("authorization") ?? "";
-      const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-      const admin = token && dependencies.adminSessions ? await dependencies.adminSessions.adminFor(token) : null;
-      if (!admin) throw new HttpError(401, "Sessão administrativa inválida.", "Unauthorized");
+      const admin = await adminOf(req);
       const restaurantId = optionalText(req.body?.restaurantId);
       if (restaurantId && (!isUuid(restaurantId) || !await wineLists().repository.restaurantExists(restaurantId))) throw notFound("Restaurante não encontrado.");
       if (!restaurantId && !optionalText(req.body?.restaurantName)) throw badRequest("Escolha um restaurante ou informe o nome do novo restaurante.");
@@ -781,6 +803,29 @@ function uploadListFiles(): RequestHandler {
       next(error);
     });
   };
+}
+
+type TranscriptionOutcome = { items: unknown[]; attempts: ModelAttempt[]; unreadPages: number[] };
+
+/** What went wrong, per page and model, for the log (null when every page was read). */
+function transcriptionProblems(transcription: TranscriptionOutcome) {
+  if (transcription.items.length && !transcription.unreadPages.length) return null;
+  const problems = transcription.attempts.filter((attempt) => !attempt.ok)
+    .map((attempt) => `${attempt.page ? `página ${attempt.page} · ` : ""}${attempt.model}: ${attempt.error ?? "nenhum vinho encontrado"}`);
+  return problems.join(" | ") || "nenhum vinho encontrado";
+}
+
+function transcriptionFailure(transcription: TranscriptionOutcome) {
+  const timedOut = transcription.attempts.some((attempt) => attempt.error === "request_timeout" || attempt.error === "no_time_left");
+  return new HttpError(422, timedOut
+    ? "A leitura da carta demorou demais. Envie menos páginas por vez (as que têm os vinhos que você quer escolher)."
+    : "Não conseguimos ler os vinhos desta carta. Confira se as fotos mostram a lista de vinhos, uma página por foto.", "Unprocessable Entity");
+}
+
+/** Usage of every attempt of a list, earlier ones included. */
+function addUsage(before: OpenRouterUsage, after: OpenRouterUsage): OpenRouterUsage {
+  const sum = (key: keyof OpenRouterUsage) => before[key] === undefined && after[key] === undefined ? undefined : (before[key] ?? 0) + (after[key] ?? 0);
+  return { promptTokens: sum("promptTokens"), completionTokens: sum("completionTokens"), totalTokens: sum("totalTokens"), costUsd: sum("costUsd") };
 }
 
 function asyncHandler(handler: AsyncRequestHandler): RequestHandler {

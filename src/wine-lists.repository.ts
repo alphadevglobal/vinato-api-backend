@@ -75,20 +75,57 @@ export class WineListRepository {
     for (const [position, file] of record.files.entries()) {
       await this.pool.query(`INSERT INTO wine_list_files (wine_list_id, position, mime, file_data_url) VALUES ($1, $2, $3, $4)`, [listId, position, file.mimetype, file.dataUrl]);
     }
-    if (record.items.length) {
-      const values: unknown[] = [];
-      const rows = record.items.map((item, position) => {
-        const row = [listId, position, item.section, item.name, item.producer, item.vintage, item.country, item.region, item.grapes, item.style, item.volume, item.price, item.glassPrice, item.currency, item.notes];
-        values.push(...row);
-        const offset = position * row.length;
-        return `(${row.map((_, index) => `$${offset + index + 1}`).join(", ")})`;
-      });
-      await this.pool.query(
-        `INSERT INTO wine_list_items (wine_list_id, position, section, name, producer, vintage, country, region, grapes, style, volume, price, glass_price, currency, notes)
-         VALUES ${rows.join(", ")}`,
-        values,
-      );
-    }
+    await this.insertItems(listId, record.items);
+    return (await this.findList(listId))!;
+  }
+
+  private async insertItems(listId: string, items: WineListItem[]) {
+    if (!items.length) return;
+    const values: unknown[] = [];
+    const rows = items.map((item, position) => {
+      const row = [listId, position, item.section, item.name, item.producer, item.vintage, item.country, item.region, item.grapes, item.style, item.volume, item.price, item.glassPrice, item.currency, item.notes];
+      values.push(...row);
+      const offset = position * row.length;
+      return `(${row.map((_, index) => `$${offset + index + 1}`).join(", ")})`;
+    });
+    await this.pool.query(
+      `INSERT INTO wine_list_items (wine_list_id, position, section, name, producer, vintage, country, region, grapes, style, volume, price, glass_price, currency, notes)
+       VALUES ${rows.join(", ")}`,
+      values,
+    );
+  }
+
+  /**
+   * What a new transcription of a saved list needs: its files in page order, the
+   * restaurant, the attempts and usage so far, and how many bottle checks it has
+   * (checks point at its items, which a new transcription replaces).
+   */
+  async retranscriptionSource(listId: string) {
+    const list = await this.pool.query<{ restaurantName: string | null; city: string | null; usage: OpenRouterUsage | null; checks: number }>(
+      `SELECT coalesce(r.name, l.restaurant_name) AS "restaurantName", coalesce(r.city, l.city) AS city, l.usage,
+              (SELECT count(*)::int FROM wine_list_checks c WHERE c.wine_list_id = l.id) AS checks
+       FROM wine_lists l LEFT JOIN restaurants r ON r.id = l.restaurant_id WHERE l.id = $1`,
+      [listId],
+    );
+    if (!list.rows[0]) return null;
+    const files = await this.pool.query<ListFile>(`SELECT mime AS mimetype, file_data_url AS "dataUrl" FROM wine_list_files WHERE wine_list_id = $1 ORDER BY position`, [listId]);
+    return { ...list.rows[0], files: files.rows };
+  }
+
+  /**
+   * Replaces the transcription of a saved list (admin "Transcrever novamente"):
+   * same list, files, restaurant and sender. The new attempts are appended to the
+   * old ones, so every billed attempt still counts in the AI costs.
+   */
+  async replaceTranscription(listId: string, record: Pick<ListRecord, "items" | "status" | "model" | "attempts" | "usage" | "errorMessage" | "durationMs">) {
+    await this.pool.query(`DELETE FROM wine_list_items WHERE wine_list_id = $1`, [listId]);
+    await this.insertItems(listId, record.items);
+    await this.pool.query(
+      `UPDATE wine_lists SET status = $2, model = $3, models_tried = models_tried || $4::jsonb, usage = $5::jsonb,
+              error_message = $6, duration_ms = $7, item_count = $8
+       WHERE id = $1`,
+      [listId, record.status, record.model, JSON.stringify(record.attempts), JSON.stringify(record.usage), record.errorMessage?.slice(0, 1000) ?? null, record.durationMs, record.items.length],
+    );
     return (await this.findList(listId))!;
   }
 
