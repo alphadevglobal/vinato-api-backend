@@ -6,7 +6,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
 import { parseJsonContent, requestJsonWithFallback, totalUsage } from "../src/openrouter.js";
-import { bottleCheckPrompt, money, normalizeCheck, normalizeItems, OpenRouterWineListAgent, transcriptionPrompt, type WineListItem } from "../src/wine-list.service.js";
+import { bottleCheckPrompt, mergePages, withoutRepeatedProducer, money, normalizeCheck, normalizeItems, OpenRouterWineListAgent, transcriptionPrompt, type WineListItem } from "../src/wine-list.service.js";
 import { WineListRepository } from "../src/wine-lists.repository.js";
 
 const item: WineListItem = {
@@ -85,8 +85,11 @@ describe("wine list transcription", () => {
     expect(prompt).toContain("Transcreva TODOS os vinhos");
     expect(prompt).toContain("Restaurante informado pelo cliente: Fasano (São Paulo)");
     expect(prompt).toContain("glassPrice");
-    expect(prompt).toContain("SEM safra, regiao, volume ou preco");
+    expect(prompt).toContain("SEM codigo/numero do item, safra, regiao, volume ou preco");
+    expect(prompt).toContain("Nao repita o produtor no nome");
+    expect(prompt).toContain("Omita os campos que nao estiverem na carta");
     expect(transcriptionPrompt({})).not.toContain("Restaurante informado");
+    expect(transcriptionPrompt({}, { index: 3, total: 8 })).toContain("Esta imagem e a pagina 3 de 8 da carta. Transcreva TODOS os vinhos DESTA pagina");
   });
 
   it("sends photos as images and a PDF as a file, and returns the items", async () => {
@@ -101,10 +104,76 @@ describe("wine list transcription", () => {
     expect(content[1]).toEqual({ type: "file", file: { filename: "carta-1.pdf", file_data: "data:application/pdf;base64,JVBE" } });
     expect(fromPdf).toMatchObject({ restaurant: { name: "Bistrô", city: "Recife" }, model: "vision", items: [{ name: "Casa Valduga Terroir", price: 180 }], usage: { totalTokens: 1500 } });
 
+    expect(call(0).max_tokens).toBeGreaterThanOrEqual(16000);
+
+    // Photos: one call per page, each with its own image.
     await agent.transcribe([{ mimetype: "image/jpeg", dataUrl: "data:image/jpeg;base64,AA" }, { mimetype: "image/jpeg", dataUrl: "data:image/jpeg;base64,BB" }], {});
-    const photos = call(1).messages[0].content;
-    expect(photos.slice(1)).toEqual([{ type: "image_url", image_url: { url: "data:image/jpeg;base64,AA" } }, { type: "image_url", image_url: { url: "data:image/jpeg;base64,BB" } }]);
-    expect(call(1).max_tokens).toBeGreaterThanOrEqual(16000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(call(1).messages[0].content.slice(1)).toEqual([{ type: "image_url", image_url: { url: "data:image/jpeg;base64,AA" } }]);
+    expect(call(2).messages[0].content.slice(1)).toEqual([{ type: "image_url", image_url: { url: "data:image/jpeg;base64,BB" } }]);
+    expect(call(1).messages[0].content[0].text).toContain("pagina 1 de 2");
+  });
+
+  it("reads a long list page by page in parallel, keeps the page order and drops overlaps between pages", async () => {
+    process.env.OPENROUTER_API_KEY = "k";
+    const pages: Record<string, unknown> = {
+      AA: { restaurant: { name: "Bistrô" }, items: [{ section: "Espumantes", name: "Chandon Réserve Brut", price: "179,00" }, { name: "Valduga Arte Brut", price: 159 }] },
+      BB: { items: [{ name: "Valduga Arte Brut", price: 159 }, { section: "Chile · Tintos", name: "La Joya Gran Reserva Cabernet Sauvignon", price: 235, notes: "Cod. 661" }] },
+      CC: { items: [] },
+    };
+    let inFlight = 0; let maxInFlight = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      inFlight += 1; maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      inFlight -= 1;
+      const url: string = JSON.parse(String(init.body)).messages[0].content[1].image_url.url;
+      return reply(pages[url.split(",")[1]]);
+    }));
+    const agent = new OpenRouterWineListAgent({ getWineListModels: async () => ({ model: "vision", fallbackModel: "backup" }) });
+    const result = await agent.transcribe(["AA", "BB", "CC"].map((page) => ({ mimetype: "image/jpeg", dataUrl: `data:image/jpeg;base64,${page}` })), {});
+    expect(maxInFlight).toBe(3);
+    expect(result.items.map((wine) => wine.name)).toEqual(["Chandon Réserve Brut", "Valduga Arte Brut", "La Joya Gran Reserva Cabernet Sauvignon"]);
+    expect(result).toMatchObject({ restaurant: { name: "Bistrô" }, unreadPages: [], pages: 3, usage: { totalTokens: 4500 } });
+    // A page without wines (cover, corkage) is a valid answer, not a reason for the fallback.
+    expect(result.attempts.map((attempt) => [attempt.page, attempt.model, attempt.ok])).toEqual([[1, "vision", true], [2, "vision", true], [3, "vision", true]]);
+  });
+
+  it("returns the pages it could read and reports the others", async () => {
+    process.env.OPENROUTER_API_KEY = "k";
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      const url: string = JSON.parse(String(init.body)).messages[0].content[1].image_url.url;
+      return url.endsWith("BB") ? new Response(JSON.stringify({ choices: [{ finish_reason: "length", message: { content: '{"items": [' } }] })) : reply({ items: [{ name: "Casa Valduga Terroir", price: 180 }] });
+    }));
+    const agent = new OpenRouterWineListAgent({ getWineListModels: async () => ({ model: "vision", fallbackModel: "backup" }) });
+    const result = await agent.transcribe(["AA", "BB"].map((page) => ({ mimetype: "image/jpeg", dataUrl: `data:image/jpeg;base64,${page}` })), {});
+    expect(result.items).toHaveLength(1);
+    expect(result.unreadPages).toEqual([2]);
+    expect(result.attempts.filter((attempt) => attempt.page === 2).map((attempt) => [attempt.model, attempt.error])).toEqual([["vision", "answer_cut_by_token_limit"], ["backup", "answer_cut_by_token_limit"]]);
+  });
+
+  it("never runs past the deadline: the fallback is skipped when there is no time left", async () => {
+    process.env.OPENROUTER_API_KEY = "k";
+    const fetchMock = vi.fn(async () => new Response("overloaded", { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await requestJsonWithFallback({ model: "vision", fallbackModel: "backup" }, [{ type: "text", text: "x" }], { deadline: Date.now() + 5_000, page: 4 });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.attempts).toEqual([{ model: "vision", ok: false, ms: 0, status: 408, error: "no_time_left", page: 4 }]);
+  });
+
+  it("drops a producer the model repeated in front of the printed name", () => {
+    expect(withoutRepeatedProducer("Casa Valduga Casa Valduga Origem Chardonnay", "Casa Valduga")).toBe("Casa Valduga Origem Chardonnay");
+    expect(withoutRepeatedProducer("Viña Morandé Morandé Pionero Reserva Chardonnay", "Viña Morandé")).toBe("Morandé Pionero Reserva Chardonnay");
+    expect(withoutRepeatedProducer("Los Vascos ( Rothschild - Lafite ) Los Vascos Albariño", "Los Vascos ( Rothschild - Lafite )")).toBe("Los Vascos Albariño");
+    // A producer written once is part of the name.
+    expect(withoutRepeatedProducer("Casa Valduga Arte Brut Tradicional", "Casa Valduga")).toBe("Casa Valduga Arte Brut Tradicional");
+    expect(withoutRepeatedProducer("Bisquertt Family Vineyards La Joya Gran Reserva", "Bisquertt Family Vineyards")).toBe("Bisquertt Family Vineyards La Joya Gran Reserva");
+  });
+
+  it("keeps a wine repeated inside a page and removes only the overlap with the previous page", () => {
+    const wine = (name: string, price: number | null = null) => ({ ...item, name, price, vintage: null, volume: null });
+    // Page 3 repeats a wine of page 1 but not of page 2: it is a new entry, not an overlap.
+    expect(mergePages([[wine("Taça A", 30), wine("Taça A", 30)], [wine("Taça A", 30), wine("Tinto B", 90)], [wine("Tinto B", 90), wine("Rosé C", 70)], [wine("Taça A", 30)]]).map((entry) => entry.name))
+      .toEqual(["Taça A", "Taça A", "Tinto B", "Rosé C", "Taça A"]);
   });
 });
 
@@ -215,8 +284,8 @@ describe("WineListRepository (migration 017)", () => {
 describe("wine list routes", () => {
   const user = (plan: "free" | "premium") => ({ id: "user-1", email: "a@b.c", displayName: "A", role: "user", plan, planExpiresAt: null, status: "active", avatarUrl: null });
   const saved = { id: "list-1", status: "transcribed", source: "photo", createdAt: "2026-09-29T00:00:00.000Z", restaurant: { id: "r1", name: "Fasano", city: "São Paulo", address: null }, items: [{ ...item, id: "item-1", position: 0 }] };
-  function appFor(plan: "free" | "premium", overrides: { items?: WineListItem[]; checkModel?: string | null } = {}) {
-    const transcribe = vi.fn(async () => ({ restaurant: { name: "Fasano", city: null }, items: overrides.items ?? [item], model: "vision", attempts: [], usage: { totalTokens: 1500 } }));
+  function appFor(plan: "free" | "premium", overrides: { items?: WineListItem[]; checkModel?: string | null; unreadPages?: number[]; attempts?: object[] } = {}) {
+    const transcribe = vi.fn(async () => ({ restaurant: { name: "Fasano", city: null }, items: overrides.items ?? [item], model: "vision", attempts: overrides.attempts ?? [], usage: { totalTokens: 1500 }, unreadPages: overrides.unreadPages ?? [], pages: 2 }));
     const checkBottle = vi.fn(async () => ({ verdict: "match" as const, confidence: 0.9, explanation: "Confere.", observed: { producer: "Catena Zapata", wine: "Malbec Argentino", vintage: "2020", region: null, country: null, volume: null }, differences: [], model: overrides.checkModel === undefined ? "vision" : overrides.checkModel, attempts: [], usage: {} }));
     const repository = {
       saveList: vi.fn(async () => saved), findList: vi.fn(async (id: string) => id === "list-1" ? saved : null), listsOf: vi.fn(async () => [{ id: "list-1" }]),
@@ -237,6 +306,11 @@ describe("wine list routes", () => {
     expect(response.body).toMatchObject({ id: "list-1", items: [{ id: "item-1", name: "Catena Zapata Malbec Argentino" }] });
     expect(transcribe.mock.calls[0][0]).toHaveLength(2);
     expect(transcribe.mock.calls[0][1]).toEqual({ restaurantName: "Fasano", city: "São Paulo" });
+    // One deadline for the whole request, well before Vercel's 60 s limit.
+    const deadline = (transcribe.mock.calls[0] as unknown as [unknown, unknown, { deadline: number }])[2].deadline;
+    expect(deadline - Date.now()).toBeGreaterThan(40_000);
+    expect(deadline - Date.now()).toBeLessThanOrEqual(45_000);
+    expect(response.body).toMatchObject({ pages: 2, unreadPages: [] });
     expect(repository.saveList.mock.calls[0][0]).toMatchObject({ userId: "user-1", source: "photo", status: "transcribed", restaurant: { name: "Fasano", city: "São Paulo", latitude: -23.56 } });
   });
 
@@ -258,8 +332,28 @@ describe("wine list routes", () => {
   it("saves a failed transcription and tells the user to retake the photos", async () => {
     const { app, repository } = appFor("premium", { items: [] });
     const response = await request(app).post("/wine-lists").set("Authorization", "Bearer t").attach("files", Buffer.from("x"), { filename: "a.jpg", contentType: "image/jpeg" }).expect(422);
-    expect(response.body.message).toContain("fotos mais nítidas");
+    expect(response.body.message).toContain("Não conseguimos ler os vinhos desta carta");
     expect(repository.saveList.mock.calls[0][0]).toMatchObject({ status: "failed" });
+  });
+
+  it("tells the user to send fewer pages when the models ran out of time", async () => {
+    const { app } = appFor("premium", { items: [], attempts: [{ model: "vision", ok: false, ms: 44000, error: "request_timeout", page: 1 }] });
+    const response = await request(app).post("/wine-lists").set("Authorization", "Bearer t").attach("files", Buffer.from("x"), { filename: "a.jpg", contentType: "image/jpeg" }).expect(422);
+    expect(response.body.message).toContain("Envie menos páginas");
+  });
+
+  it("logs the pages it could not read on a partial transcription", async () => {
+    const { app, repository } = appFor("premium", { unreadPages: [3], attempts: [{ model: "vision", ok: true, ms: 9000, page: 1 }, { model: "vision", ok: false, ms: 9000, error: "answer_cut_by_token_limit", page: 3 }] });
+    const response = await request(app).post("/wine-lists").set("Authorization", "Bearer t").attach("files", Buffer.from("x"), { filename: "a.jpg", contentType: "image/jpeg" }).expect(201);
+    expect(response.body.unreadPages).toEqual([3]);
+    expect(repository.saveList.mock.calls[0][0]).toMatchObject({ status: "transcribed", errorMessage: "página 3 · vision: answer_cut_by_token_limit" });
+  });
+
+  it("logs an unexpected failure before answering, so no attempt disappears", async () => {
+    const { app, transcribe, repository } = appFor("premium");
+    transcribe.mockRejectedValueOnce(new Error("connection terminated"));
+    await request(app).post("/wine-lists").set("Authorization", "Bearer t").attach("files", Buffer.from("x"), { filename: "a.jpg", contentType: "image/jpeg" }).expect(500);
+    expect(repository.saveList.mock.calls[0][0]).toMatchObject({ status: "failed", items: [], errorMessage: "erro interno: connection terminated" });
   });
 
   it("is a Premium feature and needs a session", async () => {

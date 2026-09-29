@@ -6,7 +6,8 @@ export type ContentPart =
   | { type: "file"; file: { filename: string; file_data: string } };
 
 export type OpenRouterUsage = { promptTokens?: number; completionTokens?: number; totalTokens?: number; costUsd?: number };
-export type ModelAttempt = { model: string; ok: boolean; ms: number; status?: number; error?: string } & OpenRouterUsage;
+// page: which page of a multi-page wine list the attempt read (1-based).
+export type ModelAttempt = { model: string; ok: boolean; ms: number; status?: number; error?: string; page?: number } & OpenRouterUsage;
 
 export type JsonReply =
   | { ok: true; json: Record<string, unknown>; usage: OpenRouterUsage }
@@ -91,19 +92,32 @@ export async function requestJson(
   return { ok: true, json, usage };
 }
 
-/** Tries the primary model, then the fallback; every attempt is recorded (and billed). */
+// Below this, a model call cannot finish: the fallback is skipped instead of being cut off.
+const MIN_ATTEMPT_MS = 8_000;
+
+/**
+ * Tries the primary model, then the fallback; every attempt is recorded (and billed).
+ * `deadline` (epoch ms) bounds all attempts together, so the caller always answers
+ * (and writes its log) before the serverless function is killed.
+ */
 export async function requestJsonWithFallback(
   models: { model: string; fallbackModel: string },
   content: ContentPart[],
-  options: Parameters<typeof requestJson>[2] & { accept?: (json: Record<string, unknown>) => boolean } = {},
+  options: Parameters<typeof requestJson>[2] & { accept?: (json: Record<string, unknown>) => boolean; deadline?: number; page?: number } = {},
 ) {
   const attempts: ModelAttempt[] = [];
   const order = models.fallbackModel && models.fallbackModel !== models.model ? [models.model, models.fallbackModel] : [models.model];
+  const page = options.page !== undefined ? { page: options.page } : {};
   for (const model of order) {
+    const left = options.deadline === undefined ? Infinity : options.deadline - Date.now();
+    if (left < MIN_ATTEMPT_MS) {
+      attempts.push({ model, ok: false, ms: 0, status: 408, error: "no_time_left", ...page });
+      break;
+    }
     const startedAt = Date.now();
-    const reply = await requestJson(model, content, options);
+    const reply = await requestJson(model, content, { ...options, timeoutMs: Math.min(options.timeoutMs ?? 50_000, left) });
     const ok = reply.ok && (options.accept ? options.accept(reply.json) : true);
-    attempts.push({ model, ok, ms: Date.now() - startedAt, ...(reply.ok ? { status: 200 } : { status: reply.status, error: reply.error }), ...(reply.usage ?? {}) });
+    attempts.push({ model, ok, ms: Date.now() - startedAt, ...(reply.ok ? { status: 200 } : { status: reply.status, error: reply.error }), ...(reply.usage ?? {}), ...page });
     if (reply.ok && ok) return { json: reply.json, model, attempts };
   }
   return { json: null, model: null, attempts };

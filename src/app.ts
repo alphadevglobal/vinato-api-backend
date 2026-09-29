@@ -11,6 +11,7 @@ import type { AppDependencies, AsyncRequestHandler, ScannedWineData, ScanWineLab
 import { verifySocialToken, type SocialProvider } from "./social-auth.js";
 import { requestJson } from "./openrouter.js";
 import { openRouterAccount } from "./openrouter-account.js";
+import { CHECK_BUDGET_MS, TRANSCRIPTION_BUDGET_MS } from "./wine-list.service.js";
 import { DISPOSABLE_EMAIL_MESSAGE, isDisposableEmailAddress } from "./email-policy.js";
 
 const require = createRequire(import.meta.url);
@@ -548,18 +549,36 @@ export function createApp(dependencies: AppDependencies) {
       const listFiles = files.map((file) => ({ mimetype: file.mimetype, dataUrl: dataUrl(file) }));
       const startedAt = Date.now();
       const { agent, repository } = wineLists();
-      const transcription = await agent.transcribe(listFiles, { restaurantName: restaurant.name, city: restaurant.city });
+      const source = pdfs.length ? "pdf" as const : "photo" as const;
+      let transcription: Awaited<ReturnType<typeof agent.transcribe>>;
+      try {
+        transcription = await agent.transcribe(listFiles, { restaurantName: restaurant.name, city: restaurant.city }, { deadline: startedAt + TRANSCRIPTION_BUDGET_MS });
+      } catch (error) {
+        // Unexpected failures are logged too, so every attempt shows up in the admin.
+        await repository.saveList({
+          userId: user.id, restaurant, source, files: listFiles, items: [], status: "failed", model: null, attempts: [], usage: {},
+          errorMessage: `erro interno: ${(error as Error).message}`, durationMs: Date.now() - startedAt,
+        }).catch((saveError) => console.error("[wine-lists] could not log the failed transcription", saveError));
+        throw error;
+      }
       const failed = !transcription.items.length;
+      const pageLabel = (page?: number) => page ? `página ${page} · ` : "";
+      const problems = transcription.attempts.filter((attempt) => !attempt.ok).map((attempt) => `${pageLabel(attempt.page)}${attempt.model}: ${attempt.error ?? "nenhum vinho encontrado"}`);
       const saved = await repository.saveList({
         userId: user.id,
         restaurant: { ...restaurant, name: restaurant.name ?? transcription.restaurant.name, city: restaurant.city ?? transcription.restaurant.city },
-        source: pdfs.length ? "pdf" : "photo", files: listFiles, items: transcription.items,
+        source, files: listFiles, items: transcription.items,
         status: failed ? "failed" : "transcribed", model: transcription.model, attempts: transcription.attempts, usage: transcription.usage,
-        errorMessage: failed ? transcription.attempts.map((attempt) => `${attempt.model}: ${attempt.error ?? "nenhum vinho encontrado"}`).join(" | ") : null,
+        errorMessage: failed || transcription.unreadPages.length ? (problems.join(" | ") || "nenhum vinho encontrado") : null,
         durationMs: Date.now() - startedAt,
       });
-      if (failed) throw new HttpError(422, "Não conseguimos ler os vinhos desta carta. Tente fotos mais nítidas, uma página por foto.", "Unprocessable Entity");
-      res.status(201).json(saved);
+      if (failed) {
+        const timedOut = transcription.attempts.some((attempt) => attempt.error === "request_timeout" || attempt.error === "no_time_left");
+        throw new HttpError(422, timedOut
+          ? "A leitura da carta demorou demais. Envie menos páginas por vez (as que têm os vinhos que você quer escolher)."
+          : "Não conseguimos ler os vinhos desta carta. Confira se as fotos mostram a lista de vinhos, uma página por foto.", "Unprocessable Entity");
+      }
+      res.status(201).json({ ...saved, pages: transcription.pages, unreadPages: transcription.unreadPages });
     }),
   );
 
@@ -594,7 +613,7 @@ export function createApp(dependencies: AppDependencies) {
       if (!item) throw notFound("Vinho da carta não encontrado.");
       const startedAt = Date.now();
       const imageDataUrl = dataUrl(req.file);
-      const check = (await agent.checkBottle(item, imageDataUrl))!;
+      const check = (await agent.checkBottle(item, imageDataUrl, { deadline: startedAt + CHECK_BUDGET_MS }))!;
       const saved = await repository.saveCheck({
         listId: String(req.params.id), itemId: item.id, userId: user.id, imageDataUrl, check, durationMs: Date.now() - startedAt,
         errorMessage: check.model ? null : check.attempts.map((attempt) => `${attempt.model}: ${attempt.error ?? "falha"}`).join(" | "),

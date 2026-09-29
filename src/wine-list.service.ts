@@ -15,6 +15,8 @@ export type Transcription = {
   restaurant: { name: string | null; city: string | null };
   items: WineListItem[];
   model: string | null; attempts: ModelAttempt[]; usage: OpenRouterUsage;
+  // Pages (1-based) no model could read; the other pages are still returned.
+  unreadPages: number[]; pages: number;
 };
 export type Verdict = "match" | "mismatch" | "uncertain";
 export type BottleCheck = {
@@ -25,24 +27,25 @@ export type BottleCheck = {
 };
 export type ListFile = { mimetype: string; dataUrl: string };
 
-export const transcriptionPrompt = (hint: { restaurantName?: string | null; city?: string | null }) => `
+export const transcriptionPrompt = (hint: { restaurantName?: string | null; city?: string | null }, page?: { index: number; total: number }) => `
 Voce e um sommelier que transcreve cartas de vinho de restaurantes para o app Vinato.
-Transcreva TODOS os vinhos da carta nas imagens/PDF, na ordem em que aparecem.
+${page && page.total > 1 ? `Esta imagem e a pagina ${page.index} de ${page.total} da carta. Transcreva TODOS os vinhos DESTA pagina, na ordem em que aparecem.` : "Transcreva TODOS os vinhos da carta nas imagens/PDF, na ordem em que aparecem."}
 ${hint.restaurantName ? `Restaurante informado pelo cliente: ${hint.restaurantName}${hint.city ? ` (${hint.city})` : ""}.` : ""}
 
 Para cada vinho:
-- section: a secao da carta em que ele esta (ex.: "Tintos", "Espumantes", "Portugal", "Por taca").
-- name: produtor + nome do vinho como impresso na carta, SEM safra, regiao, volume ou preco
-  (esses vao nos proprios campos).
-- producer, vintage (ano com 4 digitos ou null), country, region, grapes, style (tinto, branco, rose, espumante, fortificado, sobremesa).
+- section: a secao da carta em que ele esta; junte os titulos que valem para ele (ex.: "Chile · Tintos", "Espumantes", "Por taca").
+- name: o nome do vinho como impresso na linha do item, SEM codigo/numero do item, safra, regiao, volume ou preco
+  (esses vao nos proprios campos). Nao repita o produtor no nome se ele nao estiver escrito na linha.
+- producer, vintage (ano com 4 digitos), country (tambem pelo titulo ou bandeira da secao), region, grapes, style (tinto, branco, rose, espumante, fortificado, sobremesa).
 - volume: ex. "750 ml", "375 ml", "1,5 L" quando indicado.
 - price: preco da garrafa como numero (ex.: 289.90); glassPrice: preco da taca como numero, quando houver.
-- currency: moeda (BRL, USD, EUR...). notes: observacoes impressas (ex.: "harmoniza com peixes").
-Nao invente vinhos, produtores, safras ou precos: use null quando nao estiver legivel.
+- currency: moeda (BRL, USD, EUR...). notes: observacoes impressas e o codigo do item (ex.: "Cod. 687").
+Nao invente vinhos, produtores, safras ou precos. Omita os campos que nao estiverem na carta (nao escreva null),
+para a resposta ficar curta. Taxas e servicos (ex.: rolha) nao sao vinhos.
 Se a carta mostrar o nome do restaurante ou a cidade, informe em restaurant.
 
 Responda somente JSON valido, sem markdown:
-{"restaurant": {"name": string|null, "city": string|null}, "items": [ {section, name, producer, vintage, country, region, grapes, style, volume, price, glassPrice, currency, notes} ]}
+{"restaurant": {"name", "city"}, "items": [ {section, name, producer, vintage, country, region, grapes, style, volume, price, glassPrice, currency, notes} ]}
 `;
 
 export const bottleCheckPrompt = (item: Pick<WineListItem, "name" | "producer" | "vintage" | "region" | "country" | "volume" | "style">) => `
@@ -85,12 +88,27 @@ const year = (value: unknown) => {
   return match && Number(match[1]) <= new Date().getFullYear() ? Number(match[1]) : null;
 };
 
+const words = (value: string) => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 2);
+
+/**
+ * Models sometimes prefix the producer to a name that already has it:
+ * "Casa Valduga Casa Valduga Origem" or "Viña Morandé Morandé Pionero" → the
+ * printed name ("Casa Valduga Origem", "Morandé Pionero").
+ */
+export function withoutRepeatedProducer(name: string, producer: string | null) {
+  if (!producer || !name.toLowerCase().startsWith(`${producer.toLowerCase()} `)) return name;
+  const rest = name.slice(producer.length).replace(/^[\s\-–·,]+/, "");
+  const restWords = new Set(words(rest));
+  return rest && words(producer).some((word) => restWords.has(word)) ? rest : name;
+}
+
 export function normalizeItems(value: unknown): WineListItem[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((raw): WineListItem[] => {
     if (!raw || typeof raw !== "object") return [];
     const item = raw as Record<string, unknown>;
-    const name = text(item.name) ?? [text(item.producer), text(item.wine)].filter(Boolean).join(" ");
+    const producer = text(item.producer);
+    const name = withoutRepeatedProducer(text(item.name) ?? [producer, text(item.wine)].filter(Boolean).join(" "), producer);
     if (!name) return [];
     return [{
       section: text(item.section), name, producer: text(item.producer), vintage: year(item.vintage), country: text(item.country),
@@ -124,6 +142,33 @@ export function normalizeCheck(json: Record<string, unknown>): Omit<BottleCheck,
   };
 }
 
+// Vercel stops the function at 60 s (vercel.json) and the iPhone gives up on a silent
+// request at about 60 s: the models get 45 s, leaving time to save the list and answer.
+export const TRANSCRIPTION_BUDGET_MS = 45_000;
+export const CHECK_BUDGET_MS = 45_000;
+
+const itemKey = (item: WineListItem) => `${normalizeKey(item.name)}|${item.vintage ?? ""}|${item.price ?? ""}|${item.volume ?? ""}`;
+const normalizeKey = (value: string) => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+/**
+ * The pages in order. Photos of consecutive pages often overlap: a wine that ends
+ * one page and starts the next (same name, vintage, price and volume) is kept once.
+ */
+export function mergePages(pages: WineListItem[][]) {
+  const merged: WineListItem[] = [];
+  let previous = new Set<string>();
+  for (const items of pages) {
+    const current = new Set<string>();
+    for (const item of items) {
+      const key = itemKey(item);
+      current.add(key);
+      if (!previous.has(key)) merged.push(item);
+    }
+    previous = current;
+  }
+  return merged.slice(0, 400);
+}
+
 const filePart = (file: ListFile, index: number): ContentPart => file.mimetype === "application/pdf"
   ? { type: "file", file: { filename: `carta-${index + 1}.pdf`, file_data: file.dataUrl } }
   : { type: "image_url", image_url: { url: file.dataUrl } };
@@ -135,26 +180,42 @@ export class OpenRouterWineListAgent {
     return this.settings ? this.settings.getWineListModels() : Promise.resolve(defaultWineListModels());
   }
 
-  async transcribe(files: ListFile[], hint: { restaurantName?: string | null; city?: string | null }): Promise<Transcription> {
-    const content: ContentPart[] = [{ type: "text", text: transcriptionPrompt(hint) }, ...files.map(filePart)];
-    // A long list can take many output tokens; an empty transcription tries the fallback.
-    const reply = await requestJsonWithFallback(await this.models(), content, {
-      maxTokens: 16_000, timeoutMs: 55_000, title: "Vinato cartas", accept: (json) => normalizeItems(json.items).length > 0,
-    });
-    const restaurant = (reply.json?.restaurant && typeof reply.json.restaurant === "object" ? reply.json.restaurant : {}) as Record<string, unknown>;
+  /**
+   * Each photo is one page, read by its own model call in parallel: a long list in
+   * a single call overflows the output limit and the function time. A PDF is read
+   * in one call. Everything shares one deadline, so the route always answers (and
+   * logs) before Vercel stops the function; pages left unread are reported.
+   */
+  async transcribe(files: ListFile[], hint: { restaurantName?: string | null; city?: string | null }, options: { deadline?: number } = {}): Promise<Transcription> {
+    const models = await this.models();
+    const deadline = options.deadline ?? Date.now() + TRANSCRIPTION_BUDGET_MS;
+    const pages = files.some((file) => file.mimetype === "application/pdf") || files.length === 1 ? [files] : files.map((file) => [file]);
+    const replies = await Promise.all(pages.map((pageFiles, index) => {
+      const page = pages.length > 1 ? { index: index + 1, total: pages.length } : undefined;
+      const content: ContentPart[] = [{ type: "text", text: transcriptionPrompt(hint, page) }, ...pageFiles.map(filePart)];
+      return requestJsonWithFallback(models, content, {
+        maxTokens: pages.length > 1 ? 8_000 : 16_000, title: "Vinato cartas", deadline, page: page?.index,
+        // A page may legitimately have no wine (cover, corkage); a whole list may not.
+        accept: (json) => pages.length > 1 ? Array.isArray(json.items) : normalizeItems(json.items).length > 0,
+      });
+    }));
+    const attempts = replies.flatMap((reply) => reply.attempts);
+    const restaurants = replies.map((reply) => (reply.json?.restaurant && typeof reply.json.restaurant === "object" ? reply.json.restaurant : {}) as Record<string, unknown>);
     return {
-      restaurant: { name: text(restaurant.name), city: text(restaurant.city) },
-      items: normalizeItems(reply.json?.items),
-      model: reply.model, attempts: reply.attempts, usage: totalUsage(reply.attempts),
+      restaurant: { name: restaurants.map((item) => text(item.name)).find(Boolean) ?? null, city: restaurants.map((item) => text(item.city)).find(Boolean) ?? null },
+      items: mergePages(replies.map((reply) => normalizeItems(reply.json?.items))),
+      model: replies.find((reply) => reply.model)?.model ?? null, attempts, usage: totalUsage(attempts),
+      unreadPages: pages.length > 1 ? replies.flatMap((reply, index) => reply.json ? [] : [index + 1]) : [],
+      pages: pages.length,
     };
   }
 
-  async checkBottle(item: WineListItem, imageDataUrl: string): Promise<BottleCheck | null> {
+  async checkBottle(item: WineListItem, imageDataUrl: string, options: { deadline?: number } = {}): Promise<BottleCheck | null> {
     const content: ContentPart[] = [
       { type: "text", text: bottleCheckPrompt(item) },
       { type: "image_url", image_url: { url: imageDataUrl } },
     ];
-    const reply = await requestJsonWithFallback(await this.models(), content, { maxTokens: 4000, timeoutMs: 45_000, title: "Vinato cartas" });
+    const reply = await requestJsonWithFallback(await this.models(), content, { maxTokens: 4000, timeoutMs: 40_000, title: "Vinato cartas", deadline: options.deadline ?? Date.now() + CHECK_BUDGET_MS });
     if (!reply.json) return { verdict: "uncertain", confidence: 0, explanation: "", observed: { producer: null, wine: null, vintage: null, region: null, country: null, volume: null }, differences: [], model: null, attempts: reply.attempts, usage: totalUsage(reply.attempts) };
     return { ...normalizeCheck(reply.json), model: reply.model, attempts: reply.attempts, usage: totalUsage(reply.attempts) };
   }
