@@ -3,7 +3,7 @@ import { normalizeText } from "./catalog-matcher.js";
 import type { ModelAttempt, OpenRouterUsage } from "./openrouter.js";
 import type { BottleCheck, ListFile, WineListItem } from "./wine-list.service.js";
 
-export type RestaurantInput = { name?: string | null; city?: string | null; address?: string | null; latitude?: number | null; longitude?: number | null };
+export type RestaurantInput = { id?: string | null; name?: string | null; city?: string | null; address?: string | null; latitude?: number | null; longitude?: number | null };
 export type SavedItem = WineListItem & { id: string; position: number };
 export type SavedList = {
   id: string; status: "transcribed" | "failed"; source: "photo" | "pdf"; createdAt: string;
@@ -11,7 +11,8 @@ export type SavedList = {
   items: SavedItem[];
 };
 type ListRecord = {
-  userId?: string | null; restaurant: RestaurantInput; source: "photo" | "pdf"; files: ListFile[]; items: WineListItem[];
+  // userId: the app user who sent the list; uploadedBy: the admin who uploaded it in the panel.
+  userId?: string | null; uploadedBy?: string | null; restaurant: RestaurantInput; source: "photo" | "pdf"; files: ListFile[]; items: WineListItem[];
   status: "transcribed" | "failed"; model: string | null; attempts: ModelAttempt[]; usage: OpenRouterUsage; errorMessage?: string | null; durationMs: number;
 };
 
@@ -24,8 +25,12 @@ const ITEM_SELECT = `id, position, section, name, producer, vintage, country, re
 export class WineListRepository {
   constructor(private readonly pool: pg.Pool) {}
 
-  /** The restaurant with the same name (accents and case ignored) in the same city, or a new one. */
+  /** The restaurant chosen (id), the one with the same name (accents and case ignored) in the same city, or a new one. */
   private async restaurantId(input: RestaurantInput) {
+    if (input.id) {
+      const chosen = await this.pool.query<{ id: string }>(`SELECT id FROM restaurants WHERE id = $1`, [input.id]);
+      if (chosen.rows[0]) return chosen.rows[0].id;
+    }
     const name = clean(input.name);
     if (!name) return null;
     const city = clean(input.city);
@@ -43,17 +48,27 @@ export class WineListRepository {
     return result.rows[0].id;
   }
 
+  /** Whether the restaurant exists (the admin uploads a list for an existing one). */
+  async restaurantExists(id: string) {
+    return Boolean((await this.pool.query(`SELECT 1 FROM restaurants WHERE id = $1`, [id])).rowCount);
+  }
+
   async saveList(record: ListRecord): Promise<SavedList> {
     const restaurantId = await this.restaurantId(record.restaurant);
+    // A list the admin uploads is already curated.
+    const curation = record.uploadedBy && record.status === "transcribed" ? "approved" : "pending";
     const list = await this.pool.query<{ id: string; created_at: Date }>(
       `INSERT INTO wine_lists (restaurant_id, user_id, restaurant_name, city, address, latitude, longitude, source, status, model,
-                               models_tried, usage, error_message, duration_ms, item_count)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15)
+                               models_tried, usage, error_message, duration_ms, item_count, uploaded_by, curation_status,
+                               reviewed_at, reviewed_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16, $17,
+               CASE WHEN $17 = 'approved' THEN now() END, CASE WHEN $17 = 'approved' THEN $16::uuid END)
        RETURNING id, created_at`,
       [
         restaurantId, record.userId ?? null, clean(record.restaurant.name), clean(record.restaurant.city), clean(record.restaurant.address),
         coordinate(record.restaurant.latitude, 90), coordinate(record.restaurant.longitude, 180), record.source, record.status, record.model,
         JSON.stringify(record.attempts), JSON.stringify(record.usage), record.errorMessage?.slice(0, 1000) ?? null, record.durationMs, record.items.length,
+        record.uploadedBy ?? null, curation,
       ],
     );
     const listId = list.rows[0].id;
@@ -94,15 +109,25 @@ export class WineListRepository {
     };
   }
 
-  /** The user's latest wine lists, for the app history. */
+  /** The user's latest wine lists, for the app history ("Seus restaurantes"). */
   async listsOf(userId: string) {
     const result = await this.pool.query(
-      `SELECT l.id, l.created_at AS "createdAt", l.item_count AS "itemCount", l.status, coalesce(r.name, l.restaurant_name) AS "restaurantName", coalesce(r.city, l.city) AS city
+      `SELECT l.id, l.created_at AS "createdAt", l.item_count AS "itemCount", l.status, r.id AS "restaurantId",
+              coalesce(r.name, l.restaurant_name) AS "restaurantName", coalesce(r.city, l.city) AS city
        FROM wine_lists l LEFT JOIN restaurants r ON r.id = l.restaurant_id
        WHERE l.user_id = $1 AND l.status = 'transcribed' ORDER BY l.created_at DESC LIMIT 30`,
       [userId],
     );
     return result.rows;
+  }
+
+  /**
+   * Whether the user may open the list and check bottles against it: the lists they
+   * sent, and the lists the admin uploaded for a restaurant.
+   */
+  async canUse(listId: string, userId: string) {
+    const result = await this.pool.query(`SELECT 1 FROM wine_lists WHERE id = $1 AND (user_id = $2 OR (user_id IS NULL AND uploaded_by IS NOT NULL))`, [listId, userId]);
+    return Boolean(result.rowCount);
   }
 
   async findItem(listId: string, itemId: string): Promise<SavedItem | null> {

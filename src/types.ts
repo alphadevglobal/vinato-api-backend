@@ -191,7 +191,7 @@ export type AppDependencies = {
   adminSessions?: Pick<import("./admin-session.js").AdminSessions, "adminFor">;
   wineLists?: {
     agent: Pick<import("./wine-list.service.js").OpenRouterWineListAgent, "transcribe" | "checkBottle">;
-    repository: Pick<import("./wine-lists.repository.js").WineListRepository, "saveList" | "findList" | "listsOf" | "findItem" | "saveCheck">;
+    repository: Pick<import("./wine-lists.repository.js").WineListRepository, "saveList" | "findList" | "listsOf" | "findItem" | "saveCheck" | "canUse" | "restaurantExists">;
   };
 };
 

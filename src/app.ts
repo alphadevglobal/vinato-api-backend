@@ -531,6 +531,52 @@ export function createApp(dependencies: AppDependencies) {
     return Number.isFinite(parsed) ? parsed : null;
   };
 
+  /** Transcribes the wine list files sent (photos or one PDF) and saves it, also when it fails. */
+  const transcribeList = async (req: express.Request, owner: { userId?: string; uploadedBy?: string }, restaurantId?: string | null) => {
+    const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+    if (!files.length) throw badRequest('Envie as fotos da carta ou o PDF no campo "files".');
+    const pdfs = files.filter((file) => file.mimetype === "application/pdf");
+    if (pdfs.length && files.length > 1) throw badRequest("Envie um único PDF ou apenas fotos da carta.");
+    const restaurant = {
+      id: restaurantId ?? null,
+      name: optionalText(req.body?.restaurantName), city: optionalText(req.body?.city), address: optionalText(req.body?.address),
+      latitude: optionalNumber(req.body?.latitude), longitude: optionalNumber(req.body?.longitude),
+    };
+    const listFiles = files.map((file) => ({ mimetype: file.mimetype, dataUrl: dataUrl(file) }));
+    const startedAt = Date.now();
+    const { agent, repository } = wineLists();
+    const source = pdfs.length ? "pdf" as const : "photo" as const;
+    let transcription: Awaited<ReturnType<typeof agent.transcribe>>;
+    try {
+      transcription = await agent.transcribe(listFiles, { restaurantName: restaurant.name, city: restaurant.city }, { deadline: startedAt + TRANSCRIPTION_BUDGET_MS });
+    } catch (error) {
+      // Unexpected failures are logged too, so every attempt shows up in the admin.
+      await repository.saveList({
+        ...owner, restaurant, source, files: listFiles, items: [], status: "failed", model: null, attempts: [], usage: {},
+        errorMessage: `erro interno: ${(error as Error).message}`, durationMs: Date.now() - startedAt,
+      }).catch((saveError) => console.error("[wine-lists] could not log the failed transcription", saveError));
+      throw error;
+    }
+    const failed = !transcription.items.length;
+    const pageLabel = (page?: number) => page ? `página ${page} · ` : "";
+    const problems = transcription.attempts.filter((attempt) => !attempt.ok).map((attempt) => `${pageLabel(attempt.page)}${attempt.model}: ${attempt.error ?? "nenhum vinho encontrado"}`);
+    const saved = await repository.saveList({
+      ...owner,
+      restaurant: { ...restaurant, name: restaurant.name ?? transcription.restaurant.name, city: restaurant.city ?? transcription.restaurant.city },
+      source, files: listFiles, items: transcription.items,
+      status: failed ? "failed" : "transcribed", model: transcription.model, attempts: transcription.attempts, usage: transcription.usage,
+      errorMessage: failed || transcription.unreadPages.length ? (problems.join(" | ") || "nenhum vinho encontrado") : null,
+      durationMs: Date.now() - startedAt,
+    });
+    if (failed) {
+      const timedOut = transcription.attempts.some((attempt) => attempt.error === "request_timeout" || attempt.error === "no_time_left");
+      throw new HttpError(422, timedOut
+        ? "A leitura da carta demorou demais. Envie menos páginas por vez (as que têm os vinhos que você quer escolher)."
+        : "Não conseguimos ler os vinhos desta carta. Confira se as fotos mostram a lista de vinhos, uma página por foto.", "Unprocessable Entity");
+    }
+    return { ...saved, pages: transcription.pages, unreadPages: transcription.unreadPages };
+  };
+
   // Verificação de carta: the AI transcribes the wine list (photos or one PDF).
   app.post(
     "/wine-lists",
@@ -538,47 +584,25 @@ export function createApp(dependencies: AppDependencies) {
     asyncHandler(async (req, res) => {
       const { user } = await authenticated(req, dependencies);
       requirePremium(user);
-      const files = (req.files as Express.Multer.File[] | undefined) ?? [];
-      if (!files.length) throw badRequest('Envie as fotos da carta ou o PDF no campo "files".');
-      const pdfs = files.filter((file) => file.mimetype === "application/pdf");
-      if (pdfs.length && files.length > 1) throw badRequest("Envie um único PDF ou apenas fotos da carta.");
-      const restaurant = {
-        name: optionalText(req.body?.restaurantName), city: optionalText(req.body?.city), address: optionalText(req.body?.address),
-        latitude: optionalNumber(req.body?.latitude), longitude: optionalNumber(req.body?.longitude),
-      };
-      const listFiles = files.map((file) => ({ mimetype: file.mimetype, dataUrl: dataUrl(file) }));
-      const startedAt = Date.now();
-      const { agent, repository } = wineLists();
-      const source = pdfs.length ? "pdf" as const : "photo" as const;
-      let transcription: Awaited<ReturnType<typeof agent.transcribe>>;
-      try {
-        transcription = await agent.transcribe(listFiles, { restaurantName: restaurant.name, city: restaurant.city }, { deadline: startedAt + TRANSCRIPTION_BUDGET_MS });
-      } catch (error) {
-        // Unexpected failures are logged too, so every attempt shows up in the admin.
-        await repository.saveList({
-          userId: user.id, restaurant, source, files: listFiles, items: [], status: "failed", model: null, attempts: [], usage: {},
-          errorMessage: `erro interno: ${(error as Error).message}`, durationMs: Date.now() - startedAt,
-        }).catch((saveError) => console.error("[wine-lists] could not log the failed transcription", saveError));
-        throw error;
-      }
-      const failed = !transcription.items.length;
-      const pageLabel = (page?: number) => page ? `página ${page} · ` : "";
-      const problems = transcription.attempts.filter((attempt) => !attempt.ok).map((attempt) => `${pageLabel(attempt.page)}${attempt.model}: ${attempt.error ?? "nenhum vinho encontrado"}`);
-      const saved = await repository.saveList({
-        userId: user.id,
-        restaurant: { ...restaurant, name: restaurant.name ?? transcription.restaurant.name, city: restaurant.city ?? transcription.restaurant.city },
-        source, files: listFiles, items: transcription.items,
-        status: failed ? "failed" : "transcribed", model: transcription.model, attempts: transcription.attempts, usage: transcription.usage,
-        errorMessage: failed || transcription.unreadPages.length ? (problems.join(" | ") || "nenhum vinho encontrado") : null,
-        durationMs: Date.now() - startedAt,
-      });
-      if (failed) {
-        const timedOut = transcription.attempts.some((attempt) => attempt.error === "request_timeout" || attempt.error === "no_time_left");
-        throw new HttpError(422, timedOut
-          ? "A leitura da carta demorou demais. Envie menos páginas por vez (as que têm os vinhos que você quer escolher)."
-          : "Não conseguimos ler os vinhos desta carta. Confira se as fotos mostram a lista de vinhos, uma página por foto.", "Unprocessable Entity");
-      }
-      res.status(201).json({ ...saved, pages: transcription.pages, unreadPages: transcription.unreadPages });
+      res.status(201).json(await transcribeList(req, { userId: user.id }));
+    }),
+  );
+
+  // Admin "Curadoria Carta de Vinhos" (vinato-web): upload a list for a new restaurant
+  // (restaurantName, city, address) or an existing one (restaurantId). The panel
+  // forwards its admin session; the OpenRouter key never leaves this server.
+  app.post(
+    "/admin/wine-lists",
+    uploadListFiles(),
+    asyncHandler(async (req, res) => {
+      const header = req.header("authorization") ?? "";
+      const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+      const admin = token && dependencies.adminSessions ? await dependencies.adminSessions.adminFor(token) : null;
+      if (!admin) throw new HttpError(401, "Sessão administrativa inválida.", "Unauthorized");
+      const restaurantId = optionalText(req.body?.restaurantId);
+      if (restaurantId && (!isUuid(restaurantId) || !await wineLists().repository.restaurantExists(restaurantId))) throw notFound("Restaurante não encontrado.");
+      if (!restaurantId && !optionalText(req.body?.restaurantName)) throw badRequest("Escolha um restaurante ou informe o nome do novo restaurante.");
+      res.status(201).json(await transcribeList(req, { uploadedBy: admin.userId }, restaurantId));
     }),
   );
 
@@ -593,8 +617,11 @@ export function createApp(dependencies: AppDependencies) {
   app.get(
     "/wine-lists/:id",
     asyncHandler(async (req, res) => {
-      await authenticated(req, dependencies);
-      const list = await wineLists().repository.findList(String(req.params.id));
+      const { user } = await authenticated(req, dependencies);
+      const listId = String(req.params.id);
+      const { repository } = wineLists();
+      // Only the lists the user sent (or the admin uploaded) open for them.
+      const list = isUuid(listId) && await repository.canUse(listId, user.id) ? await repository.findList(listId) : null;
       if (!list) throw notFound("Carta não encontrada.");
       res.json(list);
     }),
@@ -609,7 +636,9 @@ export function createApp(dependencies: AppDependencies) {
       requirePremium(user);
       if (!req.file) throw badRequest('Envie a foto da garrafa no campo "image".');
       const { agent, repository } = wineLists();
-      const item = await repository.findItem(String(req.params.id), String(req.params.itemId));
+      const listId = String(req.params.id);
+      const item = isUuid(listId) && isUuid(String(req.params.itemId)) && await repository.canUse(listId, user.id)
+        ? await repository.findItem(listId, String(req.params.itemId)) : null;
       if (!item) throw notFound("Vinho da carta não encontrado.");
       const startedAt = Date.now();
       const imageDataUrl = dataUrl(req.file);
