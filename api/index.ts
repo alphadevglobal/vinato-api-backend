@@ -7,6 +7,9 @@ import { OpenRouterWineScanner } from "../src/scanner.service.js";
 import { PgWineRepository } from "../src/wines.repository.js";
 import { AccountRepository } from "../src/account.repository.js";
 import { PgAiModelSettings } from "../src/ai-model-settings.js";
+import { OpenRouterWineListAgent } from "../src/wine-list.service.js";
+import { AdminSessions } from "../src/admin-session.js";
+import { WineListRepository } from "../src/wine-lists.repository.js";
 
 const aiModelSettings = new PgAiModelSettings(pool);
 import { PgScanAuditRepository } from "../src/scan-audit.repository.js";
@@ -19,6 +22,8 @@ const app = createApp({
   sommelier: new SommelierAgent(pool),
   reviews: new ReviewRepository(pool),
   offers: new OfferRepository(pool),
+  adminSessions: new AdminSessions(pool),
+  wineLists: { agent: new OpenRouterWineListAgent(aiModelSettings), repository: new WineListRepository(pool) },
 });
 
 export default app;

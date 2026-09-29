@@ -188,6 +188,11 @@ export type AppDependencies = {
   sommelier?: import("./sommelier.service.js").SommelierAgent;
   reviews?: import("./reviews.repository.js").ReviewRepository;
   offers?: import("./offers.repository.js").OfferRepository;
+  adminSessions?: Pick<import("./admin-session.js").AdminSessions, "adminFor">;
+  wineLists?: {
+    agent: Pick<import("./wine-list.service.js").OpenRouterWineListAgent, "transcribe" | "checkBottle">;
+    repository: Pick<import("./wine-lists.repository.js").WineListRepository, "saveList" | "findList" | "listsOf" | "findItem" | "saveCheck">;
+  };
 };
 
 export type AsyncRequestHandler = (

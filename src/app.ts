@@ -9,6 +9,7 @@ import { validRating } from "./reviews.repository.js";
 import { newScanTrace, type ScanAuditEntry } from "./scan-audit.repository.js";
 import type { AppDependencies, AsyncRequestHandler, ScannedWineData, ScanWineLabelResult, Wine, WineListQuery } from "./types.js";
 import { verifySocialToken, type SocialProvider } from "./social-auth.js";
+import { requestJson } from "./openrouter.js";
 import { DISPOSABLE_EMAIL_MESSAGE, isDisposableEmailAddress } from "./email-policy.js";
 
 const require = createRequire(import.meta.url);
@@ -23,6 +24,20 @@ const acceptedMimeTypes = new Set([
   "image/heic",
   "image/heif",
 ]);
+
+// Wine lists: several photos of the pages or one PDF (the app compresses the photos;
+// Vercel limits a request body to about 4.5 MB).
+const listUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 10 },
+  fileFilter: (_req, file, callback) => {
+    if (!acceptedMimeTypes.has(file.mimetype) && file.mimetype !== "application/pdf") {
+      callback(badRequest(`Tipo de arquivo não suportado: "${file.mimetype}". Envie fotos (JPEG, PNG, WEBP, HEIC) ou um PDF.`));
+      return;
+    }
+    callback(null, true);
+  },
+});
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -466,6 +481,119 @@ export function createApp(dependencies: AppDependencies) {
     }),
   );
 
+  // AI review for the admin curation screen (vinato-web "Revisar com IA"): the panel
+  // forwards its admin session; the OpenRouter key never leaves this server.
+  app.post(
+    "/admin/ai/enrich",
+    asyncHandler(async (req, res) => {
+      const header = req.header("authorization") ?? "";
+      const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+      const admin = token && dependencies.adminSessions ? await dependencies.adminSessions.adminFor(token) : null;
+      if (!admin) throw new HttpError(401, "Sessão administrativa inválida.", "Unauthorized");
+      const model = typeof req.body?.model === "string" ? req.body.model.trim() : "";
+      const prompt = typeof req.body?.prompt === "string" ? req.body.prompt : "";
+      if (!model || !prompt) throw badRequest("Informe o modelo e o prompt.");
+      if (prompt.length > 20_000) throw badRequest("Prompt muito longo.");
+      const reply = await requestJson(model, [{ type: "text", text: prompt }], { maxTokens: 6000, timeoutMs: 55_000, title: "Vinato curadoria", webSearch: req.body?.web === true });
+      if (!reply.ok) {
+        const message = reply.error === "answer_cut_by_token_limit"
+          ? "A resposta do modelo foi cortada pelo limite de tokens (raciocínio longo). Tente outro modelo ou sem pesquisa na web."
+          : reply.error === "invalid_json_answer" ? "O modelo não devolveu um JSON válido." : `OpenRouter respondeu ${reply.status}: ${reply.error.slice(0, 200)}`;
+        res.status(502).json({ message, usage: reply.usage ?? null });
+        return;
+      }
+      res.json({ answer: reply.json, usage: reply.usage });
+    }),
+  );
+
+  const wineLists = () => {
+    if (!dependencies.wineLists) throw new HttpError(503, "Verificação de carta indisponível.", "Service Unavailable");
+    return dependencies.wineLists;
+  };
+  const dataUrl = (file: Express.Multer.File) => `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
+  const optionalText = (value: unknown) => typeof value === "string" && value.trim() ? value.trim() : null;
+  const optionalNumber = (value: unknown) => {
+    const parsed = typeof value === "string" && value.trim() ? Number(value.replace(",", ".")) : typeof value === "number" ? value : NaN;
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  // Verificação de carta: the AI transcribes the wine list (photos or one PDF).
+  app.post(
+    "/wine-lists",
+    uploadListFiles(),
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      requirePremium(user);
+      const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+      if (!files.length) throw badRequest('Envie as fotos da carta ou o PDF no campo "files".');
+      const pdfs = files.filter((file) => file.mimetype === "application/pdf");
+      if (pdfs.length && files.length > 1) throw badRequest("Envie um único PDF ou apenas fotos da carta.");
+      const restaurant = {
+        name: optionalText(req.body?.restaurantName), city: optionalText(req.body?.city), address: optionalText(req.body?.address),
+        latitude: optionalNumber(req.body?.latitude), longitude: optionalNumber(req.body?.longitude),
+      };
+      const listFiles = files.map((file) => ({ mimetype: file.mimetype, dataUrl: dataUrl(file) }));
+      const startedAt = Date.now();
+      const { agent, repository } = wineLists();
+      const transcription = await agent.transcribe(listFiles, { restaurantName: restaurant.name, city: restaurant.city });
+      const failed = !transcription.items.length;
+      const saved = await repository.saveList({
+        userId: user.id,
+        restaurant: { ...restaurant, name: restaurant.name ?? transcription.restaurant.name, city: restaurant.city ?? transcription.restaurant.city },
+        source: pdfs.length ? "pdf" : "photo", files: listFiles, items: transcription.items,
+        status: failed ? "failed" : "transcribed", model: transcription.model, attempts: transcription.attempts, usage: transcription.usage,
+        errorMessage: failed ? transcription.attempts.map((attempt) => `${attempt.model}: ${attempt.error ?? "nenhum vinho encontrado"}`).join(" | ") : null,
+        durationMs: Date.now() - startedAt,
+      });
+      if (failed) throw new HttpError(422, "Não conseguimos ler os vinhos desta carta. Tente fotos mais nítidas, uma página por foto.", "Unprocessable Entity");
+      res.status(201).json(saved);
+    }),
+  );
+
+  app.get(
+    "/wine-lists",
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      res.json(await wineLists().repository.listsOf(user.id));
+    }),
+  );
+
+  app.get(
+    "/wine-lists/:id",
+    asyncHandler(async (req, res) => {
+      await authenticated(req, dependencies);
+      const list = await wineLists().repository.findList(String(req.params.id));
+      if (!list) throw notFound("Carta não encontrada.");
+      res.json(list);
+    }),
+  );
+
+  // The critical sommelier: is the bottle served the wine chosen on the list?
+  app.post(
+    "/wine-lists/:id/items/:itemId/check",
+    uploadSingleImage(),
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      requirePremium(user);
+      if (!req.file) throw badRequest('Envie a foto da garrafa no campo "image".');
+      const { agent, repository } = wineLists();
+      const item = await repository.findItem(String(req.params.id), String(req.params.itemId));
+      if (!item) throw notFound("Vinho da carta não encontrado.");
+      const startedAt = Date.now();
+      const imageDataUrl = dataUrl(req.file);
+      const check = (await agent.checkBottle(item, imageDataUrl))!;
+      const saved = await repository.saveCheck({
+        listId: String(req.params.id), itemId: item.id, userId: user.id, imageDataUrl, check, durationMs: Date.now() - startedAt,
+        errorMessage: check.model ? null : check.attempts.map((attempt) => `${attempt.model}: ${attempt.error ?? "falha"}`).join(" | "),
+      });
+      if (!check.model) throw new HttpError(502, "Não foi possível comparar a garrafa agora. Tente novamente.", "Bad Gateway");
+      res.json({
+        id: saved.id, createdAt: saved.createdAt, item, verdict: check.verdict, confidence: check.confidence,
+        observed: check.observed, differences: check.differences, explanation: check.explanation,
+      });
+    }),
+  );
+
   app.post(
     "/wine-scanner/scan",
     uploadSingleImage(),
@@ -578,6 +706,17 @@ function uploadSingleImage(): RequestHandler {
         return;
       }
 
+      next(error);
+    });
+  };
+}
+
+function uploadListFiles(): RequestHandler {
+  return (req, res, next) => {
+    listUpload.array("files", 10)(req, res, (error) => {
+      if (!error) { next(); return; }
+      if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") { next(badRequest("Cada arquivo pode ter no máximo 10MB.")); return; }
+      if (error instanceof multer.MulterError && (error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE")) { next(badRequest("Envie no máximo 10 fotos da carta.")); return; }
       next(error);
     });
   };
