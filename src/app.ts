@@ -28,10 +28,11 @@ const acceptedMimeTypes = new Set([
 ]);
 
 // Wine lists: several photos of the pages or one PDF (the app compresses the photos;
-// Vercel limits a request body to about 4.5 MB).
+// Vercel limits a request body to about 4.5 MB). Long lists reach 12–15 pages.
+export const MAX_LIST_FILES = 15;
 const listUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024, files: 10 },
+  limits: { fileSize: 10 * 1024 * 1024, files: MAX_LIST_FILES },
   fileFilter: (_req, file, callback) => {
     if (!acceptedMimeTypes.has(file.mimetype) && file.mimetype !== "application/pdf") {
       callback(badRequest(`Tipo de arquivo não suportado: "${file.mimetype}". Envie fotos (JPEG, PNG, WEBP, HEIC) ou um PDF.`));
@@ -807,10 +808,10 @@ function uploadSingleImage(): RequestHandler {
 
 function uploadListFiles(): RequestHandler {
   return (req, res, next) => {
-    listUpload.array("files", 10)(req, res, (error) => {
+    listUpload.array("files", MAX_LIST_FILES)(req, res, (error) => {
       if (!error) { next(); return; }
       if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") { next(badRequest("Cada arquivo pode ter no máximo 10MB.")); return; }
-      if (error instanceof multer.MulterError && (error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE")) { next(badRequest("Envie no máximo 10 fotos da carta.")); return; }
+      if (error instanceof multer.MulterError && (error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE")) { next(badRequest(`Envie no máximo ${MAX_LIST_FILES} fotos da carta.`)); return; }
       next(error);
     });
   };

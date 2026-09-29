@@ -399,6 +399,19 @@ describe("wine list routes", () => {
     expect(repository.saveList.mock.calls[0][0]).toMatchObject({ source: "pdf", restaurant: { name: "Fasano" } });
   });
 
+  it("accepts a long list of up to 15 pages, and refuses more", async () => {
+    const { app, transcribe } = appFor("premium");
+    const send = (pages: number) => {
+      let call = request(app).post("/wine-lists").set("Authorization", "Bearer t").field("restaurantName", "Casa Nostra");
+      for (let page = 1; page <= pages; page += 1) call = call.attach("files", Buffer.from(`page${page}`), { filename: `p${page}.jpg`, contentType: "image/jpeg" });
+      return call;
+    };
+    await send(15).expect(201);
+    expect(transcribe.mock.calls[0][0]).toHaveLength(15);
+    const tooMany = await send(16).expect(400);
+    expect(tooMany.body.message).toBe("Envie no máximo 15 fotos da carta.");
+  });
+
   it("rejects mixing a PDF with photos, other file types and empty requests", async () => {
     const { app } = appFor("premium");
     await request(app).post("/wine-lists").set("Authorization", "Bearer t")
