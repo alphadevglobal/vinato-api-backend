@@ -5,6 +5,10 @@ import type { BottleCheck, ListFile, WineListItem } from "./wine-list.service.js
 
 export type RestaurantInput = { id?: string | null; name?: string | null; city?: string | null; address?: string | null; latitude?: number | null; longitude?: number | null };
 export type SavedItem = WineListItem & { id: string; position: number };
+export type RestaurantWithList = {
+  id: string; name: string; city: string | null; address: string | null; networkNote: string | null; otherCities: string[];
+  listId: string; updatedAt: string; itemCount: number; approved: boolean; mine: boolean;
+};
 export type SavedList = {
   id: string; status: "transcribed" | "failed"; source: "photo" | "pdf"; createdAt: string;
   restaurant: { id: string | null; name: string | null; city: string | null; address: string | null };
@@ -104,7 +108,7 @@ export class WineListRepository {
     const list = await this.pool.query<{ restaurantName: string | null; city: string | null; usage: OpenRouterUsage | null; checks: number }>(
       `SELECT coalesce(r.name, l.restaurant_name) AS "restaurantName", coalesce(r.city, l.city) AS city, l.usage,
               (SELECT count(*)::int FROM wine_list_checks c WHERE c.wine_list_id = l.id) AS checks
-       FROM wine_lists l LEFT JOIN restaurants r ON r.id = l.restaurant_id WHERE l.id = $1`,
+       FROM wine_lists l LEFT JOIN restaurants r ON r.id = l.restaurant_id WHERE l.id = $1 AND l.deleted_at IS NULL`,
       [listId],
     );
     if (!list.rows[0]) return null;
@@ -152,7 +156,7 @@ export class WineListRepository {
       `SELECT l.id, l.created_at AS "createdAt", l.item_count AS "itemCount", l.status, r.id AS "restaurantId",
               coalesce(r.name, l.restaurant_name) AS "restaurantName", coalesce(r.city, l.city) AS city
        FROM wine_lists l LEFT JOIN restaurants r ON r.id = l.restaurant_id
-       WHERE l.user_id = $1 AND l.status = 'transcribed' ORDER BY l.created_at DESC LIMIT 30`,
+       WHERE l.user_id = $1 AND l.status = 'transcribed' AND l.deleted_at IS NULL ORDER BY l.created_at DESC LIMIT 30`,
       [userId],
     );
     return result.rows;
@@ -160,11 +164,48 @@ export class WineListRepository {
 
   /**
    * Whether the user may open the list and check bottles against it: the lists they
-   * sent, and the lists the admin uploaded for a restaurant.
+   * sent, and every published list (transcribed, not rejected by the curators) —
+   * the lists the app offers for each restaurant. Deleted lists never open.
    */
   async canUse(listId: string, userId: string) {
-    const result = await this.pool.query(`SELECT 1 FROM wine_lists WHERE id = $1 AND (user_id = $2 OR (user_id IS NULL AND uploaded_by IS NOT NULL))`, [listId, userId]);
+    const result = await this.pool.query(
+      `SELECT 1 FROM wine_lists WHERE id = $1 AND deleted_at IS NULL
+         AND (user_id = $2 OR (status = 'transcribed' AND curation_status <> 'rejected'))`,
+      [listId, userId],
+    );
     return Boolean(result.rowCount);
+  }
+
+  /**
+   * The restaurants that already have a wine list, for the first screen of the
+   * app: each with its current list (the newest approved one, or else the newest
+   * published), when it was sent, how many wines it has, the chain description
+   * and the other cities of a restaurant with the same name. The user's own lists
+   * count even before curation.
+   */
+  async restaurantsWithLists(userId: string, query = "") {
+    const term = normalizeText(query);
+    const result = await this.pool.query<RestaurantWithList>(
+      `WITH visible AS (
+         SELECT l.id, l.restaurant_id, l.created_at, l.item_count, l.curation_status = 'approved' AS approved, coalesce(l.user_id = $1, false) AS mine
+         FROM wine_lists l
+         WHERE l.deleted_at IS NULL AND l.status = 'transcribed' AND l.restaurant_id IS NOT NULL
+           AND (l.curation_status <> 'rejected' OR l.user_id = $1)
+       ), current AS (
+         SELECT DISTINCT ON (restaurant_id) restaurant_id, id, created_at, item_count, approved, mine
+         FROM visible ORDER BY restaurant_id, approved DESC, created_at DESC
+       )
+       SELECT r.id, r.name, r.city, r.address, r.network_note AS "networkNote",
+              c.id AS "listId", c.created_at AS "updatedAt", c.item_count AS "itemCount", c.approved, c.mine,
+              coalesce((SELECT array_agg(DISTINCT o.city ORDER BY o.city) FROM restaurants o
+                        WHERE o.name_key = r.name_key AND o.id <> r.id AND o.city IS NOT NULL), '{}') AS "otherCities"
+       FROM current c JOIN restaurants r ON r.id = c.restaurant_id
+       WHERE $2 = '' OR r.name_key LIKE '%' || $2 || '%' OR lower(coalesce(r.city, '')) LIKE '%' || lower($3) || '%'
+       ORDER BY r.name, r.city NULLS LAST
+       LIMIT 100`,
+      [userId, term, query.trim()],
+    );
+    return result.rows.map((row) => ({ ...row, updatedAt: new Date(row.updatedAt).toISOString() }));
   }
 
   async findItem(listId: string, itemId: string): Promise<SavedItem | null> {

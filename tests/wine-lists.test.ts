@@ -219,7 +219,7 @@ describe("WineListRepository (migration 017)", () => {
     db = new PGlite();
     await db.exec(`create table catalog_wines (id uuid primary key default gen_random_uuid(), display_name text not null, images jsonb not null default '[]', updated_at timestamptz not null default now());
       create table unlisted_wine_scans (id uuid primary key default gen_random_uuid(), unlisted_code text not null unique, status text not null default 'needs_registration', image_data_url text not null, extracted_data jsonb not null default '{}', user_id uuid, registered_wine_id uuid references catalog_wines(id), created_at timestamptz not null default now());`);
-    for (const name of ["014_unlisted_scan_dedup.sql", "015_wine_photo_pool.sql", "017_wine_lists.sql", "019_admin_wine_lists.sql"]) await db.exec(read(name));
+    for (const name of ["014_unlisted_scan_dedup.sql", "015_wine_photo_pool.sql", "017_wine_lists.sql", "019_admin_wine_lists.sql", "020_wine_list_management.sql"]) await db.exec(read(name));
     // node-pg style adapter over PGlite.
     const pool = { query: (sql: string, params?: unknown[]) => db.query(sql, params) } as unknown as pg.Pool;
     repository = new WineListRepository(pool);
@@ -284,7 +284,8 @@ describe("WineListRepository (migration 017)", () => {
     const row = (await db.query(`select user_id, uploaded_by, curation_status, reviewed_by from wine_lists where id = $1`, [official.id])).rows[0];
     expect(row).toEqual({ user_id: null, uploaded_by: admin, curation_status: "approved", reviewed_by: admin });
     expect(await repository.canUse(mine.id, owner)).toBe(true);
-    expect(await repository.canUse(mine.id, stranger)).toBe(false);
+    // A published list (transcribed, not rejected) opens for every user of the app.
+    expect(await repository.canUse(mine.id, stranger)).toBe(true);
     expect(await repository.canUse(official.id, stranger)).toBe(true);
     expect(await repository.restaurantExists(mine.restaurant.id!)).toBe(true);
     expect(await repository.restaurantExists(stranger)).toBe(false);
@@ -314,6 +315,39 @@ describe("WineListRepository (migration 017)", () => {
     expect((await repository.retranscriptionSource(saved.id))?.checks).toBe(1);
   });
 
+  it("lists the restaurants with a list: the current one per restaurant, published to every user", async () => {
+    const ana = "11111111-1111-4111-8111-111111111111", bia = "22222222-2222-4222-8222-222222222222", admin = "33333333-3333-4333-8333-333333333333";
+    const older = await repository.saveList(record({ userId: null, uploadedBy: admin, restaurant: { name: "Casa Nostra", city: "Recife" } }));
+    await db.query(`update wine_lists set created_at = now() - interval '10 days' where id = $1`, [older.id]);
+    const newer = await repository.saveList(record({ userId: ana, restaurant: { name: "Casa Nostra", city: "Recife" } }));
+    await repository.saveList(record({ userId: ana, restaurant: { name: "Casa Nostra", city: "Lisboa" } }));
+    const rejected = await repository.saveList(record({ userId: ana, restaurant: { name: "Bistrô Rejeitado", city: "Recife" } }));
+    await db.query(`update wine_lists set curation_status = 'rejected' where id = $1`, [rejected.id]);
+    const removed = await repository.saveList(record({ userId: ana, restaurant: { name: "Carta Excluída", city: "Recife" } }));
+    await db.query(`update wine_lists set deleted_at = now() where id = $1`, [removed.id]);
+    await repository.saveList(record({ userId: ana, restaurant: { name: "Falhou", city: "Recife" }, items: [], status: "failed" }));
+    await db.query(`update restaurants set network_note = 'Rede italiana com unidades no Brasil e em Portugal' where name = 'Casa Nostra' and city = 'Recife'`);
+
+    const forBia = await repository.restaurantsWithLists(bia);
+    expect(forBia.map((restaurant) => [restaurant.name, restaurant.city])).toEqual([["Casa Nostra", "Lisboa"], ["Casa Nostra", "Recife"]]);
+    // The approved (admin) list is the current one, even though a newer pending one exists.
+    const recife = forBia.find((restaurant) => restaurant.city === "Recife")!;
+    expect(recife).toMatchObject({ listId: older.id, approved: true, mine: false, itemCount: 2, networkNote: "Rede italiana com unidades no Brasil e em Portugal", otherCities: ["Lisboa"] });
+    expect(newer.id).not.toBe(recife.listId);
+    // Its sender still sees a list the curators rejected; nobody sees a deleted one.
+    expect((await repository.restaurantsWithLists(ana)).map((restaurant) => restaurant.name)).toEqual(["Bistrô Rejeitado", "Casa Nostra", "Casa Nostra"]);
+    // Search ignores accents and case, by name or city.
+    expect((await repository.restaurantsWithLists(bia, "NOSTRÁ")).length).toBe(2);
+    expect((await repository.restaurantsWithLists(bia, "lisboa")).map((restaurant) => restaurant.city)).toEqual(["Lisboa"]);
+
+    // Published lists open for everyone; rejected only for the sender; deleted for nobody.
+    expect(await repository.canUse(newer.id, bia)).toBe(true);
+    expect(await repository.canUse(rejected.id, bia)).toBe(false);
+    expect(await repository.canUse(rejected.id, ana)).toBe(true);
+    expect(await repository.canUse(removed.id, ana)).toBe(false);
+    expect(await repository.retranscriptionSource(removed.id)).toBeNull();
+  });
+
   it("creates the default wine list AI model", async () => {
     expect((await db.query(`select model, fallback_model from wine_list_agent_config`)).rows).toEqual([{ model: "google/gemini-3.8-flash", fallback_model: "google/gemini-3.1-flash-lite" }]);
   });
@@ -333,6 +367,7 @@ describe("wine list routes", () => {
       canUse: vi.fn(async (id: string) => id === LIST), restaurantExists: vi.fn(async (id: string) => id === RESTAURANT),
       retranscriptionSource: vi.fn(async (id: string) => id === LIST ? { restaurantName: "Casa Nostra", city: "Recife", usage: { totalTokens: 24978, costUsd: 0.05 }, checks: overrides.checks ?? 0, files: [{ mimetype: "image/jpeg", dataUrl: "data:image/jpeg;base64,AA" }] } : null),
       replaceTranscription: vi.fn(async () => saved),
+      restaurantsWithLists: vi.fn(async () => [{ id: RESTAURANT, name: "Casa Nostra", city: "Recife", listId: LIST }]),
     };
     const adminSessions = { adminFor: vi.fn(async (token: string) => token === "admin-token" ? { userId: "admin-1", role: "admin" } : null) };
     const accountRepository = { getUser: vi.fn(async () => user(plan)) };
@@ -398,6 +433,14 @@ describe("wine list routes", () => {
     transcribe.mockRejectedValueOnce(new Error("connection terminated"));
     await request(app).post("/wine-lists").set("Authorization", "Bearer t").attach("files", Buffer.from("x"), { filename: "a.jpg", contentType: "image/jpeg" }).expect(500);
     expect(repository.saveList.mock.calls[0][0]).toMatchObject({ status: "failed", items: [], errorMessage: "erro interno: connection terminated" });
+  });
+
+  it("lists the restaurants with a wine list for a signed-in user, before the list id route", async () => {
+    const { app, repository } = appFor("free");
+    const response = await request(app).get("/wine-lists/restaurants?q=nostra").set("Authorization", "Bearer t").expect(200);
+    expect(response.body).toEqual([{ id: RESTAURANT, name: "Casa Nostra", city: "Recife", listId: LIST }]);
+    expect(repository.restaurantsWithLists).toHaveBeenCalledWith("user-1", "nostra");
+    expect(repository.findList).not.toHaveBeenCalled();
   });
 
   it("lets the admin transcribe again a list a user sent, with its saved files", async () => {

@@ -636,6 +636,17 @@ export function createApp(dependencies: AppDependencies) {
     }),
   );
 
+  // First screen of "Verificação de carta": restaurants that already have a list.
+  // Declared before /wine-lists/:id, which would take "restaurants" as an id.
+  app.get(
+    "/wine-lists/restaurants",
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      const query = typeof req.query.q === "string" ? req.query.q.slice(0, 80) : "";
+      res.json(await wineLists().repository.restaurantsWithLists(user.id, query));
+    }),
+  );
+
   app.get(
     "/wine-lists/:id",
     asyncHandler(async (req, res) => {
