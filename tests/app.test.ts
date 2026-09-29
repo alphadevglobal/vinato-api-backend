@@ -331,6 +331,32 @@ describe("scan audit log", () => {
     expect(record.mock.calls[0][0].reading.displayName).toBe("Chateau Test 2019");
   });
 
+  it("answers with the wine linked to an identical photo without querying the catalog", async () => {
+    const record = vi.fn(async () => undefined);
+    const repository = Object.assign(new MemoryWineRepository(seedWines), {
+      reconcileScan: vi.fn(async () => ({ status: "matched" as const, wineId: seedWines[0].id, imageAdded: false, alternatives: [] })),
+    });
+    const scanner = { scanWineLabel: vi.fn(async () => ({ success: true as const, data: reading })) };
+    const response = await post(createApp({ wineRepository: repository, wineScanner: scanner, scanAudit: { record } })).expect(200);
+
+    expect(response.body.catalog).toMatchObject({ status: "matched", wineId: seedWines[0].id });
+    expect(response.body.data.displayName).toBe(seedWines[0].displayName);
+    expect(record.mock.calls[0][0]).toMatchObject({ outcome: "matched", catalogWineId: seedWines[0].id, trace: { catalogQueried: false } });
+    expect(record.mock.calls[0][0].matchScore).toBeUndefined();
+  });
+
+  it("returns and audits the reused code when an identical photo is already queued", async () => {
+    const record = vi.fn(async () => undefined);
+    const repository = Object.assign(new MemoryWineRepository(seedWines), {
+      reconcileScan: vi.fn(async () => ({ status: "needs_registration" as const, code: "VINATO-UNLISTED-20260901-ABCD1234", alternatives: [] })),
+    });
+    const scanner = { scanWineLabel: vi.fn(async () => ({ success: true as const, data: reading })) };
+    const response = await post(createApp({ wineRepository: repository, wineScanner: scanner, scanAudit: { record } })).expect(200);
+
+    expect(response.body.catalog).toEqual({ status: "needs_registration", code: "VINATO-UNLISTED-20260901-ABCD1234", alternatives: [] });
+    expect(record.mock.calls[0][0]).toMatchObject({ outcome: "needs_registration", unlistedCode: "VINATO-UNLISTED-20260901-ABCD1234" });
+  });
+
   it("records recognition failures without touching the catalog", async () => {
     const record = vi.fn(async () => undefined);
     const scanner = { scanWineLabel: vi.fn(async () => { throw new Error("MODEL_402: insufficient credits"); }) };
