@@ -7,12 +7,13 @@ import { badRequest, HttpError, internalServerError, notFound } from "./http-err
 import { openApiDocument } from "./openapi.js";
 import { validRating } from "./reviews.repository.js";
 import { newScanTrace, type ScanAuditEntry } from "./scan-audit.repository.js";
-import type { AppDependencies, AsyncRequestHandler, ScannedWineData, ScanWineLabelResult, Wine, WineListQuery } from "./types.js";
+import type { AppDependencies, AsyncRequestHandler, ScannedWineData, ScanResolution, ScanWineLabelResult, Wine, WineListQuery } from "./types.js";
 import { verifySocialToken, type SocialProvider } from "./social-auth.js";
 import { requestJson, type ModelAttempt, type OpenRouterUsage } from "./openrouter.js";
 import { openRouterAccount } from "./openrouter-account.js";
 import { CHECK_BUDGET_MS, TRANSCRIPTION_BUDGET_MS } from "./wine-list.service.js";
 import { DISPOSABLE_EMAIL_MESSAGE, isDisposableEmailAddress } from "./email-policy.js";
+import { deviceSearchTerms, exactTextMatch, labelVolume, labelYears, parseDeviceReading, type DeviceReading } from "./label-text-match.js";
 
 const require = createRequire(import.meta.url);
 const helmet = require("helmet") as (options?: { contentSecurityPolicy?: boolean }) => RequestHandler;
@@ -740,17 +741,34 @@ export function createApp(dependencies: AppDependencies) {
       const user = token && dependencies.accountRepository ? await dependencies.accountRepository.getUser(token).catch(() => null) : null;
       // Every scan leaves one audit row (photo, model, catalog lookup, outcome).
       // Auditing is best effort: it never changes what the user receives.
-      const audit = async (entry: Omit<ScanAuditEntry, "file" | "trace" | "durationMs" | "userId" | "platform" | "appVersion">) => {
+      // The phone's own reading of the label (text lines + barcodes): tried against the
+      // catalog first, without AI. mode=ai: the user said the wine found that way was wrong.
+      const device = parseDeviceReading(req.body?.deviceReading);
+      const forceAi = req.body?.mode === "ai";
+      const audit = async (entry: Omit<ScanAuditEntry, "file" | "trace" | "durationMs" | "userId" | "platform" | "appVersion" | "deviceReading">) => {
         if (!dependencies.scanAudit) return;
         try {
           await dependencies.scanAudit.record({
-            ...entry, file, trace, userId: user?.id, durationMs: Date.now() - startedAt,
+            ...entry, file, trace, userId: user?.id, durationMs: Date.now() - startedAt, deviceReading: device,
             platform: req.header("x-vinato-platform") ?? undefined, appVersion: req.header("x-vinato-app-version") ?? undefined,
           });
         } catch (error) {
           console.error("[wine-scanner] could not write the scan audit log", error);
         }
       };
+
+      if (device && !forceAi) {
+        const quick = await resolveWithoutAi(dependencies, device, file, user?.id, trace).catch((error) => {
+          // Never blocks the scan: the AI reads the label as before.
+          console.error("[wine-scanner] lookup without AI failed", (error as Error).message);
+          return null;
+        });
+        if (quick) {
+          await audit({ success: true, outcome: "matched", reading: quick.data, catalogWineId: quick.catalog.wineId, matchScore: 1, imageAdded: quick.catalog.imageAdded, resolvedBy: quick.catalog.resolvedBy });
+          res.json(quick);
+          return;
+        }
+      }
 
       let result: ScanWineLabelResult;
       try {
@@ -776,7 +794,15 @@ export function createApp(dependencies: AppDependencies) {
         throw error;
       }
       const catalog = result.catalog;
+      if (catalog?.status === "matched") {
+        catalog.resolvedBy = "ai";
+        // The AI found the wine: the barcode on this photo now finds it without AI.
+        for (const barcode of device?.barcodes ?? []) {
+          await dependencies.wineRepository.rememberBarcode?.(barcode, catalog.wineId, "scan_ai", user?.id, forceAi);
+        }
+      }
       await audit({
+        resolvedBy: catalog?.status === "matched" ? "ai" : undefined,
         success: true,
         outcome: catalog?.status === "needs_registration" ? "needs_registration" : catalog?.created ? "ai_created" : "matched",
         reading,
@@ -796,6 +822,59 @@ export function createApp(dependencies: AppDependencies) {
   app.use(errorHandler);
 
   return app;
+}
+
+type ResolvedScan = ScanWineLabelResult & { catalog: { status: "matched"; wineId: string; imageAdded: boolean; resolvedBy: ScanResolution } };
+
+/**
+ * The wine found on the phone's reading alone (no AI tokens): a barcode already
+ * linked to a wine, else the label text matching exactly one catalog wine.
+ * Null whenever that is not certain.
+ */
+async function resolveWithoutAi(dependencies: AppDependencies, device: DeviceReading, file: Express.Multer.File, userId: string | undefined, trace: ReturnType<typeof newScanTrace>): Promise<ResolvedScan | null> {
+  const repository = dependencies.wineRepository;
+  if (!repository.findCandidatesByTerms) return null;
+  const startedAt = Date.now();
+  const years = labelYears(device);
+  let found: { wineId: string; resolvedBy: ScanResolution; vintage: number | null } | null = null;
+
+  for (const barcode of device.barcodes) {
+    const linked = await repository.findWineByBarcode?.(barcode);
+    // One barcode serves every vintage: a row for another printed year is not this bottle.
+    if (linked && !(linked.vintage && years.length && !years.includes(linked.vintage))) {
+      found = { wineId: linked.wineId, resolvedBy: "barcode", vintage: years.length === 1 ? years[0] : linked.vintage };
+      break;
+    }
+  }
+
+  if (!found) {
+    const terms = deviceSearchTerms(device);
+    const candidates = terms.length ? await repository.findCandidatesByTerms(terms) : [];
+    trace.catalogQueried = true;
+    trace.catalogCandidates = candidates.length;
+    const match = exactTextMatch(device, candidates);
+    if (match) {
+      found = { wineId: match.candidate.id, resolvedBy: "text", vintage: match.vintage };
+      for (const barcode of device.barcodes) await repository.rememberBarcode?.(barcode, match.candidate.id, "scan_text", userId);
+    }
+  }
+  trace.catalogMs = Date.now() - startedAt;
+  if (!found) return null;
+
+  const wine = await repository.findById(found.wineId);
+  if (!wine) return null;
+  const reading: ScannedWineData = {
+    displayName: null, producerTitle: null, producerName: null, wine: null, country: null, region: null, subRegion: null,
+    colour: null, type: null, subType: null, designation: null, classification: null,
+    vintage: found.vintage ? String(found.vintage) : null, alcoholContent: null, grapes: null, volume: labelVolume(device),
+    confidence: 1, notes: "",
+  };
+  const imageAdded = await repository.attachDeviceScan?.(wine.id, file, userId) ?? false;
+  return {
+    success: true,
+    data: catalogWineToScanData(wine, reading),
+    catalog: { status: "matched", wineId: wine.id, imageAdded, matchScore: 1, alternatives: [], resolvedBy: found.resolvedBy },
+  };
 }
 
 // Every fact comes from the catalog row. The only label facts kept are the ones

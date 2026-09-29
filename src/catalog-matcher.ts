@@ -43,7 +43,7 @@ const GENERIC_WORDS = new Set([
 ]);
 
 // Words that separate different wines of the same producer and line.
-const TIER_WORDS = new Set([
+export const TIER_WORDS = new Set([
   "reserva", "reserve", "riserva", "gran", "grande", "grand", "premium", "select", "selection", "seleccion", "selecao",
   "limitada", "limited", "especial", "special", "crianza", "icon", "single", "estate", "superior", "old", "vines",
   "brut", "nature", "extra", "moscatel", "noir", "rose", "rosado", "branco", "blanco", "white", "blanc",
@@ -64,7 +64,7 @@ const SWEETNESS: Array<[string, RegExp]> = [
   ["seco", /\b(seco|seca|dry)\b/],
   ["brut", /\b(brut|extra brut|nature)\b/],
 ];
-function sweetnessOf(text: string) {
+export function sweetnessOf(text: string) {
   const normalized = normalizeText(text);
   // "demi-sec" must not also count as "seco"; "extra brut" as "brut" is the same family.
   const found = new Set<string>();
@@ -74,13 +74,13 @@ function sweetnessOf(text: string) {
 }
 
 /** Colour stated by a text. Style words win over grape hints ("Pinot Noir Rosé" is rosé). */
-function colourOf(text: string) {
+export function colourOf(text: string) {
   const normalized = normalizeText(text);
   for (const [colour, pattern] of COLOURS) if (pattern.test(normalized)) return colour;
   return null;
 }
 
-const GRAPE_WORDS = new Set([
+export const GRAPE_WORDS = new Set([
   "cabernet", "franc", "sauvignon", "malbec", "merlot", "syrah", "shiraz", "pinot", "noir", "chardonnay", "carmenere", "tannat",
   "bonarda", "tempranillo", "sangiovese", "primitivo", "nebbiolo", "touriga", "marselan", "montepulciano", "riesling", "viognier",
   "verdot", "grenache", "garnacha", "zinfandel", "barbera", "aglianico", "carignan", "mourvedre", "monastrell", "torrontes",
@@ -88,7 +88,7 @@ const GRAPE_WORDS = new Set([
 ]);
 
 // Bottle formats that make a catalog row a different product from a standard 750 ml bottle.
-const LARGE_OR_SMALL_FORMAT = /\b(magnum|imperial|jeroboam|rehoboam|methuselah|salmanazar|nabucodonosor|double|split|demi|half|piccolo|(1[,.]5|3|4[,.]5|5|6|9|12|15)\s?l(itros?)?|(187|375|500)\s?ml)\b/;
+export const LARGE_OR_SMALL_FORMAT = /\b(magnum|imperial|jeroboam|rehoboam|methuselah|salmanazar|nabucodonosor|double|split|demi|half|piccolo|(1[,.]5|3|4[,.]5|5|6|9|12|15)\s?l(itros?)?|(187|375|500)\s?ml)\b/;
 
 export function normalizeText(value: string | null | undefined) {
   return (value ?? "")
@@ -102,7 +102,7 @@ export function normalizeText(value: string | null | undefined) {
     .trim();
 }
 
-function tokens(value: string | null | undefined) {
+export function tokens(value: string | null | undefined) {
   return normalizeText(value)
     // Initials are a name ("D.V. Catena" → "dv"), not stray letters to drop.
     .replace(/\b([a-z])(?: ([a-z]))+\b/g, (match) => match.replace(/ /g, ""))
@@ -317,7 +317,7 @@ function strip(list: Array<ScoredCandidate & { raw: number }>): ScoredCandidate[
 
 // The same wine catalogued twice ("Vinho Rutini Cabernet / Malbec" and
 // "Rutini, Cabernet Malbec, Mendoza") differs only by generic and place words.
-function sameWine(a: CatalogCandidate, b: CatalogCandidate) {
+export function sameWine(a: CatalogCandidate, b: CatalogCandidate) {
   const places = new Set([...(a.places ?? []), ...(b.places ?? [])].flatMap((place) => tokens(place)));
   const name = (candidate: CatalogCandidate) => [...new Set(tokens([candidate.displayName, candidate.producer].join(" ")))].filter((token) => !places.has(token)).sort().join(" ");
   return name(a) === name(b);

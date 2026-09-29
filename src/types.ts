@@ -155,12 +155,15 @@ export type ScannedWineData = {
 
 export type CatalogAlternative = { wineId: string; displayName: string };
 
+export type ScanResolution = "barcode" | "text" | "ai";
+
 export type ScanWineLabelResult = {
   data: ScannedWineData;
   success: true;
   catalog?:
     // created: the catalog had no safe match, so the wine was created from the AI reading (pending curation).
-    | { status: "matched"; wineId: string; imageAdded: boolean; matchScore?: number; created?: boolean; alternatives?: CatalogAlternative[] }
+    // resolvedBy: how the wine was found. barcode/text: on the phone's reading, without AI tokens.
+    | { status: "matched"; wineId: string; imageAdded: boolean; matchScore?: number; created?: boolean; alternatives?: CatalogAlternative[]; resolvedBy?: ScanResolution }
     | { status: "needs_registration"; code: string; alternatives?: CatalogAlternative[] };
 };
 
@@ -171,6 +174,11 @@ export type WineRepository = {
   findByLwin(lwin: string): Promise<Wine | null>;
   explore(): Promise<ExploreCatalog>;
   reconcileScan?(data: ScannedWineData, file: Express.Multer.File, userId?: string, trace?: import("./scan-audit.repository.js").ScanTrace): Promise<NonNullable<ScanWineLabelResult["catalog"]>>;
+  // Scan without AI (label-text-match): barcode links and the catalog search by label text.
+  findCandidatesByTerms?(terms: string[]): Promise<import("./catalog-matcher.js").CatalogCandidate[]>;
+  findWineByBarcode?(barcode: string): Promise<{ wineId: string; vintage: number | null } | null>;
+  rememberBarcode?(barcode: string, wineId: string, source: "scan_ai" | "scan_text", userId?: string, replace?: boolean): Promise<void>;
+  attachDeviceScan?(wineId: string, file: Express.Multer.File, userId?: string): Promise<boolean>;
   logUnlistedScan?(file: Express.Multer.File, userId?: string, extractedData?: Record<string, unknown>): Promise<NonNullable<ScanWineLabelResult["catalog"]>>;
   listUnlistedScans?(): Promise<unknown[]>;
   reviewUnlistedScan?(code: string, status: "reviewing" | "registered" | "rejected", registeredWineId?: string): Promise<unknown | null>;

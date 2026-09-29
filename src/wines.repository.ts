@@ -207,7 +207,59 @@ export class PgWineRepository implements WineRepository {
   }
 
   async findScanCandidates(data: ScannedWineData): Promise<CatalogCandidate[]> {
-    const terms = searchTerms(data);
+    return this.findCandidatesByTerms(searchTerms(data));
+  }
+
+  /** The wine a product barcode was linked to (label-text-match), following merges; null when unknown. */
+  async findWineByBarcode(barcode: string): Promise<{ wineId: string; vintage: number | null } | null> {
+    try {
+      const result = await this.pool.query<{ id: string; vintage: number | null }>(
+        `SELECT coalesce(w.merged_into, w.id) AS id, w.vintage
+         FROM wine_barcodes b JOIN catalog_wines w ON w.id = b.wine_id
+         WHERE b.barcode = $1 AND (w.curation_status <> 'rejected' OR w.merged_into IS NOT NULL)
+         LIMIT 1`,
+        [barcode],
+      );
+      const row = result.rows[0];
+      return row ? { wineId: row.id, vintage: row.vintage } : null;
+    } catch (error) {
+      // Before migration 022 there is no barcode table: the scan simply goes on.
+      console.error("[wine-scanner] barcode lookup failed", (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Links a barcode to the wine a scan resolved. An existing link is kept (and
+   * confirmed when it agrees) unless replace is set: the user said the barcode
+   * answer was wrong and the AI read the label again.
+   */
+  async rememberBarcode(barcode: string, wineId: string, source: "scan_ai" | "scan_text", userId?: string, replace = false) {
+    try {
+      await this.pool.query(
+        `INSERT INTO wine_barcodes (barcode, wine_id, source, created_by)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (barcode) DO UPDATE SET
+           confirmations = wine_barcodes.confirmations + CASE WHEN wine_barcodes.wine_id = EXCLUDED.wine_id THEN 1 ELSE 0 END,
+           wine_id = CASE WHEN $5::boolean THEN EXCLUDED.wine_id ELSE wine_barcodes.wine_id END,
+           source = CASE WHEN $5::boolean THEN EXCLUDED.source ELSE wine_barcodes.source END,
+           corrections = wine_barcodes.corrections + CASE WHEN $5::boolean AND wine_barcodes.wine_id <> EXCLUDED.wine_id THEN 1 ELSE 0 END,
+           updated_at = now()`,
+        [barcode, wineId, source, userId ?? null, replace],
+      );
+    } catch (error) {
+      console.error("[wine-scanner] could not store the barcode", (error as Error).message);
+    }
+  }
+
+  /** A scan resolved without AI: the photo still becomes the label (if missing) and joins the photo pool. */
+  async attachDeviceScan(wineId: string, file: Express.Multer.File, userId?: string) {
+    const imageAdded = await this.attachScanImage(wineId, file);
+    await this.addToPhotoPool(wineId, file, userId);
+    return imageAdded;
+  }
+
+  async findCandidatesByTerms(terms: string[]): Promise<CatalogCandidate[]> {
     if (!terms.length) return [];
     const client = await this.pool.connect();
     try {

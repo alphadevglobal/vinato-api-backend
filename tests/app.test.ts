@@ -268,7 +268,7 @@ describe("Wine API", () => {
       })
       .expect(200);
 
-    expect(response.body.catalog).toEqual({ status: "matched", wineId: catalogWine.id, imageAdded: false });
+    expect(response.body.catalog).toEqual({ status: "matched", wineId: catalogWine.id, imageAdded: false, resolvedBy: "ai" });
     expect(response.body.data.displayName).toBe(catalogWine.displayName);
     expect(response.body.data.producerName).toBe(catalogWine.producerName);
     expect(response.body.data.displayName).not.toBe("Chateau Test 2019");

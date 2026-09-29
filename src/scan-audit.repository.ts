@@ -1,5 +1,6 @@
 import type pg from "pg";
-import type { ScannedWineData } from "./types.js";
+import type { DeviceReading } from "./label-text-match.js";
+import type { ScannedWineData, ScanResolution } from "./types.js";
 
 export type ModelAttempt = {
   model: string;
@@ -43,6 +44,9 @@ export type ScanAuditEntry = {
   durationMs: number;
   platform?: string;
   appVersion?: string;
+  // How the wine was found (migration 022): barcode/text = on the phone's reading, no AI tokens.
+  resolvedBy?: ScanResolution;
+  deviceReading?: DeviceReading | null;
 };
 
 export type ScanAuditLog = { record(entry: ScanAuditEntry): Promise<void> };
@@ -56,8 +60,9 @@ export class PgScanAuditRepository implements ScanAuditLog {
       `INSERT INTO scan_audit_logs (
          user_id, success, outcome, error_stage, error_message, image_data_url, image_mime, image_bytes,
          model_used, models_tried, reading, confidence, catalog_queried, catalog_candidates, catalog_wine_id,
-         match_score, unlisted_code, image_added, duration_ms, recognition_ms, catalog_ms, platform, app_version
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+         match_score, unlisted_code, image_added, duration_ms, recognition_ms, catalog_ms, platform, app_version,
+         resolved_by, device_reading
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25::jsonb)`,
       [
         entry.userId ?? null, entry.success, entry.outcome, entry.errorStage ?? null, entry.errorMessage?.slice(0, 1000) ?? null,
         `data:${file.mimetype};base64,${file.buffer.toString("base64")}`, file.mimetype, file.size ?? file.buffer.length,
@@ -65,6 +70,7 @@ export class PgScanAuditRepository implements ScanAuditLog {
         entry.reading?.confidence ?? null, trace.catalogQueried, trace.catalogCandidates ?? null, entry.catalogWineId ?? null,
         entry.matchScore ?? null, entry.unlistedCode ?? null, entry.imageAdded ?? null, Math.round(entry.durationMs),
         trace.recognitionMs ?? null, trace.catalogMs ?? null, entry.platform?.slice(0, 40) ?? null, entry.appVersion?.slice(0, 40) ?? null,
+        entry.resolvedBy ?? null, entry.deviceReading ? JSON.stringify(entry.deviceReading) : null,
       ],
     );
   }
