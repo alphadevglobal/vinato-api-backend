@@ -345,6 +345,18 @@ describe("scan audit log", () => {
     expect(record.mock.calls[0][0].matchScore).toBeUndefined();
   });
 
+  it("audits a wine created from the AI reading as ai_created and opens it for the user", async () => {
+    const record = vi.fn(async () => undefined);
+    const repository = Object.assign(new MemoryWineRepository(seedWines), {
+      reconcileScan: vi.fn(async () => ({ status: "matched" as const, wineId: seedWines[0].id, imageAdded: true, created: true, alternatives: [] })),
+    });
+    const scanner = { scanWineLabel: vi.fn(async () => ({ success: true as const, data: reading })) };
+    const response = await post(createApp({ wineRepository: repository, wineScanner: scanner, scanAudit: { record } })).expect(200);
+
+    expect(response.body.catalog).toMatchObject({ status: "matched", wineId: seedWines[0].id, created: true });
+    expect(record.mock.calls[0][0]).toMatchObject({ success: true, outcome: "ai_created", catalogWineId: seedWines[0].id, imageAdded: true });
+  });
+
   it("returns and audits the reused code when an identical photo is already queued", async () => {
     const record = vi.fn(async () => undefined);
     const repository = Object.assign(new MemoryWineRepository(seedWines), {

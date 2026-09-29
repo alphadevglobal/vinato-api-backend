@@ -54,19 +54,16 @@ describe("scan image enrichment", () => {
     expect(result).toMatchObject({ status: "matched", wineId: "wine-id", imageAdded: false });
   });
 
-  it("queues the label with catalog alternatives when nothing matches", async () => {
+  it("queues the label with catalog alternatives when nothing matches and the reading names no wine", async () => {
     const { repository, poolQuery } = repositoryWith([
       { id: "other", display_name: "Almaviva 2019", wine_name: "Almaviva", producer_manufacturer: "Almaviva", vintage: 2019, has_image: true },
     ]);
 
-    const result = await repository.reconcileScan(almaviva, file);
+    const result = await repository.reconcileScan({ ...almaviva, displayName: null, producerName: null, producerTitle: null, wine: null, region: "Puente Alto" }, file);
 
-    expect(result).toEqual({
-      status: "needs_registration",
-      code: "VINATO-UNLISTED-TEST",
-      alternatives: [{ wineId: "other", displayName: "Almaviva 2019" }],
-    });
-    expect(JSON.parse(callsWith(poolQuery, "INSERT INTO unlisted_wine_scans")[0][1][1]).catalogCandidates).toHaveLength(1);
+    expect(result).toMatchObject({ status: "needs_registration", code: "VINATO-UNLISTED-TEST" });
+    expect(callsWith(poolQuery, "INSERT INTO catalog_wines")).toHaveLength(0);
+    expect(callsWith(poolQuery, "INSERT INTO unlisted_wine_scans")).toHaveLength(1);
   });
 });
 
@@ -152,5 +149,133 @@ describe("wine photo pool", () => {
     const result = await repository.reconcileScan(almaviva, file);
     errorLog.mockRestore();
     expect(result).toMatchObject({ status: "matched", wineId: "wine-id" });
+  });
+});
+
+describe("AI-assisted catalog", () => {
+  type Handler = (sql: string, params: unknown[]) => { rows: object[]; rowCount?: number } | undefined;
+  function repositoryFor(options: { candidates?: object[]; existingByName?: object[]; catalogRow?: object; failInsert?: boolean; identical?: object } = {}) {
+    const clientQuery = vi.fn(async (sql: string) => (sql.includes("FROM catalog_wines") ? { rows: options.candidates ?? [] } : { rows: [] }));
+    const handlers: Handler[] = [
+      (sql) => sql.includes("WHERE image_md5 = $1") ? { rows: options.identical ? [options.identical] : [] } : undefined,
+      (sql) => sql.includes("lower(btrim(display_name)) = lower(btrim($1))") ? { rows: options.existingByName ?? [] } : undefined,
+      (sql) => {
+        if (!sql.includes("INSERT INTO catalog_wines")) return undefined;
+        if (options.failInsert) throw new Error("insert failed");
+        return { rows: [{ id: "ai-wine" }] };
+      },
+      (sql) => sql.includes("SELECT display_name, wine_name") ? { rows: options.catalogRow ? [options.catalogRow] : [] } : undefined,
+      (sql) => sql.includes("INSERT INTO unlisted_wine_scans") ? { rows: [{ unlisted_code: "VINATO-UNLISTED-TEST" }] } : undefined,
+    ];
+    const poolQuery = vi.fn(async (sql: string, params: unknown[] = []) => {
+      for (const handler of handlers) { const result = handler(String(sql), params); if (result) return result; }
+      return { rows: [], rowCount: 1 };
+    });
+    const client = { query: clientQuery, release: vi.fn() };
+    const pool = { connect: vi.fn(async () => client), query: poolQuery } as unknown as pg.Pool;
+    return { repository: new PgWineRepository(pool), poolQuery };
+  }
+  const morgado: ScannedWineData = {
+    displayName: "Quinta do Morgado York Madeira", producerTitle: null, producerName: "Fante", wine: "York Madeira",
+    country: "Brasil", region: null, subRegion: null, colour: "tinto", type: "Suave", subType: null, designation: null,
+    classification: null, vintage: null, alcoholContent: "10%", grapes: "Bordô, Isabel", volume: null,
+    description: "Vinho de mesa suave.", foodPairings: ["Pizza"], confidence: 0.9, notes: "",
+  };
+  const catalogRow = {
+    display_name: "Almaviva 2017", wine_name: "Almaviva", producer_manufacturer: "Almaviva", country: "Chile", region: null,
+    sub_region: null, color: "Red", wine_type: null, designation: null, classification: null, vintage: 2017, alcohol_percent: null,
+    grapes: [{ name: "Cabernet Sauvignon", percentage: 70 }], description: null, pairings: { dishes: [], ingredients: [] },
+    data_source: "catalog", curation_status: "approved",
+  };
+  const matchedAlmaviva = { id: "wine-id", display_name: "Almaviva 2017", wine_name: "Almaviva", producer_manufacturer: "Almaviva", vintage: 2017, has_image: true };
+
+  it("creates the wine from the AI reading when the catalog has no match, with the scan photo as front label", async () => {
+    const { repository, poolQuery } = repositoryFor({ candidates: [] });
+    const trace = { modelsTried: [], catalogQueried: false, modelUsed: "~deepseek/deepseek-flash-latest" };
+
+    const result = await repository.reconcileScan(morgado, file, "user-1", trace);
+
+    expect(result).toEqual({ status: "matched", wineId: "ai-wine", imageAdded: true, created: true, alternatives: [] });
+    const [insert] = callsWith(poolQuery, "INSERT INTO catalog_wines");
+    expect(insert[0]).toContain("'ai_scan', 'pending'");
+    expect(insert[0]).toContain("'role', 'front'");
+    expect(insert[1]).toEqual([
+      "Quinta do Morgado York Madeira", "York Madeira", "Fante", "Brasil", null, null, "Red", "Suave", null, null, null, 10,
+      JSON.stringify([{ name: "Bordô", percentage: null }, { name: "Isabel", percentage: null }]), "Vinho de mesa suave.",
+      JSON.stringify({ dishes: ["Pizza"], ingredients: [] }), "data:image/jpeg;base64,dXNlci1waG90bw==",
+    ]);
+    const [proposal] = callsWith(poolQuery, "INSERT INTO wine_ai_proposals");
+    expect(proposal[0]).toContain("'new_wine'");
+    expect(proposal[1][0]).toBe("ai-wine");
+    expect(JSON.parse(proposal[1][1] as string)).toMatchObject({ displayName: "Quinta do Morgado York Madeira", producer: "Fante", colour: "Red" });
+    expect(proposal[1].slice(4)).toEqual(["~deepseek/deepseek-flash-latest", 0.9, "user-1"]);
+    expect(callsWith(poolQuery, "INSERT INTO wine_photo_candidates")[0][1][0]).toBe("ai-wine");
+    expect(callsWith(poolQuery, "INSERT INTO unlisted_wine_scans")).toHaveLength(0);
+  });
+
+  it("reuses a wine with the same name and vintage instead of creating a duplicate", async () => {
+    const { repository, poolQuery } = repositoryFor({ existingByName: [{ id: "existing" }], catalogRow: { ...catalogRow, display_name: morgado.displayName, data_source: "ai_scan", curation_status: "pending" } });
+
+    const result = await repository.reconcileScan(morgado, file);
+
+    expect(result).toMatchObject({ status: "matched", wineId: "existing", created: false });
+    expect(callsWith(poolQuery, "INSERT INTO catalog_wines")).toHaveLength(0);
+    // The wine still awaits curation: the new scan only counts on its proposal.
+    expect(callsWith(poolQuery, "times_proposed = times_proposed + 1")[0][1]).toEqual(["existing"]);
+  });
+
+  it("falls back to the review queue when the wine cannot be created", async () => {
+    const { repository } = repositoryFor({ failInsert: true });
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const result = await repository.reconcileScan(morgado, file);
+    errorLog.mockRestore();
+    expect(result).toMatchObject({ status: "needs_registration", code: "VINATO-UNLISTED-TEST" });
+  });
+
+  it("proposes the fields the AI would fill or change on a matched wine", async () => {
+    const { repository, poolQuery } = repositoryFor({ candidates: [matchedAlmaviva], catalogRow });
+
+    await repository.reconcileScan({ ...almaviva, alcoholContent: "14,5%", grapes: "Cabernet Sauvignon, Carmenère", description: "Tinto chileno encorpado." }, file, "user-1");
+
+    const [proposal] = callsWith(poolQuery, "INSERT INTO wine_ai_proposals");
+    expect(proposal[0]).toContain("'update'");
+    expect(proposal[0]).toContain("ON CONFLICT (wine_id, kind) WHERE status = 'pending' DO UPDATE");
+    expect(JSON.parse(proposal[1][1] as string)).toEqual({
+      region: "Puente Alto", wineType: "Wine", alcoholPercent: 14.5, grapes: ["Cabernet Sauvignon", "Carmenère"], description: "Tinto chileno encorpado.",
+    });
+    expect(JSON.parse(proposal[1][2] as string)).toEqual({ region: null, wineType: null, alcoholPercent: null, grapes: ["Cabernet Sauvignon"], description: null });
+  });
+
+  it("records no proposal when the AI agrees with the catalog", async () => {
+    const { repository, poolQuery } = repositoryFor({ candidates: [matchedAlmaviva], catalogRow: { ...catalogRow, region: "Puente Alto", wine_type: "Wine" } });
+    await repository.reconcileScan({ ...almaviva, grapes: "Cabernet Sauvignon" }, file);
+    expect(callsWith(poolQuery, "INSERT INTO wine_ai_proposals")).toHaveLength(0);
+  });
+
+  it("keeps the match when the proposal cannot be written", async () => {
+    const { repository, poolQuery } = repositoryFor({ candidates: [matchedAlmaviva], catalogRow });
+    const original = poolQuery.getMockImplementation()!;
+    poolQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (String(sql).includes("wine_ai_proposals")) throw new Error("relation does not exist");
+      return original(sql, params);
+    });
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const result = await repository.reconcileScan(almaviva, file);
+    errorLog.mockRestore();
+    expect(result).toMatchObject({ status: "matched", wineId: "wine-id" });
+  });
+
+  it("proposes updates for the wine linked to an identical photo too", async () => {
+    const { repository, poolQuery } = repositoryFor({ identical: { unlisted_code: "OLD", status: "registered", registered_wine_id: "linked" }, catalogRow });
+    await repository.reconcileScan({ ...almaviva, description: "Novo texto." }, file);
+    expect(callsWith(poolQuery, "INSERT INTO wine_ai_proposals")[0][1][0]).toBe("linked");
+  });
+
+  it("leaves wines rejected by the curators out of the scan candidates", async () => {
+    const clientCalls: string[] = [];
+    const client = { query: vi.fn(async (sql: string) => { clientCalls.push(String(sql)); return { rows: [] }; }), release: vi.fn() };
+    const pool = { connect: vi.fn(async () => client), query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as unknown as pg.Pool;
+    await new PgWineRepository(pool).findScanCandidates(almaviva);
+    expect(clientCalls.find((sql) => sql.includes("FROM catalog_wines"))).toContain("curation_status <> 'rejected'");
   });
 });

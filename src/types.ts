@@ -38,6 +38,12 @@ export type Wine = {
   awardsCount?: number;
   latestAwardYear?: number | null;
   awardSymbol?: string | null;
+  /** "catalog" (imported base), "ai_scan" (created from a scan) or "admin". */
+  dataSource?: string;
+  /** "approved", "pending" (awaiting curation) or "rejected". */
+  curationStatus?: string;
+  backImageUrl?: string | null;
+  pairings?: string[];
   createdAt: string;
   updatedAt: string;
 };
@@ -80,6 +86,10 @@ export type WineRow = {
   awards_count: number;
   latest_award_year: number | null;
   award_symbol: string | null;
+  data_source?: string | null;
+  curation_status?: string | null;
+  back_image_url?: string | null;
+  pairings?: string[] | null;
   created_at: string | Date;
   updated_at: string | Date;
 };
@@ -135,6 +145,10 @@ export type ScannedWineData = {
   alcoholContent?: string | null;
   grapes?: string | null;
   volume?: string | null;
+  /** 2–3 sentences about the wine's style, from wine knowledge consistent with the label. */
+  description?: string | null;
+  /** Dishes that pair with the wine. */
+  foodPairings?: string[] | null;
   confidence: number;
   notes: string;
 };
@@ -145,7 +159,8 @@ export type ScanWineLabelResult = {
   data: ScannedWineData;
   success: true;
   catalog?:
-    | { status: "matched"; wineId: string; imageAdded: boolean; matchScore?: number; alternatives?: CatalogAlternative[] }
+    // created: the catalog had no safe match, so the wine was created from the AI reading (pending curation).
+    | { status: "matched"; wineId: string; imageAdded: boolean; matchScore?: number; created?: boolean; alternatives?: CatalogAlternative[] }
     | { status: "needs_registration"; code: string; alternatives?: CatalogAlternative[] };
 };
 

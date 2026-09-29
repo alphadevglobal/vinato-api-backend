@@ -24,10 +24,18 @@ Regras:
 - colour: tinto, branco, rose ou espumante, quando indicado.
 - Use null quando nao estiver visivel. Nunca invente produtor, vinho ou safra.
 
+Alem da transcricao, para a ficha do vinho no app:
+- description: 2 a 3 frases em portugues do Brasil sobre o estilo do vinho (uvas,
+  regiao, perfil de aromas e paladar), usando conhecimento enologico geral
+  coerente com o rotulo. null se voce nao reconhecer o vinho nem o estilo.
+- foodPairings: lista com ate 5 pratos que harmonizam com este vinho, em portugues.
+Esses dois campos nunca alteram a transcricao: produtor, vinho e safra continuam
+sendo apenas o que esta impresso.
+
 Responda somente JSON valido, sem markdown, com estas chaves:
 displayName, producerTitle, producerName, wine, country, region, subRegion,
 colour, type, subType, designation, classification, vintage, alcoholContent,
-grapes, volume, confidence, notes. confidence e um numero de 0 a 1.
+grapes, volume, description, foodPairings, confidence, notes. confidence e um numero de 0 a 1.
 `;
 
 export class OpenRouterWineScanner implements WineScanner {
@@ -201,6 +209,8 @@ function normalizeScannedWineData(data: Record<string, unknown>): ScannedWineDat
     alcoholContent: nullableString(data.alcoholContent),
     grapes: nullableString(data.grapes),
     volume: nullableString(data.volume),
+    description: nullableString(data.description),
+    foodPairings: stringList(data.foodPairings),
     confidence: confidence(data.confidence),
     notes: typeof data.notes === "string" ? data.notes : "",
   };
@@ -216,6 +226,14 @@ function nullableString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const cleaned = value.replace(EMPTY_WORDS, " ").replace(/\s+/g, " ").trim();
   return cleaned && !/^[-–—.]+$/.test(cleaned) ? cleaned : null;
+}
+
+function stringList(value: unknown): string[] | null {
+  const items = (Array.isArray(value) ? value : typeof value === "string" ? value.split(/[,;\n]/) : [])
+    .map((item) => nullableString(item))
+    .filter((item): item is string => Boolean(item))
+    .slice(0, 5);
+  return items.length ? items : null;
 }
 
 function confidence(value: unknown): number {

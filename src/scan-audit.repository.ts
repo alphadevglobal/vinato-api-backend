@@ -27,7 +27,8 @@ export const newScanTrace = (): ScanTrace => ({ modelsTried: [], catalogQueried:
 export type ScanAuditEntry = {
   userId?: string | null;
   success: boolean;
-  outcome: "matched" | "needs_registration" | "recognition_failed" | "catalog_failed";
+  // ai_created: no catalog match, the wine was created from the AI reading (migration 016).
+  outcome: "matched" | "ai_created" | "needs_registration" | "recognition_failed" | "catalog_failed";
   errorStage?: "recognition" | "catalog";
   errorMessage?: string;
   file: Express.Multer.File;

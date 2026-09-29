@@ -12,6 +12,7 @@ import type {
   ScanWineLabelResult,
 } from "./types.js";
 import { mapWineRow } from "./wine-mapper.js";
+import { canCreateWine, proposedUpdates, readingToCatalogFields, type CatalogFields } from "./wine-curation.js";
 import { createHash } from "node:crypto";
 import type pg from "pg";
 
@@ -67,6 +68,14 @@ const baseSelect = `
       ELSE NULL
     END AS image_url,
     NULL::text AS source_url,
+    data_source,
+    curation_status,
+    CASE WHEN jsonb_typeof(images) = 'array' AND jsonb_typeof(images->1) = 'object' AND images->1->>'role' = 'back'
+      THEN COALESCE(images->1->>'url', images->1->>'image_url') END AS back_image_url,
+    CASE WHEN jsonb_typeof(pairings->'dishes') = 'array' THEN ARRAY(
+      SELECT CASE WHEN jsonb_typeof(dish) = 'string' THEN dish #>> '{}' ELSE dish->>'name' END
+      FROM jsonb_array_elements(pairings->'dishes') dish
+    ) ELSE ARRAY[]::text[] END AS pairings,
     COALESCE((SELECT stats.review_count FROM wine_review_stats stats WHERE stats.wine_id = catalog_wines.id), 0)::integer AS review_count,
     COALESCE((SELECT awarded.awards_count FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id), 0)::integer AS awards_count,
     (SELECT awarded.latest_award_year FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id) AS latest_award_year,
@@ -87,6 +96,35 @@ const STYLE_SQL = `CASE lower(btrim(COALESCE(NULLIF(btrim(color), ''), NULLIF(bt
 END`;
 
 const scanImageDataUrl = (file: Express.Multer.File) => `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
+
+type CatalogFieldsRow = {
+  display_name: string; wine_name: string | null; producer_manufacturer: string | null; country: string | null; region: string | null;
+  sub_region: string | null; color: string | null; wine_type: string | null; designation: string | null; classification: string | null;
+  vintage: number | null; alcohol_percent: string | number | null; grapes: unknown; description: string | null; pairings: unknown;
+  data_source: string; curation_status: string;
+};
+const CATALOG_FIELDS_SELECT = `display_name, wine_name, producer_manufacturer, country, region, sub_region, color, wine_type,
+  designation, classification, vintage, alcohol_percent, grapes, description, pairings, data_source, curation_status`;
+
+const names = (value: unknown) => (Array.isArray(value) ? value : [])
+  .map((item) => typeof item === "string" ? item : typeof item === "object" && item && typeof (item as { name?: unknown }).name === "string" ? (item as { name: string }).name : "")
+  .map((item) => item.trim())
+  .filter(Boolean);
+
+/** Catalog row → the field names used by wine_ai_proposals. */
+export function catalogFieldsFromRow(row: CatalogFieldsRow): CatalogFields {
+  const grapes = names(row.grapes);
+  const dishes = names((row.pairings as { dishes?: unknown } | null)?.dishes);
+  const fields: CatalogFields = {
+    displayName: row.display_name, wineName: row.wine_name ?? undefined, producer: row.producer_manufacturer ?? undefined,
+    country: row.country ?? undefined, region: row.region ?? undefined, subRegion: row.sub_region ?? undefined,
+    colour: row.color ?? undefined, wineType: row.wine_type ?? undefined, designation: row.designation ?? undefined,
+    classification: row.classification ?? undefined, vintage: row.vintage ?? undefined,
+    alcoholPercent: row.alcohol_percent === null ? undefined : Number(row.alcohol_percent),
+    grapes: grapes.length ? grapes : undefined, description: row.description ?? undefined, pairings: dishes.length ? dishes : undefined,
+  };
+  return Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined && value !== "")) as CatalogFields;
+}
 
 export class PgWineRepository implements WineRepository {
   private exploreCache?: { value: ExploreCatalog; expiresAt: number };
@@ -151,7 +189,7 @@ export class PgWineRepository implements WineRepository {
       // otherwise Postgres rejects it (42P18) and every such scan failed.
       const updated = await this.pool.query(
         `UPDATE catalog_wines SET images = jsonb_build_array(jsonb_build_object(
-           'url', $2::text, 'source', 'user_scan', 'review_status', 'pending', 'captured_at', now()
+           'url', $2::text, 'source', 'user_scan', 'role', 'front', 'review_status', 'pending', 'captured_at', now()
          )), updated_at = now()
          WHERE id = $1 AND (images IS NULL OR images = '[]'::jsonb)`,
         [wineId, scanImageDataUrl(file)],
@@ -178,7 +216,7 @@ export class PgWineRepository implements WineRepository {
         `SELECT id, display_name, wine_name, producer_manufacturer, vintage, region, sub_region, country,
                 (jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0) AS has_image
          FROM catalog_wines
-         WHERE ${where}
+         WHERE (${where}) AND curation_status <> 'rejected'
          ORDER BY (${rank}) DESC
          LIMIT 40`,
         terms,
@@ -207,6 +245,7 @@ export class PgWineRepository implements WineRepository {
       await this.countResubmission(identical.unlisted_code);
       const imageAdded = await this.attachScanImage(identical.registered_wine_id, file);
       await this.addToPhotoPool(identical.registered_wine_id, file, userId);
+      await this.proposeCatalogUpdate(identical.registered_wine_id, data, trace, userId);
       return { status: "matched", wineId: identical.registered_wine_id, imageAdded, alternatives: [] };
     }
 
@@ -220,9 +259,21 @@ export class PgWineRepository implements WineRepository {
       const { best } = decision;
       const imageAdded = best.hasImage ? false : await this.attachScanImage(best.id, file);
       await this.addToPhotoPool(best.id, file, userId);
+      await this.proposeCatalogUpdate(best.id, data, trace, userId);
       return { status: "matched", wineId: best.id, imageAdded, matchScore: best.score, alternatives };
     }
 
+    // No safe match: a scan never ends without wine details. The wine is created
+    // from the AI reading (pending curation) with the scan photo as its front label.
+    const aiWine = await this.createAiWine(data, file, userId, alternatives, trace);
+    if (aiWine) {
+      const imageAdded = aiWine.created || await this.attachScanImage(aiWine.wineId, file);
+      await this.addToPhotoPool(aiWine.wineId, file, userId);
+      if (!aiWine.created) await this.proposeCatalogUpdate(aiWine.wineId, data, trace, userId);
+      return { status: "matched", wineId: aiWine.wineId, imageAdded, created: aiWine.created, alternatives };
+    }
+
+    // The reading names no wine (or the catalog could not be written): old review queue.
     // Same photo already waiting in the queue (or rejected): reuse its code instead of storing it again.
     if (identical) {
       await this.countResubmission(identical.unlisted_code);
@@ -231,6 +282,96 @@ export class PgWineRepository implements WineRepository {
 
     const logged = await this.logUnlistedScan(file, userId, { ...data, catalogCandidates: alternatives });
     return { ...logged, alternatives };
+  }
+
+  /**
+   * Creates the wine from the AI reading (data_source 'ai_scan', curation_status
+   * 'pending') and its 'new_wine' proposal for the admin. A wine with the same name
+   * and vintage is reused instead, so repeated scans never duplicate it.
+   * Returns null when the reading names no wine or the catalog cannot be written.
+   */
+  private async createAiWine(data: ScannedWineData, file: Express.Multer.File, userId: string | undefined, alternatives: { wineId: string; displayName: string }[], trace?: ScanTrace) {
+    const fields = readingToCatalogFields(data);
+    if (!canCreateWine(fields)) return null;
+    try {
+      const existing = await this.pool.query<{ id: string }>(
+        `SELECT id FROM catalog_wines
+         WHERE lower(btrim(display_name)) = lower(btrim($1))
+           AND (vintage = $2::smallint OR (vintage IS NULL AND $2::smallint IS NULL))
+           AND curation_status <> 'rejected'
+         ORDER BY (data_source = 'catalog') DESC, created_at
+         LIMIT 1`,
+        [fields.displayName, fields.vintage ?? null],
+      );
+      if (existing.rows[0]) return { wineId: existing.rows[0].id, created: false };
+
+      const created = await this.pool.query<{ id: string }>(
+        `INSERT INTO catalog_wines (display_name, wine_name, producer_manufacturer, country, region, sub_region, color, wine_type,
+                                    designation, classification, vintage, alcohol_percent, grapes, description, pairings, images,
+                                    data_source, curation_status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15::jsonb,
+                 jsonb_build_array(jsonb_build_object('url', $16::text, 'source', 'user_scan', 'role', 'front',
+                   'review_status', 'pending', 'captured_at', now())),
+                 'ai_scan', 'pending')
+         RETURNING id`,
+        [
+          fields.displayName, fields.wineName, fields.producer ?? null, fields.country ?? null, fields.region ?? null,
+          fields.subRegion ?? null, fields.colour ?? null, fields.wineType ?? null, fields.designation ?? null,
+          fields.classification ?? null, fields.vintage ?? null, fields.alcoholPercent ?? null,
+          JSON.stringify((fields.grapes ?? []).map((name) => ({ name, percentage: null }))),
+          fields.description ?? null,
+          JSON.stringify({ dishes: fields.pairings ?? [], ingredients: [] }),
+          scanImageDataUrl(file),
+        ],
+      );
+      const wineId = created.rows[0].id;
+      await this.pool.query(
+        `INSERT INTO wine_ai_proposals (wine_id, kind, proposed, reading, candidates, model, confidence, user_id)
+         VALUES ($1, 'new_wine', $2::jsonb, $3::jsonb, $4::jsonb, $5, $6, $7)`,
+        [wineId, JSON.stringify(fields), JSON.stringify(data), JSON.stringify(alternatives), trace?.modelUsed ?? null, data.confidence, userId ?? null],
+      );
+      return { wineId, created: true };
+    } catch (error) {
+      console.error("[wine-scanner] could not create the wine from the AI reading", error);
+      return null;
+    }
+  }
+
+  /**
+   * Records what the AI would fill or change on a wine it matched, for curation.
+   * Pending proposals of a wine accumulate in one row (newest values win).
+   * A wine still awaiting curation only counts the new scan. Best effort.
+   */
+  private async proposeCatalogUpdate(wineId: string, data: ScannedWineData, trace?: ScanTrace, userId?: string) {
+    try {
+      const row = (await this.pool.query<CatalogFieldsRow>(`SELECT ${CATALOG_FIELDS_SELECT} FROM catalog_wines WHERE id = $1`, [wineId])).rows[0];
+      if (!row) return;
+      if (row.data_source === "ai_scan" && row.curation_status === "pending") {
+        await this.pool.query(
+          `UPDATE wine_ai_proposals SET times_proposed = times_proposed + 1, last_proposed_at = now()
+           WHERE wine_id = $1 AND kind = 'new_wine' AND status = 'pending'`,
+          [wineId],
+        );
+        return;
+      }
+      const current = catalogFieldsFromRow(row);
+      const changes = proposedUpdates(current, readingToCatalogFields(data));
+      const keys = Object.keys(changes) as (keyof CatalogFields)[];
+      if (!keys.length) return;
+      const snapshot = Object.fromEntries(keys.map((key) => [key, current[key] ?? null]));
+      await this.pool.query(
+        `INSERT INTO wine_ai_proposals (wine_id, kind, proposed, current_values, reading, model, confidence, user_id)
+         VALUES ($1, 'update', $2::jsonb, $3::jsonb, $4::jsonb, $5, $6, $7)
+         ON CONFLICT (wine_id, kind) WHERE status = 'pending' DO UPDATE SET
+           proposed = wine_ai_proposals.proposed || EXCLUDED.proposed,
+           current_values = wine_ai_proposals.current_values || EXCLUDED.current_values,
+           reading = EXCLUDED.reading, model = EXCLUDED.model, confidence = EXCLUDED.confidence,
+           times_proposed = wine_ai_proposals.times_proposed + 1, last_proposed_at = now()`,
+        [wineId, JSON.stringify(changes), JSON.stringify(snapshot), JSON.stringify(data), trace?.modelUsed ?? null, data.confidence, userId ?? null],
+      );
+    } catch (error) {
+      console.error("[wine-scanner] could not record the AI proposal", error);
+    }
   }
 
   async listUnlistedScans() {
@@ -279,7 +420,7 @@ export class PgWineRepository implements WineRepository {
   async autocomplete(term: string): Promise<AutocompleteWine[]> {
     const normalizedTerm = `%${term}%`;
     const result = await this.pool.query<WineRow>(
-      `${baseSelect} WHERE normalized_search ILIKE $1 OR display_name ILIKE $1 ORDER BY display_name ASC LIMIT 20`,
+      `${baseSelect} WHERE (normalized_search ILIKE $1 OR display_name ILIKE $1) AND curation_status <> 'rejected' ORDER BY display_name ASC LIMIT 20`,
       [normalizedTerm],
     );
 
@@ -319,7 +460,7 @@ export class PgWineRepository implements WineRepository {
     const [countries, regions, grapes, styles, awarded] = await Promise.all([
       this.pool.query(`
         SELECT country AS name, COUNT(*)::int AS count
-        FROM catalog_wines WHERE length(btrim(country)) > 0
+        FROM catalog_wines WHERE length(btrim(country)) > 0 AND curation_status <> 'rejected'
         GROUP BY country ORDER BY COUNT(*) DESC, country ASC LIMIT 100
       `),
       this.pool.query(`
@@ -329,7 +470,7 @@ export class PgWineRepository implements WineRepository {
                    WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 AND jsonb_typeof(images->0) = 'string' AND images->>0 NOT ILIKE '%logo%' THEN images->>0
                    WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 AND COALESCE(images->0->>'url', images->0->>'image_url') NOT ILIKE '%logo%' THEN COALESCE(images->0->>'url', images->0->>'image_url')
                  END) AS image_url
-          FROM catalog_wines WHERE length(btrim(region)) > 0 AND length(btrim(country)) > 0
+          FROM catalog_wines WHERE length(btrim(region)) > 0 AND length(btrim(country)) > 0 AND curation_status <> 'rejected'
           GROUP BY region, country
         ), ranked AS (
           SELECT *, ROW_NUMBER() OVER (PARTITION BY country ORDER BY count DESC, name ASC) AS position
@@ -350,13 +491,13 @@ export class PgWineRepository implements WineRepository {
             CASE WHEN jsonb_typeof(wines.grapes) = 'array' THEN wines.grapes ELSE '[]'::jsonb END
           ) item
         ) grape
-        WHERE length(btrim(grape.name)) > 0
+        WHERE length(btrim(grape.name)) > 0 AND wines.curation_status <> 'rejected'
         GROUP BY grape.name ORDER BY COUNT(*) DESC, grape.name ASC LIMIT 60
       `),
       this.pool.query(`
         SELECT ${STYLE_SQL} AS name, COUNT(*)::int AS count
         FROM catalog_wines
-        WHERE COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), '')) IS NOT NULL
+        WHERE COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), '')) IS NOT NULL AND curation_status <> 'rejected'
         GROUP BY 1 ORDER BY COUNT(*) DESC, 1 ASC LIMIT 20
       `),
       this.pool.query(`SELECT COUNT(*)::int AS count FROM catalog_awarded_wines`),
@@ -378,7 +519,8 @@ function mapFacet(row: Record<string, unknown>) {
 }
 
 function buildWhere(query: WineListQuery) {
-  const clauses: string[] = [];
+  // Wines the curators rejected (AI-created from a bad reading) stay out of every list.
+  const clauses: string[] = ["curation_status <> 'rejected'"];
   const params: string[] = [];
 
   const addExactFilter = (column: string, value?: string) => {

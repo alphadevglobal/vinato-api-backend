@@ -519,7 +519,7 @@ export function createApp(dependencies: AppDependencies) {
       const catalog = result.catalog;
       await audit({
         success: true,
-        outcome: catalog?.status === "needs_registration" ? "needs_registration" : "matched",
+        outcome: catalog?.status === "needs_registration" ? "needs_registration" : catalog?.created ? "ai_created" : "matched",
         reading,
         catalogWineId: catalog?.status === "matched" ? catalog.wineId : undefined,
         matchScore: catalog?.status === "matched" ? catalog.matchScore : undefined,

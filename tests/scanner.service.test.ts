@@ -67,6 +67,8 @@ describe("OpenRouterWineScanner", () => {
         alcoholContent: null,
         grapes: null,
         volume: null,
+        description: null,
+        foodPairings: null,
         confidence: 0.82,
         notes: "ok",
       },
@@ -83,6 +85,32 @@ describe("OpenRouterWineScanner", () => {
     expect(result.data.producerName).toBeNull();
     expect(result.data.region).toBeNull();
     expect(result.data.vintage).toBeNull();
+  });
+
+  it("reads the wine description and food pairings for the app's wine page", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(modelReply(JSON.stringify({
+      displayName: "Quinta do Morgado York Madeira", producerName: "Fante", confidence: 0.9, notes: "",
+      description: "Vinho de mesa suave e frutado.", foodPairings: ["Massas", "Pizza", "null", "Queijos", "Churrasco", "Doces", "Frutas"],
+    })));
+    const result = await scanWith(fetchMock);
+    expect(result.data.description).toBe("Vinho de mesa suave e frutado.");
+    expect(result.data.foodPairings).toEqual(["Massas", "Pizza", "Queijos", "Churrasco", "Doces"]);
+  });
+
+  it("accepts pairings written as text and leaves them empty when missing", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(modelReply('{"displayName":"Vinho","foodPairings":"Massas; Pizza","description":"N/A","confidence":0.9,"notes":""}'));
+    const result = await scanWith(fetchMock);
+    expect(result.data.foodPairings).toEqual(["Massas", "Pizza"]);
+    expect(result.data.description).toBeNull();
+  });
+
+  it("asks the model for the description and pairings without changing the transcription rules", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(modelReply('{"displayName":"Vinho","confidence":0.9,"notes":""}'));
+    await scanWith(fetchMock);
+    const prompt = JSON.parse(fetchMock.mock.calls[0][1].body).messages[0].content[0].text as string;
+    expect(prompt).toContain("description, foodPairings");
+    expect(prompt).toContain("Nunca invente produtor, vinho ou safra");
   });
 
   it("uses models selected at runtime for each scan", async () => {
