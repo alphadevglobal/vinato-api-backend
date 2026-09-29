@@ -29,7 +29,16 @@ describe("wine reviews", () => {
     });
     return { app, upsert, list };
   };
-  const member = { id: "user-1", plan: "free", status: "active" };
+  const member = { id: "user-1", plan: "premium", status: "active" };
+
+  it("lets only Premium members rate a wine; free accounts still read the reviews", async () => {
+    const { app, upsert, list } = appWith({ ...member, plan: "free" });
+    const response = await request(app).put(`/wines/${WINE}/reviews/me`).set("Authorization", "Bearer t").send({ rating: 4 }).expect(403);
+    expect(response.body.message).toBe("Recurso exclusivo do VINATO Premium.");
+    expect(upsert).not.toHaveBeenCalled();
+    await request(app).get(`/wines/${WINE}/reviews`).set("Authorization", "Bearer t").expect(200);
+    expect(list).toHaveBeenCalled();
+  });
 
   it("requires a session to review and validates the rating", async () => {
     await request(appWith(null).app).put(`/wines/${WINE}/reviews/me`).send({ rating: 4 }).expect(401);

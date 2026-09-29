@@ -3,6 +3,17 @@ import type pg from "pg";
 
 const SESSION_DAYS = 30;
 
+export type Subscription = {
+  plan: "free" | "premium"; startedAt: string | null; expiresAt: string | null;
+  /** "vinato" = granted by the team in the panel; otherwise the store of the last purchase. */
+  source: string | null;
+  prices: { currency: "BRL"; monthlyCents: number; yearlyCents: number };
+  /** Purchase through the App Store / Google Play: not available yet. */
+  storePurchase: boolean;
+};
+// Used until vinato-web migration 0019 adds the prices to finance_settings.
+const DEFAULT_PRICES = { monthlyCents: 2990, yearlyCents: 23990 };
+
 export type PublicUser = { id: string; email: string; displayName: string; role: string; plan: "free" | "premium"; planExpiresAt: string | null; status: string; avatarUrl: string | null };
 
 export class AccountRepository {
@@ -256,8 +267,11 @@ export class AccountRepository {
   }
 
   async updateAccess(userId: string, access: { status?: "active" | "blocked"; plan?: "free" | "premium" }) {
+    // plan_started_at: set when the account becomes Premium, kept while it stays Premium.
     const result = await this.pool.query(
-      `UPDATE app_users SET status = COALESCE($2, status), plan = COALESCE($3, plan), updated_at = now()
+      `UPDATE app_users SET status = COALESCE($2, status), plan = COALESCE($3, plan),
+         plan_started_at = CASE WHEN $3 = 'premium' AND plan <> 'premium' THEN now() WHEN $3 = 'free' THEN NULL ELSE plan_started_at END,
+         updated_at = now()
        WHERE id = $1 RETURNING id, email::text, display_name, role, plan, plan_expires_at, status, avatar_url`,
       [userId, access.status ?? null, access.plan ?? null],
     );
@@ -271,6 +285,33 @@ export class AccountRepository {
     return mapUser(result.rows[0]);
   }
 
+  /** "Assinatura Premium" in the app: the member's period and the prices of the plans. */
+  async getSubscription(user: PublicUser): Promise<Subscription> {
+    const account = (await this.pool.query(`SELECT plan_started_at FROM app_users WHERE id = $1`, [user.id])).rows[0];
+    const purchase = (await this.pool.query(
+      `SELECT provider, product_id, purchased_at, expires_at FROM app_purchases
+       WHERE user_id = $1 AND status = 'completed' ORDER BY purchased_at DESC LIMIT 1`,
+      [user.id],
+    ).catch(() => ({ rows: [] as Record<string, unknown>[] }))).rows[0];
+    const prices = (await this.pool.query(
+      `SELECT premium_monthly_cents, premium_yearly_cents FROM finance_settings WHERE id = 1`,
+    ).catch(() => ({ rows: [] as Record<string, unknown>[] }))).rows[0];
+    const iso = (value: unknown) => (value ? new Date(String(value)).toISOString() : null);
+    const premium = user.plan === "premium";
+    return {
+      plan: user.plan,
+      startedAt: premium ? iso(account?.plan_started_at) ?? iso(purchase?.purchased_at) : null,
+      expiresAt: premium ? user.planExpiresAt : null,
+      source: !premium ? null : purchase ? String(purchase.provider) : "vinato",
+      prices: {
+        currency: "BRL",
+        monthlyCents: Number(prices?.premium_monthly_cents ?? DEFAULT_PRICES.monthlyCents),
+        yearlyCents: Number(prices?.premium_yearly_cents ?? DEFAULT_PRICES.yearlyCents),
+      },
+      storePurchase: false,
+    };
+  }
+
   async getNews() {
     // The editorial CMS (vinato-web) writes full articles to news_articles: video,
     // body blocks, subtitle. The news_posts mirror only keeps title/summary/image,
@@ -279,7 +320,9 @@ export class AccountRepository {
     if (articles.rows[0]?.ready) {
       const result = await this.pool.query(
         `SELECT id, title, subtitle, summary, content, author_name, category, cover_image, cover_caption,
-                video_url, video_thumbnail, video_caption, published_at
+                video_url, video_thumbnail, video_caption, published_at,
+                -- 'notifications' = "Atualização do app" (web migration 0019): only in the app's notifications.
+                coalesce(to_jsonb(news_articles) ->> 'audience', 'feed') AS audience
          FROM news_articles
          WHERE status = 'published' AND published_at IS NOT NULL AND published_at <= now()
          ORDER BY featured DESC, published_at DESC LIMIT 20`,
@@ -289,7 +332,7 @@ export class AccountRepository {
         content: Array.isArray(row.content) ? row.content : [], authorName: row.author_name, category: row.category,
         imageUrl: row.cover_image ?? row.video_thumbnail, imageCaption: row.cover_caption,
         videoUrl: row.video_url, videoThumbnail: row.video_thumbnail, videoCaption: row.video_caption,
-        linkUrl: null, publishedAt: row.published_at,
+        linkUrl: null, publishedAt: row.published_at, audience: row.audience === "notifications" ? "notifications" : "feed",
       }));
     }
     const result = await this.pool.query(
@@ -299,7 +342,7 @@ export class AccountRepository {
     );
     return result.rows.map((row) => ({
       id: row.id, title: row.title, summary: row.summary,
-      imageUrl: row.image_url, linkUrl: row.link_url, publishedAt: row.published_at,
+      imageUrl: row.image_url, linkUrl: row.link_url, publishedAt: row.published_at, audience: "feed",
     }));
   }
 

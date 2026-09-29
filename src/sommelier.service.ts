@@ -10,13 +10,22 @@ export type SommelierConfig = {
   maxOutputTokens: number;
   historyMessages: number;
   dailyMessageLimit: number;
+  /** Answers the messages that carry photos or audio (must read both). */
+  mediaModel: string;
 };
 
-export type ChatTurn = { role: "system" | "user" | "assistant"; content: string; reasoning_details?: unknown };
+export type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } }
+  | { type: "input_audio"; input_audio: { data: string; format: string } };
+export type ChatTurn = { role: "system" | "user" | "assistant"; content: string | ContentPart[]; reasoning_details?: unknown };
 export type Completion = { content: string; reasoningDetails: unknown; model: string; promptTokens?: number; completionTokens?: number; costUsd?: number };
 export type CompleteChat = (messages: ChatTurn[], settings: SommelierConfig) => Promise<Completion>;
 
-export type SommelierMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
+export type AttachmentInfo = { id: string; kind: "image" | "audio"; mimeType: string; durationMs: number | null };
+export type SommelierMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string; attachments?: AttachmentInfo[] };
+/** A photo or a voice message sent with the question, as a data URL (base64). */
+export type AttachmentInput = { kind: "image" | "audio"; dataUrl: string; durationMs?: number };
 export type SommelierConversation = { id: string; title: string; createdAt: string; updatedAt: string };
 
 const DEFAULT_CONFIG: SommelierConfig = {
@@ -27,7 +36,61 @@ const DEFAULT_CONFIG: SommelierConfig = {
   maxOutputTokens: 1200,
   historyMessages: 20,
   dailyMessageLimit: 60,
+  mediaModel: "google/gemini-3.8-flash",
 };
+export const MAX_IMAGES = 3;
+export const MAX_AUDIO_SECONDS = 90;
+const MAX_IMAGE_BYTES = 1_500_000;
+const MAX_AUDIO_BYTES = 2_000_000;
+const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"]);
+// OpenRouter input_audio formats (https://openrouter.ai/docs/features/multimodal/audio).
+const AUDIO_FORMATS: Record<string, string> = {
+  "audio/m4a": "m4a", "audio/x-m4a": "m4a", "audio/mp4": "m4a", "audio/aac": "aac", "audio/mpeg": "mp3", "audio/mp3": "mp3",
+  "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/ogg": "ogg", "audio/webm": "ogg", "audio/flac": "flac",
+};
+// Added to the instructions when the client sends photos or audio.
+const MEDIA_GUIDE = `
+Mídia enviada pelo cliente:
+- Fotos: descreva o que é relevante para vinho (rótulo, garrafa, carta de vinhos, prato, taça) e use isso na resposta. Se for um rótulo, identifique produtor, vinho, safra e região quando estiverem legíveis; não invente o que não estiver visível.
+- Áudio: é a pergunta do cliente falada. Responda ao que foi dito, sem transcrever o áudio, a menos que peçam.
+- Se a foto ou o áudio não tiver relação com vinho, diga isso com gentileza e ofereça ajuda com vinhos.`;
+
+/** Validates the photos and audio of one message; returns them ready to store and to send to the model. */
+export function parseAttachments(value: unknown): Array<AttachmentInput & { mimeType: string; base64: string; format?: string }> {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new HttpError(400, "Anexos inválidos.", "Bad Request");
+  const parsed = value.map((item) => {
+    const kind = (item as AttachmentInput)?.kind;
+    const dataUrl = (item as AttachmentInput)?.dataUrl;
+    const match = typeof dataUrl === "string" ? /^data:([\w/+.-]+);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl) : null;
+    if ((kind !== "image" && kind !== "audio") || !match) throw new HttpError(400, "Anexo inválido: envie a foto ou o áudio novamente.", "Bad Request");
+    const mimeType = match[1].toLowerCase();
+    const bytes = Math.floor(match[2].length * 3 / 4);
+    if (kind === "image") {
+      if (!IMAGE_TYPES.has(mimeType)) throw new HttpError(400, "Formato de foto não suportado. Envie JPEG, PNG ou HEIC.", "Bad Request");
+      if (bytes > MAX_IMAGE_BYTES) throw new HttpError(413, "A foto ficou grande demais. Tente outra foto.", "Payload Too Large");
+      return { kind, dataUrl, mimeType, base64: match[2] };
+    }
+    const format = AUDIO_FORMATS[mimeType];
+    if (!format) throw new HttpError(400, "Formato de áudio não suportado.", "Bad Request");
+    if (bytes > MAX_AUDIO_BYTES) throw new HttpError(413, `O áudio ficou longo demais (máximo de ${MAX_AUDIO_SECONDS} segundos).`, "Payload Too Large");
+    const rawDuration = Number((item as AttachmentInput).durationMs);
+    const durationMs = Number.isFinite(rawDuration) && rawDuration > 0 ? Math.round(rawDuration) : undefined;
+    if (durationMs && durationMs > (MAX_AUDIO_SECONDS + 1) * 1000) throw new HttpError(400, `O áudio pode ter no máximo ${MAX_AUDIO_SECONDS} segundos.`, "Bad Request");
+    return { kind, dataUrl, mimeType, base64: match[2], format, durationMs };
+  });
+  if (parsed.filter((item) => item.kind === "image").length > MAX_IMAGES) throw new HttpError(400, `Envie no máximo ${MAX_IMAGES} fotos por mensagem.`, "Bad Request");
+  if (parsed.filter((item) => item.kind === "audio").length > 1) throw new HttpError(400, "Envie um áudio por mensagem.", "Bad Request");
+  return parsed;
+}
+
+/** How a message with media appears in the history sent to the model (the media itself is sent only once). */
+export function mediaNote(attachments: Array<{ kind: string }>) {
+  const images = attachments.filter((item) => item.kind === "image").length;
+  const audio = attachments.some((item) => item.kind === "audio");
+  const parts = [images ? (images === 1 ? "uma foto" : `${images} fotos`) : "", audio ? "uma mensagem de voz" : ""].filter(Boolean);
+  return parts.length ? `[O cliente enviou ${parts.join(" e ")}.]` : "";
+}
 const MAX_MESSAGE_LENGTH = 2000;
 const BURST_LIMIT_PER_MINUTE = 6;
 export const GUARDED_REPLY = "Esse não é o meu trabalho: sou o sommelier do VINATO e só converso sobre vinhos. Posso te ajudar a escolher um vinho ou uma harmonização?";
@@ -111,6 +174,7 @@ export class SommelierAgent {
     return {
       model: row.model, systemPrompt: row.system_prompt, reasoningEnabled: row.reasoning_enabled, temperature: Number(row.temperature),
       maxOutputTokens: row.max_output_tokens, historyMessages: row.history_messages, dailyMessageLimit: row.daily_message_limit,
+      mediaModel: row.media_model || DEFAULT_CONFIG.mediaModel,
     };
   }
 
@@ -128,7 +192,38 @@ export class SommelierAgent {
       `SELECT id, role, content, created_at AS "createdAt" FROM sommelier_messages WHERE conversation_id = $1 ORDER BY created_at ASC`,
       [conversationId],
     );
-    return result.rows;
+    const attachments = await this.attachmentsOf(result.rows.map((row) => row.id));
+    return result.rows.map((row) => (attachments.has(row.id) ? { ...row, attachments: attachments.get(row.id) } : row));
+  }
+
+  /** A photo or audio of the user's own conversation, for the app to show or play. */
+  async getAttachment(userId: string, attachmentId: string): Promise<{ mimeType: string; data: Buffer } | null> {
+    if (!/^[0-9a-f-]{36}$/i.test(attachmentId)) return null;
+    const row = (await this.pool.query(
+      `SELECT a.mime_type, a.data_url FROM sommelier_attachments a
+       JOIN sommelier_messages m ON m.id = a.message_id
+       JOIN sommelier_conversations c ON c.id = m.conversation_id
+       WHERE a.id = $1 AND c.user_id = $2`,
+      [attachmentId, userId],
+    )).rows[0];
+    if (!row) return null;
+    const base64 = String(row.data_url).slice(String(row.data_url).indexOf(",") + 1);
+    return { mimeType: row.mime_type, data: Buffer.from(base64, "base64") };
+  }
+
+  private async attachmentsOf(messageIds: string[]) {
+    const byMessage = new Map<string, AttachmentInfo[]>();
+    if (!messageIds.length) return byMessage;
+    const rows = (await this.pool.query(
+      `SELECT id, message_id, kind, mime_type, duration_ms FROM sommelier_attachments WHERE message_id = ANY($1::uuid[]) ORDER BY created_at ASC`,
+      [messageIds],
+    ).catch(() => ({ rows: [] as Record<string, unknown>[] }))).rows;
+    for (const row of rows) {
+      const list = byMessage.get(String(row.message_id)) ?? [];
+      list.push({ id: String(row.id), kind: row.kind as "image" | "audio", mimeType: String(row.mime_type), durationMs: row.duration_ms == null ? null : Number(row.duration_ms) });
+      byMessage.set(String(row.message_id), list);
+    }
+    return byMessage;
   }
 
   async deleteConversation(userId: string, conversationId: string) {
@@ -136,9 +231,10 @@ export class SommelierAgent {
     await this.pool.query(`DELETE FROM sommelier_conversations WHERE id = $1`, [conversationId]);
   }
 
-  async chat(userId: string, input: { conversationId?: string; message: string }) {
+  async chat(userId: string, input: { conversationId?: string; message: string; attachments?: unknown }) {
     const text = input.message.trim();
-    if (!text) throw new HttpError(400, "Escreva sua pergunta para o Sommelier.", "Bad Request");
+    const media = parseAttachments(input.attachments);
+    if (!text && !media.length) throw new HttpError(400, "Escreva sua pergunta, envie uma foto ou grave um áudio para o Sommelier.", "Bad Request");
     if (text.length > MAX_MESSAGE_LENGTH) throw new HttpError(400, `Mensagem muito longa (máximo de ${MAX_MESSAGE_LENGTH} caracteres).`, "Bad Request");
     const settings = await this.getConfig();
 
@@ -161,22 +257,36 @@ export class SommelierAgent {
 
     const existing = input.conversationId ? await this.ownedConversation(userId, input.conversationId) : null;
     const history = existing ? (await this.pool.query(
-      `SELECT role, content, reasoning_details FROM (
-         SELECT role, content, reasoning_details, created_at FROM sommelier_messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2
+      `SELECT id, role, content, reasoning_details FROM (
+         SELECT id, role, content, reasoning_details, created_at FROM sommelier_messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2
        ) recent ORDER BY created_at ASC`,
       [existing.id, settings.historyMessages],
-    )).rows as Array<{ role: "user" | "assistant"; content: string; reasoning_details: unknown }> : [];
+    )).rows as Array<{ id?: string; role: "user" | "assistant"; content: string; reasoning_details: unknown }> : [];
+    const pastMedia = await this.attachmentsOf(history.map((turn) => turn.id).filter((id): id is string => Boolean(id)));
 
+    // Photos and audio go to the media model; reasoning_details only return to the model that wrote them.
+    const withMedia = media.length > 0;
+    const turnSettings = withMedia ? { ...settings, model: settings.mediaModel, reasoningEnabled: false } : settings;
+    const userContent: string | ContentPart[] = withMedia ? [
+      { type: "text", text: text || (media.some((item) => item.kind === "audio") ? "Responda à minha mensagem de voz." : "O que você me diz sobre esta foto?") },
+      ...media.map((item): ContentPart => (item.kind === "image"
+        ? { type: "image_url", image_url: { url: item.dataUrl } }
+        : { type: "input_audio", input_audio: { data: item.base64, format: item.format! } })),
+    ] : text;
     const messages: ChatTurn[] = [
-      { role: "system", content: settings.systemPrompt },
-      ...history.map((turn) => (turn.role === "assistant" && turn.reasoning_details ? { role: turn.role, content: turn.content, reasoning_details: turn.reasoning_details } : { role: turn.role, content: turn.content })),
-      { role: "user", content: text },
+      { role: "system", content: withMedia ? `${settings.systemPrompt}\n${MEDIA_GUIDE}` : settings.systemPrompt },
+      ...history.map((turn): ChatTurn => {
+        const note = turn.id ? mediaNote(pastMedia.get(turn.id) ?? []) : "";
+        const content = [note, turn.content].filter(Boolean).join(" ") || "(mensagem sem texto)";
+        return turn.role === "assistant" && turn.reasoning_details && !withMedia ? { role: turn.role, content, reasoning_details: turn.reasoning_details } : { role: turn.role, content };
+      }),
+      { role: "user", content: userContent },
     ];
 
     // Ask the model first: nothing is stored (and nothing counts toward the
     // daily limit) when the model fails.
     const startedAt = Date.now();
-    const completion = await this.complete(messages, settings);
+    const completion = await this.complete(messages, turnSettings);
     const durationMs = Date.now() - startedAt;
     const guarded = guardReply(completion.content, settings.systemPrompt);
     if (guarded.blocked) console.warn("[sommelier] reply blocked by the output guard");
@@ -189,16 +299,25 @@ export class SommelierAgent {
       await client.query("BEGIN");
       conversation = existing ?? (await client.query(
         `INSERT INTO sommelier_conversations (user_id, title) VALUES ($1, $2) RETURNING id, title, created_at AS "createdAt", updated_at AS "updatedAt"`,
-        [userId, text.length > 60 ? `${text.slice(0, 57)}...` : text],
+        [userId, conversationTitle(text, media)],
       )).rows[0];
       userMessage = (await client.query(
         `INSERT INTO sommelier_messages (conversation_id, role, content, created_at) VALUES ($1, 'user', $2, now() - interval '1 millisecond') RETURNING id, role, content, created_at AS "createdAt"`,
         [conversation.id, text],
       )).rows[0];
+      const stored: AttachmentInfo[] = [];
+      for (const item of media) {
+        const saved = (await client.query(
+          `INSERT INTO sommelier_attachments (message_id, kind, mime_type, data_url, duration_ms) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+          [userMessage.id, item.kind, item.mimeType, item.dataUrl, item.durationMs ?? null],
+        )).rows[0];
+        stored.push({ id: String(saved.id), kind: item.kind, mimeType: item.mimeType, durationMs: item.durationMs ?? null });
+      }
+      if (stored.length) userMessage = { ...userMessage, attachments: stored };
       reply = (await client.query(
         `INSERT INTO sommelier_messages (conversation_id, role, content, reasoning_details, model, prompt_tokens, completion_tokens, cost_usd, duration_ms)
          VALUES ($1, 'assistant', $2, $3::jsonb, $4, $5, $6, $7, $8) RETURNING id, role, content, created_at AS "createdAt"`,
-        [conversation.id, guarded.content, guarded.blocked || completion.reasoningDetails == null ? null : JSON.stringify(completion.reasoningDetails), completion.model, completion.promptTokens ?? null, completion.completionTokens ?? null, completion.costUsd ?? null, durationMs],
+        [conversation.id, guarded.content, guarded.blocked || withMedia || completion.reasoningDetails == null ? null : JSON.stringify(completion.reasoningDetails), completion.model, completion.promptTokens ?? null, completion.completionTokens ?? null, completion.costUsd ?? null, durationMs],
       )).rows[0];
       await client.query(`UPDATE sommelier_conversations SET updated_at = now() WHERE id = $1`, [conversation.id]);
       await client.query("COMMIT");
@@ -221,4 +340,9 @@ export class SommelierAgent {
     if (!row) throw notFound("Conversa não encontrada.");
     return row;
   }
+}
+
+function conversationTitle(text: string, media: Array<{ kind: string }>) {
+  if (text) return text.length > 60 ? `${text.slice(0, 57)}...` : text;
+  return media.some((item) => item.kind === "audio") ? "Mensagem de voz" : "Foto para o Sommelier";
 }

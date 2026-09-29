@@ -64,7 +64,8 @@ export function createApp(dependencies: AppDependencies) {
 
   app.use(cors());
   app.use(helmet({ contentSecurityPolicy: false }));
-  app.use(express.json({ limit: "3mb" }));
+  // Sommelier photos and audio travel as base64; Vercel caps a request body at about 4.5 MB.
+  app.use(express.json({ limit: "4mb" }));
 
   app.get("/", (_req, res) => {
     res.send("Hello World!");
@@ -269,6 +270,15 @@ export function createApp(dependencies: AppDependencies) {
     }),
   );
 
+  // "Assinatura Premium": the member's period, or the benefits and prices for free accounts.
+  app.get(
+    "/me/subscription",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      res.set("Cache-Control", "private, no-store").json(await accounts.getSubscription(user));
+    }),
+  );
+
   app.get(
     "/news",
     asyncHandler(async (_req, res) => {
@@ -419,6 +429,8 @@ export function createApp(dependencies: AppDependencies) {
     "/wines/:id/reviews/me",
     asyncHandler(async (req, res) => {
       const { user } = await authenticated(req, dependencies);
+      // Everyone reads the reviews; rating a wine is Premium.
+      requirePremium(user);
       if (!isUuid(req.params.id)) throw badRequest("Validation failed (uuid is expected)");
       const rating = validRating(req.body?.rating);
       if (rating === null) throw badRequest("A nota deve ser de 1 a 5, em passos de meio ponto.");
@@ -480,7 +492,31 @@ export function createApp(dependencies: AppDependencies) {
       requirePremium(user);
       const message = typeof req.body?.message === "string" ? req.body.message : "";
       const conversationId = typeof req.body?.conversationId === "string" && req.body.conversationId ? req.body.conversationId : undefined;
-      res.json(await sommelier().chat(user.id, { conversationId, message }));
+      res.json(await sommelier().chat(user.id, { conversationId, message, attachments: req.body?.attachments }));
+    }),
+  );
+
+  // A photo or voice message of the user's own conversation (shown / played in the chat).
+  app.get(
+    "/sommelier/attachments/:id",
+    asyncHandler(async (req, res) => {
+      const { user } = await authenticated(req, dependencies);
+      requirePremium(user);
+      const file = await sommelier().getAttachment(user.id, String(req.params.id));
+      if (!file) throw notFound("Anexo não encontrado.");
+      // iOS plays audio only from servers that answer byte ranges, with a standard MIME type.
+      const type = file.mimeType === "audio/m4a" || file.mimeType === "audio/x-m4a" ? "audio/mp4" : file.mimeType;
+      res.set({ "Content-Type": type, "Cache-Control": "private, max-age=86400", "Accept-Ranges": "bytes" });
+      const range = /^bytes=(\d*)-(\d*)$/.exec(req.header("range") ?? "");
+      if (range && (range[1] || range[2])) {
+        const size = file.data.length;
+        const start = range[1] ? Number(range[1]) : Math.max(0, size - Number(range[2]));
+        const end = range[1] && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+        if (start >= size || start > end) { res.status(416).set("Content-Range", `bytes */${size}`).end(); return; }
+        res.status(206).set("Content-Range", `bytes ${start}-${end}/${size}`).send(file.data.subarray(start, end + 1));
+        return;
+      }
+      res.send(file.data);
     }),
   );
 
