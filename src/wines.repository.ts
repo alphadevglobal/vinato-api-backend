@@ -438,8 +438,9 @@ export class PgWineRepository implements WineRepository {
   }
 
   async findById(id: string): Promise<Wine | null> {
+    // A duplicate merged by the curators (vinato-web migration 0012) opens the wine that replaced it.
     const result = await this.pool.query<WineRow>(
-      `${baseSelect} WHERE id = $1 LIMIT 1`,
+      `${baseSelect} WHERE id = COALESCE((SELECT merged_into FROM catalog_wines WHERE id = $1), $1) LIMIT 1`,
       [id],
     );
 

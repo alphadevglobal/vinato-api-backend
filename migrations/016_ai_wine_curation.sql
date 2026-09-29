@@ -77,3 +77,7 @@ BEGIN
       CHECK (outcome IN ('matched', 'needs_registration', 'recognition_failed', 'catalog_failed', 'ai_created'));
   END IF;
 END $$;
+
+-- vinato-web 0012: AI review of proposals and merged duplicates.
+ALTER TABLE wine_ai_proposals ADD COLUMN IF NOT EXISTS enrichment jsonb;
+ALTER TABLE catalog_wines ADD COLUMN IF NOT EXISTS merged_into uuid REFERENCES catalog_wines(id) ON DELETE SET NULL;

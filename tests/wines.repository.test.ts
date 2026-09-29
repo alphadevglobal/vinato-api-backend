@@ -279,3 +279,13 @@ describe("AI-assisted catalog", () => {
     expect(clientCalls.find((sql) => sql.includes("FROM catalog_wines"))).toContain("curation_status <> 'rejected'");
   });
 });
+
+describe("merged duplicates", () => {
+  it("opens the wine a duplicate was merged into", async () => {
+    const query = vi.fn(async () => ({ rows: [] }));
+    const pool = { query } as unknown as pg.Pool;
+    await new PgWineRepository(pool).findById("duplicate-id");
+    expect(query.mock.calls[0][0]).toContain("WHERE id = COALESCE((SELECT merged_into FROM catalog_wines WHERE id = $1), $1)");
+    expect(query.mock.calls[0][1]).toEqual(["duplicate-id"]);
+  });
+});
