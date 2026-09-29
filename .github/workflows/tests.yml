@@ -1,0 +1,29 @@
+# Runs the type check and the unit tests on every push and pull request, so the
+# Actions tab shows whether a commit is safe to deploy (Vercel deploys main).
+name: Testes
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Checagem de tipos
+        run: npx tsc --noEmit
+      # No DATABASE_URL: the tests use in-memory fakes and PGlite, never the Neon database.
+      - name: Testes unitários
+        run: npm test
