@@ -76,30 +76,33 @@ export class OpenRouterWineScanner implements WineScanner {
 
 async function identifyWithModel(model: string, imageDataUrl: string, trace?: ScanTrace) {
   const startedAt = Date.now();
-  const attempt = (ok: boolean, extra: { status?: number; error?: string; promptTokens?: number; completionTokens?: number; totalTokens?: number } = {}) =>
+  const attempt = (ok: boolean, extra: { status?: number; error?: string; promptTokens?: number; completionTokens?: number; totalTokens?: number; costUsd?: number } = {}) =>
     trace?.modelsTried.push({ model, ok, ms: Date.now() - startedAt, ...extra });
+  // An answer that fails validation is billed too, so its usage is kept on the failed attempt.
+  let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number; costUsd?: number } = {};
   try {
     const response = await callOpenRouter(model, imageDataUrl);
     if (!response.ok) throw Object.assign(new Error(`MODEL_${response.status}: ${response.body.slice(0, 200)}`), { status: response.status });
-    const parsed = parseModelJson(response.payload.choices?.[0]?.message?.content);
-    const data = normalizeScannedWineData(parsed);
-    if (!hasWineIdentity(data)) throw new Error("EMPTY_WINE_IDENTITY: o modelo não identificou produtor nem vinho");
-    attempt(true, {
-      status: 200,
+    usage = {
       promptTokens: response.payload.usage?.prompt_tokens,
       completionTokens: response.payload.usage?.completion_tokens,
       totalTokens: response.payload.usage?.total_tokens,
-    });
+      costUsd: response.payload.usage?.cost,
+    };
+    const parsed = parseModelJson(response.payload.choices?.[0]?.message?.content);
+    const data = normalizeScannedWineData(parsed);
+    if (!hasWineIdentity(data)) throw new Error("EMPTY_WINE_IDENTITY: o modelo não identificou produtor nem vinho");
+    attempt(true, { status: 200, ...usage });
     return data;
   } catch (error) {
-    attempt(false, { status: (error as { status?: number }).status, error: (error as Error).message });
+    attempt(false, { status: (error as { status?: number }).status, error: (error as Error).message, ...usage });
     throw error;
   }
 }
 
 type OpenRouterPayload = {
   choices?: Array<{ message?: { content?: unknown } }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; cost?: number };
 };
 
 type OpenRouterResult =
@@ -126,6 +129,7 @@ async function callOpenRouter(
     body: JSON.stringify({
       model,
       max_tokens: 2500,
+      usage: { include: true },
       messages: [
         {
           role: "user",

@@ -10,6 +10,7 @@ import { newScanTrace, type ScanAuditEntry } from "./scan-audit.repository.js";
 import type { AppDependencies, AsyncRequestHandler, ScannedWineData, ScanWineLabelResult, Wine, WineListQuery } from "./types.js";
 import { verifySocialToken, type SocialProvider } from "./social-auth.js";
 import { requestJson } from "./openrouter.js";
+import { openRouterAccount } from "./openrouter-account.js";
 import { DISPOSABLE_EMAIL_MESSAGE, isDisposableEmailAddress } from "./email-policy.js";
 
 const require = createRequire(import.meta.url);
@@ -478,6 +479,18 @@ export function createApp(dependencies: AppDependencies) {
       const message = typeof req.body?.message === "string" ? req.body.message : "";
       const conversationId = typeof req.body?.conversationId === "string" && req.body.conversationId ? req.body.conversationId : undefined;
       res.json(await sommelier().chat(user.id, { conversationId, message }));
+    }),
+  );
+
+  // Admin "Financeiro" (vinato-web): OpenRouter usage and balance of the server keys.
+  app.get(
+    "/admin/finance/openrouter",
+    asyncHandler(async (req, res) => {
+      const header = req.header("authorization") ?? "";
+      const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+      const admin = token && dependencies.adminSessions ? await dependencies.adminSessions.adminFor(token) : null;
+      if (!admin) throw new HttpError(401, "Sessão administrativa inválida.", "Unauthorized");
+      res.set("Cache-Control", "private, no-store").json(await openRouterAccount());
     }),
   );
 

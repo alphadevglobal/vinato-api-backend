@@ -7,7 +7,7 @@ import { GUARDED_REPLY, SommelierAgent, guardReply, type ChatTurn, type Complete
 // Minimal in-memory stand-in for the three sommelier tables.
 function fakeDb(sentToday = 0) {
   const conversations: Array<{ id: string; user_id: string; title: string }> = [];
-  const messages: Array<{ id: string; conversation_id: string; role: string; content: string; reasoning_details: unknown; created_at: number }> = [];
+  const messages: Array<{ id: string; conversation_id: string; role: string; content: string; reasoning_details: unknown; created_at: number; params: unknown[] }> = [];
   let clock = 0;
   const query = vi.fn(async (sql: string, params: unknown[] = []) => {
     if (sql.includes("FROM sommelier_agent_config")) return { rows: [{ model: "deepseek/deepseek-v3.2", system_prompt: "REGRAS", reasoning_enabled: true, temperature: "0.7", max_output_tokens: 1200, history_messages: 20, daily_message_limit: 2 }] };
@@ -17,7 +17,7 @@ function fakeDb(sentToday = 0) {
     if (sql.includes("FROM sommelier_conversations WHERE id = $1 AND user_id = $2")) return { rows: conversations.filter((c) => c.id === params[0] && c.user_id === params[1]) };
     if (sql.trim().startsWith("INSERT INTO sommelier_messages")) {
       const assistant = sql.includes("'assistant'");
-      const row = { id: `m${messages.length + 1}`, conversation_id: String(params[0]), role: assistant ? "assistant" : "user", content: String(params[1]), reasoning_details: assistant && params[2] ? JSON.parse(String(params[2])) : null, created_at: ++clock };
+      const row = { id: `m${messages.length + 1}`, conversation_id: String(params[0]), role: assistant ? "assistant" : "user", content: String(params[1]), reasoning_details: assistant && params[2] ? JSON.parse(String(params[2])) : null, created_at: ++clock, params };
       messages.push(row); return { rows: [row] };
     }
     if (sql.includes("SELECT role, content, reasoning_details FROM")) return { rows: messages.filter((m) => m.conversation_id === params[0]).sort((a, b) => a.created_at - b.created_at) };
@@ -44,6 +44,15 @@ describe("SommelierAgent", () => {
     expect(secondCall.map((turn) => turn.role)).toEqual(["system", "user", "assistant", "user"]);
     expect(secondCall[2].reasoning_details).toEqual([{ type: "reasoning.text", text: "pensando" }]);
     expect(first.reply.content).toBe("Um Malbec vai bem.");
+  });
+
+  it("stores the tokens and the cost OpenRouter billed for the answer", async () => {
+    const db = fakeDb();
+    const agent = new SommelierAgent(db.pool, async () => ({ content: "Um Malbec.", reasoningDetails: null, model: "deepseek/deepseek-v3.2", promptTokens: 900, completionTokens: 120, costUsd: 0.00031 }));
+    await agent.chat("user-1", { message: "Vinho para churrasco?" });
+    const reply = db.messages.find((message) => message.role === "assistant")!;
+    // (conversation, content, reasoning, model, prompt_tokens, completion_tokens, cost_usd, duration_ms)
+    expect(reply.params.slice(3, 7)).toEqual(["deepseek/deepseek-v3.2", 900, 120, 0.00031]);
   });
 
   it("stores nothing when the model fails", async () => {

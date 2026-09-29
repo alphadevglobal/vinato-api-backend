@@ -69,3 +69,36 @@ describe("POST /admin/ai/enrich", () => {
     expect(limited.body.message).toContain("429");
   });
 });
+
+describe("GET /admin/finance/openrouter", () => {
+  const appWith = () => createApp({
+    wineRepository: {} as never, wineScanner: {} as never,
+    adminSessions: { adminFor: vi.fn(async (token: string) => token === "admin-token" ? { userId: "a", role: "admin" } : null) },
+  });
+  const originalSommelier = process.env.SOMMELIER_OPENROUTER_API_KEY;
+  afterEach(() => { if (originalSommelier === undefined) delete process.env.SOMMELIER_OPENROUTER_API_KEY; else process.env.SOMMELIER_OPENROUTER_API_KEY = originalSommelier; });
+
+  it("reports the usage of each server key and the balance, without exposing the keys", async () => {
+    process.env.OPENROUTER_API_KEY = "sk-or-scanner-1111";
+    process.env.SOMMELIER_OPENROUTER_API_KEY = "sk-or-sommelier-2222";
+    const fetchMock = vi.fn(async (url: string, init: RequestInit) => {
+      const key = (init.headers as Record<string, string>).Authorization;
+      if (url.endsWith("/key")) return new Response(JSON.stringify({ data: { label: "vinato", usage: key.endsWith("1111") ? 12.5 : 3.25, usage_monthly: 1.5, limit: null, limit_remaining: null, is_free_tier: false } }));
+      if (key.endsWith("1111")) return new Response(JSON.stringify({ error: { message: "forbidden" } }), { status: 403 });
+      return new Response(JSON.stringify({ data: { total_credits: 40, total_usage: 15.75 } }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const response = await request(appWith()).get("/admin/finance/openrouter").set("Authorization", "Bearer admin-token").expect(200);
+    expect(response.body.keys).toEqual([
+      expect.objectContaining({ purpose: "Scanner, cartas e curadoria", keyHint: "…1111", ok: true, usageUsd: 12.5, usageMonthlyUsd: 1.5 }),
+      expect.objectContaining({ purpose: "Sommelier", keyHint: "…2222", ok: true, usageUsd: 3.25 }),
+    ]);
+    expect(response.body.credits).toEqual({ totalCreditsUsd: 40, totalUsageUsd: 15.75, balanceUsd: 24.25 });
+    expect(JSON.stringify(response.body)).not.toContain("sk-or-");
+  });
+
+  it("requires an admin session", async () => {
+    await request(appWith()).get("/admin/finance/openrouter").expect(401);
+    await request(appWith()).get("/admin/finance/openrouter").set("Authorization", "Bearer customer").expect(401);
+  });
+});

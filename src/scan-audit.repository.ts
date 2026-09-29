@@ -10,6 +10,8 @@ export type ModelAttempt = {
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
+  // Billed by OpenRouter (usage.cost), read by the admin finance screen.
+  costUsd?: number;
 };
 
 /** Filled in by the scanner and the catalog matcher while a scan runs. */

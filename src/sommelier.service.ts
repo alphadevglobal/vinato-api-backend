@@ -13,7 +13,7 @@ export type SommelierConfig = {
 };
 
 export type ChatTurn = { role: "system" | "user" | "assistant"; content: string; reasoning_details?: unknown };
-export type Completion = { content: string; reasoningDetails: unknown; model: string; promptTokens?: number; completionTokens?: number };
+export type Completion = { content: string; reasoningDetails: unknown; model: string; promptTokens?: number; completionTokens?: number; costUsd?: number };
 export type CompleteChat = (messages: ChatTurn[], settings: SommelierConfig) => Promise<Completion>;
 
 export type SommelierMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string };
@@ -76,6 +76,7 @@ export const openRouterChat: CompleteChat = async (messages, settings) => {
         messages,
         temperature: settings.temperature,
         max_tokens: settings.maxOutputTokens,
+        usage: { include: true },
         ...(settings.reasoningEnabled ? { reasoning: { enabled: true } } : {}),
       }),
     });
@@ -93,12 +94,12 @@ export const openRouterChat: CompleteChat = async (messages, settings) => {
   const payload = JSON.parse(body) as {
     model?: string;
     choices?: Array<{ message?: { content?: string | null; reasoning_details?: unknown } }>;
-    usage?: { prompt_tokens?: number; completion_tokens?: number };
+    usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
   };
   const message = payload.choices?.[0]?.message;
   const content = message?.content?.trim();
   if (!content) throw internalServerError("O Sommelier não conseguiu responder agora.");
-  return { content, reasoningDetails: message?.reasoning_details ?? null, model: payload.model ?? settings.model, promptTokens: payload.usage?.prompt_tokens, completionTokens: payload.usage?.completion_tokens };
+  return { content, reasoningDetails: message?.reasoning_details ?? null, model: payload.model ?? settings.model, promptTokens: payload.usage?.prompt_tokens, completionTokens: payload.usage?.completion_tokens, costUsd: payload.usage?.cost };
 };
 
 export class SommelierAgent {
@@ -195,9 +196,9 @@ export class SommelierAgent {
         [conversation.id, text],
       )).rows[0];
       reply = (await client.query(
-        `INSERT INTO sommelier_messages (conversation_id, role, content, reasoning_details, model, prompt_tokens, completion_tokens, duration_ms)
-         VALUES ($1, 'assistant', $2, $3::jsonb, $4, $5, $6, $7) RETURNING id, role, content, created_at AS "createdAt"`,
-        [conversation.id, guarded.content, guarded.blocked || completion.reasoningDetails == null ? null : JSON.stringify(completion.reasoningDetails), completion.model, completion.promptTokens ?? null, completion.completionTokens ?? null, durationMs],
+        `INSERT INTO sommelier_messages (conversation_id, role, content, reasoning_details, model, prompt_tokens, completion_tokens, cost_usd, duration_ms)
+         VALUES ($1, 'assistant', $2, $3::jsonb, $4, $5, $6, $7, $8) RETURNING id, role, content, created_at AS "createdAt"`,
+        [conversation.id, guarded.content, guarded.blocked || completion.reasoningDetails == null ? null : JSON.stringify(completion.reasoningDetails), completion.model, completion.promptTokens ?? null, completion.completionTokens ?? null, completion.costUsd ?? null, durationMs],
       )).rows[0];
       await client.query(`UPDATE sommelier_conversations SET updated_at = now() WHERE id = $1`, [conversation.id]);
       await client.query("COMMIT");

@@ -149,9 +149,30 @@ describe("OpenRouterWineScanner", () => {
       totalTokens: 955,
     })]);
   });
+
+  it("records the billed cost, also for an answer that fails validation", async () => {
+    process.env.OPENROUTER_API_KEY = "test-key";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(modelReply('{"displayName":"","confidence":0.1}', { prompt_tokens: 800, completion_tokens: 20, total_tokens: 820, cost: 0.0004 }))
+      .mockResolvedValueOnce(modelReply('{"displayName":"Cost Wine","confidence":0.9,"notes":""}', { prompt_tokens: 810, completion_tokens: 150, total_tokens: 960, cost: 0.0021 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { OpenRouterWineScanner } = await import("../src/scanner.service.js");
+    const trace = { modelsTried: [], catalogQueried: false };
+
+    await new OpenRouterWineScanner({ getScannerModels: async () => ({ model: "cheap-model", fallbackModel: "better-model" }) }).scanWineLabel(
+      { buffer: Buffer.from("image"), mimetype: "image/jpeg" } as Express.Multer.File,
+      trace,
+    );
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).usage).toEqual({ include: true });
+    expect(trace.modelsTried).toEqual([
+      expect.objectContaining({ model: "cheap-model", ok: false, totalTokens: 820, costUsd: 0.0004 }),
+      expect.objectContaining({ model: "better-model", ok: true, totalTokens: 960, costUsd: 0.0021 }),
+    ]);
+  });
 });
 
-function modelReply(content: string, usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }) {
+function modelReply(content: string, usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number; cost?: number }) {
   return new Response(JSON.stringify({ choices: [{ message: { content } }], usage }), { status: 200 });
 }
 
