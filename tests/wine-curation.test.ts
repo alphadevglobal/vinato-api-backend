@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alcoholPercent, canCreateWine, catalogColour, proposedUpdates, readingToCatalogFields } from "../src/wine-curation.js";
+import { alcoholPercent, canCreateWine, catalogColour, fillAssignments, proposedUpdates, readingToCatalogFields, splitFills } from "../src/wine-curation.js";
 import type { ScannedWineData } from "../src/types.js";
 
 const reading = (overrides: Partial<ScannedWineData> = {}): ScannedWineData => ({
@@ -85,5 +85,19 @@ describe("proposedUpdates", () => {
       grapes: ["Isabel", "Bordo"], description: "Vinho de mesa suave, frutado", pairings: ["Pizza", "Massas"],
     };
     expect(proposedUpdates(current, proposed)).toEqual({});
+  });
+});
+
+describe("automatic fills", () => {
+  it("separates empty catalog fields from values the AI would replace", () => {
+    expect(splitFills({ producer: undefined, region: "Maipo", grapes: [] as unknown as string[] }, { producer: "Viña Cobos", region: "Mendoza", grapes: ["Malbec"] }))
+      .toEqual({ fills: { producer: "Viña Cobos", grapes: ["Malbec"] }, replacements: { region: "Mendoza" } });
+  });
+
+  it("writes each field to its catalog column", () => {
+    expect(fillAssignments({ producer: "Viña Cobos", subRegion: "Luján de Cuyo", alcoholPercent: 14, grapes: ["Malbec"], pairings: ["Churrasco"] }, 1)).toEqual({
+      sets: ["producer_manufacturer = $2", "sub_region = $3", "alcohol_percent = $4", "grapes = $5::jsonb", `pairings = jsonb_set(coalesce(pairings, '{"dishes": [], "ingredients": []}'::jsonb), '{dishes}', $6::jsonb)`],
+      values: ["Viña Cobos", "Luján de Cuyo", 14, JSON.stringify([{ name: "Malbec", percentage: null }]), JSON.stringify(["Churrasco"])],
+    });
   });
 });

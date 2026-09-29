@@ -15,6 +15,7 @@ export type CatalogCandidate = {
   vintage: number | null;
   hasImage: boolean;
   places?: string[]; // region, sub-region, country of the catalog row
+  colour?: string | null; // catalog colour column (may be wrong in the imported base)
 };
 
 export type ScoredCandidate = CatalogCandidate & { score: number };
@@ -33,6 +34,12 @@ const GENERIC_WORDS = new Set([
   "valley", "vale", "valle", "region",
   // Company suffixes printed on back labels ("Rutini Wines", "Cinque Segni Srl", "& Figli").
   "wines", "vinos", "vins", "finos", "sa", "srl", "spa", "sas", "sca", "scav", "ltda", "ltd", "inc", "co", "company", "figli", "hijos", "filhos",
+  // Numbering printed as "Nº 3" / "no. 3" / "nr 3".
+  "no", "nr", "num", "numero",
+  // Company forms and appellations written with initials ("S.L.", "I.G.T.", "D.O.Ca.", "I.P.").
+  "sl", "slu", "igt", "docg", "doca", "dop", "igp", "ip", "vqprd", "aop", "ava",
+  // Field labels the model sometimes writes instead of a value.
+  "produtor", "producer", "productor", "engarrafado", "bottled",
 ]);
 
 // Words that separate different wines of the same producer and line.
@@ -46,8 +53,25 @@ const COLOURS: Array<[string, RegExp]> = [
   ["sparkling", /\b(espumante|sparkling|champagne|cava|prosecco|cremant|brut|spumante|frisante)\b/],
   ["rose", /\b(rose|rosado|rosato|rosa)\b/],
   ["white", /\b(branco|blanco|white|blanc|bianco|chardonnay|sauvignon blanc|riesling|alvarinho|moscatel)\b/],
-  ["red", /\b(tinto|tinta|red|rouge|rosso|malbec|cabernet sauvignon|merlot|carmenere|pinot noir|syrah|tannat|bordo)\b/],
+  ["red", /\b(tinto|tinta|red|rouge|rosso|malbec|cabernet|merlot|carmenere|pinot noir|syrah|shiraz|tannat|bordo|isabel|tempranillo|sangiovese|nebbiolo|primitivo|pinotage|marselan|touriga|montepulciano)\b/],
 ];
+
+// Sweetness words: "Suave" and "Seco" are different wines of the same line
+// (Brazilian table wines), like "Brut" and "Demi-Sec" for sparkling ones.
+const SWEETNESS: Array<[string, RegExp]> = [
+  ["suave", /\b(suave|doce|dolce|sweet)\b/],
+  ["demi", /\b(demi sec|demi|meio seco|semi seco|semisseco|medium dry)\b/],
+  ["seco", /\b(seco|seca|dry)\b/],
+  ["brut", /\b(brut|extra brut|nature)\b/],
+];
+function sweetnessOf(text: string) {
+  const normalized = normalizeText(text);
+  // "demi-sec" must not also count as "seco"; "extra brut" as "brut" is the same family.
+  const found = new Set<string>();
+  for (const [name, pattern] of SWEETNESS) if (pattern.test(normalized)) found.add(name);
+  if (found.has("demi")) found.delete("seco");
+  return found;
+}
 
 /** Colour stated by a text. Style words win over grape hints ("Pinot Noir Rosé" is rosé). */
 function colourOf(text: string) {
@@ -80,6 +104,8 @@ export function normalizeText(value: string | null | undefined) {
 
 function tokens(value: string | null | undefined) {
   return normalizeText(value)
+    // Initials are a name ("D.V. Catena" → "dv"), not stray letters to drop.
+    .replace(/\b([a-z])(?: ([a-z]))+\b/g, (match) => match.replace(/ /g, ""))
     .split(" ")
     .filter((token) => token.length > 1 && !GENERIC_WORDS.has(token) && !/^(1[89]|20)\d{2}$/.test(token));
 }
@@ -107,6 +133,17 @@ export function searchTerms(data: ScannedWineData) {
   return [...new Set([...terms, printed, normalizeText(printed)].filter((term) => term.length >= 3))].slice(0, 6);
 }
 
+/**
+ * Distinctive words read on the label: producer words and wine-name words. A wine
+ * can only be created from a reading that names it well enough (producer + name,
+ * or at least two name words): "La Flor" alone would create a wrong wine.
+ */
+export function readingIdentity(data: Pick<ScannedWineData, "displayName" | "producerName" | "producerTitle" | "wine">) {
+  const producer = [...new Set([data.producerName, data.producerTitle].flatMap((name) => tokens(name)))];
+  const name = [...new Set([...tokens(data.displayName), ...tokens(data.wine)])].filter((token) => !producer.includes(token));
+  return { producer, name, sufficient: name.length >= 2 || (producer.length >= 1 && name.length >= 1) };
+}
+
 export function labelVintage(data: ScannedWineData) {
   const year = Number(data.vintage);
   return Number.isInteger(year) && year > 1850 && year <= new Date().getFullYear() ? year : null;
@@ -117,26 +154,44 @@ function labelIsStandardBottle(data: ScannedWineData) {
   return !volume || /\b75\s?cl\b|\b750\s?ml\b|\b0 75\s?l\b/.test(volume) || !LARGE_OR_SMALL_FORMAT.test(volume);
 }
 
+// One letter of difference in a long word is a spelling variant, not another wine
+// ("Trebbiano"/"Trebiano", "Arouce"/"Arource").
+function similarWord(a: string, b: string) {
+  if (a === b) return true;
+  if (Math.min(a.length, b.length) < 6 || Math.abs(a.length - b.length) > 1) return false;
+  let i = 0; let j = 0; let edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i += 1; j += 1; continue; }
+    edits += 1;
+    if (edits > 1) return false;
+    if (a.length > b.length) i += 1; else if (b.length > a.length) j += 1; else { i += 1; j += 1; }
+  }
+  return edits + (a.length - i) + (b.length - j) <= 1;
+}
+const hasWord = (words: Set<string>, word: string) => words.has(word) || [...words].some((other) => similarWord(word, other));
+
 export function scoreCandidate(data: ScannedWineData, candidate: CatalogCandidate) {
-  const producer = data.producerName ?? data.producerTitle;
-  const labelIdentity = new Set([...tokens(data.displayName), ...tokens(producer), ...tokens(data.wine)]);
+  // Both producer fields: the model may put the company ("S.C.A.V.M.") in one and
+  // the estate ("Château Bauvallon") in the other.
+  const producerNames = [data.producerName, data.producerTitle].filter((value): value is string => Boolean(value));
+  const labelIdentity = new Set([...tokens(data.displayName), ...producerNames.flatMap((name) => tokens(name)), ...tokens(data.wine)]);
   const candidateName = normalizeText([candidate.displayName, candidate.wineName, candidate.producer].filter(Boolean).join(" "));
   const candidateIdentity = new Set(tokens(candidateName));
   if (!labelIdentity.size || !candidateIdentity.size) return 0;
 
   // How much of what the label says is present in the catalog row...
-  const found = [...labelIdentity].filter((token) => candidateIdentity.has(token)).length;
+  const found = [...labelIdentity].filter((token) => hasWord(candidateIdentity, token)).length;
   const labelCoverage = found / labelIdentity.size;
   // ...and how much of the catalog row is explained by the label. A catalog
   // "Lote 43 Magnum" or "Reserva Especial" must not win for a plain "Lote 43".
   const everythingRead = new Set([...labelIdentity, ...tokens(data.designation), ...tokens(data.classification), ...tokens(data.grapes), ...tokens(data.region), ...tokens(data.subRegion), ...tokens(data.country)]);
-  const explained = [...candidateIdentity].filter((token) => everythingRead.has(token)).length;
+  const explained = [...candidateIdentity].filter((token) => hasWord(everythingRead, token)).length;
   const candidateCoverage = explained / candidateIdentity.size;
 
   let score = labelCoverage * 0.6 + candidateCoverage * 0.4;
 
-  const producerTokens = tokens(producer);
-  if (producerTokens.length && producerTokens.every((token) => candidateIdentity.has(token))) score += 0.08;
+  const producerTokens = [...new Set(producerNames.flatMap((name) => tokens(name)))];
+  if (producerNames.some((name) => { const words = tokens(name); return words.length > 0 && words.every((token) => candidateIdentity.has(token)); })) score += 0.08;
   // The producer read on the label appears nowhere in the row: another producer's
   // wine with the same name ("Absurdo, Cabernet Franc Malbec" for a Rutini).
   // Only rows that name a producer can contradict the label.
@@ -146,9 +201,17 @@ export function scoreCandidate(data: ScannedWineData, candidate: CatalogCandidat
   if (vintage && candidate.vintage === vintage) score += 0.1;
 
   // A red label never matches the white or sparkling version of the same line.
+  // The name says it first ("il Rosso" is red even if the imported row says White);
+  // the catalog colour column only speaks when the name does not.
   const labelColour = colourOf([data.colour, data.type, data.displayName, data.wine].filter(Boolean).join(" "));
-  const candidateColour = colourOf(candidate.displayName);
+  const candidateColour = colourOf(candidate.displayName) ?? colourOf(candidate.colour ?? "");
   if (labelColour && candidateColour && labelColour !== candidateColour) score -= 0.45;
+
+  // "Suave" on the label and "Seco" (or nothing) in the row: another wine of the line.
+  const labelSweetness = sweetnessOf([data.displayName, data.wine, data.type, data.subType, data.classification].filter(Boolean).join(" "));
+  const candidateSweetness = sweetnessOf(candidateName);
+  const sweetnessMismatch = [...labelSweetness].filter((word) => !candidateSweetness.has(word)).length + [...candidateSweetness].filter((word) => !labelSweetness.has(word)).length;
+  score -= Math.min(0.4, sweetnessMismatch * 0.2);
 
   // "Reserva", "Gran", "Select"... on only one side means another wine of the line.
   const labelTiers = tierWords([data.displayName, data.wine, data.designation, data.classification].filter(Boolean).join(" "));
@@ -181,6 +244,38 @@ export function scoreCandidate(data: ScannedWineData, candidate: CatalogCandidat
   // ("Rutini, Cabernet Franc") is not the blend on the label ("Cabernet Franc - Malbec").
   const missingGrape = [...labelIdentity].some((token) => GRAPE_WORDS.has(token) && !candidateIdentity.has(token));
   if (missingGrape || producerMissing) score = Math.min(score, 0.65);
+
+  // The reverse: a grape in the row that nothing on the label shows ("Almadén
+  // Cabernet Suave" or "Rutini Syrah" for a label that names no grape) is another wine.
+  const unreadGrape = [...candidateIdentity].some((token) => GRAPE_WORDS.has(token) && !everythingRead.has(token));
+  if (unreadGrape) score = Math.min(score, 0.6);
+
+  // Too little was read to tell wines apart: only the producer ("Rutini"), or a
+  // single word without producer ("La Flor", "Trifula"). Only a row fully explained
+  // by the reading can be that wine.
+  // When the "producer" read is in fact the wine's name (the row names another
+  // producer: "Quinta de Foz de Arouce" by João Portugal Ramos), it is not thin.
+  const nameTokens = [...labelIdentity].filter((token) => !producerTokens.includes(token));
+  const rowProducer = new Set(tokens(candidate.producer));
+  const producerIsRowProducer = !candidate.producer || producerTokens.some((token) => rowProducer.has(token));
+  const thin = (nameTokens.length === 0 && producerIsRowProducer) || (nameTokens.length === 1 && producerTokens.length === 0);
+  const places = new Set((candidate.places ?? []).flatMap((place) => tokens(place)));
+  if (thin) {
+    const unexplained = [...candidateIdentity].filter((token) => !hasWord(everythingRead, token) && !places.has(token));
+    if (unexplained.length) score = Math.min(score, 0.6);
+  }
+
+  // The producer read appears nowhere in the row, and the row has a name of its own
+  // that the label never showed ("Quara" for an "El Enemigo" label): another
+  // producer's wine, even when the row has no producer field.
+  const producerAbsent = producerTokens.length > 0 && !producerTokens.some((token) => hasWord(candidateIdentity, token));
+  const ownName = [...candidateIdentity].filter((token) => !hasWord(everythingRead, token) && !places.has(token) && !GRAPE_WORDS.has(token) && !TIER_WORDS.has(token));
+  if (producerAbsent && ownName.length) score = Math.min(score, 0.6);
+
+  // A word of the wine's name on the label that the row does not have ("La Flor"
+  // for a "Pulenta Estate I Malbec") names another wine of the producer.
+  const unmatchedName = nameTokens.filter((token) => !hasWord(candidateIdentity, token) && !GRAPE_WORDS.has(token) && !places.has(token) && !TIER_WORDS.has(token));
+  if (unmatchedName.length) score = Math.min(score, 0.65);
 
   // A row for another vintage is another bottle (its notes and scores differ):
   // keep it below the match threshold so it is offered as an alternative.

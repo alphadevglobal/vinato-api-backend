@@ -64,7 +64,13 @@ export async function requestJson(
   } catch (error) {
     return { ok: false, status: 408, error: (error as Error).name === "TimeoutError" ? "request_timeout" : (error as Error).message };
   }
-  const body = await response.text();
+  // The timeout also covers reading the body: a slow model can time out after the headers.
+  let body: string;
+  try {
+    body = await response.text();
+  } catch (error) {
+    return { ok: false, status: 408, error: (error as Error).name === "TimeoutError" ? "request_timeout" : (error as Error).message };
+  }
   if (!response.ok) return { ok: false, status: response.status, error: body.slice(0, 300) };
   let payload: Payload;
   try {

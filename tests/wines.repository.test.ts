@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 import { PgWineRepository } from "../src/wines.repository.js";
@@ -232,18 +234,41 @@ describe("AI-assisted catalog", () => {
     expect(result).toMatchObject({ status: "needs_registration", code: "VINATO-UNLISTED-TEST" });
   });
 
-  it("proposes the fields the AI would fill or change on a matched wine", async () => {
+  it("fills the empty catalog fields at once and proposes the ones that would change a value", async () => {
     const { repository, poolQuery } = repositoryFor({ candidates: [matchedAlmaviva], catalogRow });
 
     await repository.reconcileScan({ ...almaviva, alcoholContent: "14,5%", grapes: "Cabernet Sauvignon, Carmenère", description: "Tinto chileno encorpado." }, file, "user-1");
 
-    const [proposal] = callsWith(poolQuery, "INSERT INTO wine_ai_proposals");
-    expect(proposal[0]).toContain("'update'");
-    expect(proposal[0]).toContain("ON CONFLICT (wine_id, kind) WHERE status = 'pending' DO UPDATE");
-    expect(JSON.parse(proposal[1][1] as string)).toEqual({
-      region: "Puente Alto", wineType: "Wine", alcoholPercent: 14.5, grapes: ["Cabernet Sauvignon", "Carmenère"], description: "Tinto chileno encorpado.",
-    });
-    expect(JSON.parse(proposal[1][2] as string)).toEqual({ region: null, wineType: null, alcoholPercent: null, grapes: ["Cabernet Sauvignon"], description: null });
+    const [fill] = callsWith(poolQuery, "UPDATE catalog_wines SET").filter(([sql]) => !String(sql).includes("images"));
+    expect(fill[0]).toContain("region = $2");
+    expect(fill[0]).toContain("description = ");
+    expect(fill[1]).toEqual(["wine-id", "Puente Alto", "Wine", 14.5, "Tinto chileno encorpado."]);
+    const [applied, pending] = callsWith(poolQuery, "INSERT INTO wine_ai_proposals");
+    expect(applied[0]).toContain("'applied'");
+    expect(JSON.parse(applied[1][1] as string)).toEqual({ region: "Puente Alto", wineType: "Wine", alcoholPercent: 14.5, description: "Tinto chileno encorpado." });
+    expect(JSON.parse(applied[1][7] as string)).toMatchObject({ auto: true });
+    // The catalog already names a grape: replacing it waits for the curators.
+    expect(pending[0]).toContain("ON CONFLICT (wine_id, kind) WHERE status = 'pending' DO UPDATE");
+    expect(JSON.parse(pending[1][1] as string)).toEqual({ grapes: ["Cabernet Sauvignon", "Carmenère"] });
+  });
+
+  it("gives a catalog wine without producer the producer read on the label ('Vinho Cobos Felino Malbec')", async () => {
+    const felino = { id: "felino", display_name: "Vinho Cobos Felino Malbec", wine_name: "Cobos Felino Malbec", producer_manufacturer: null, vintage: null, has_image: true };
+    const { repository, poolQuery } = repositoryFor({ candidates: [felino], catalogRow: { ...catalogRow, display_name: "Vinho Cobos Felino Malbec", wine_name: "Cobos Felino Malbec", producer_manufacturer: null, country: "Argentina", color: "Red", vintage: null, grapes: [{ name: "Malbec" }] } });
+    const result = await repository.reconcileScan({ ...almaviva, displayName: "Viña Cobos FELINO", producerName: "Viña Cobos", producerTitle: null, wine: "FELINO", grapes: "Malbec", country: "Argentina", region: "Mendoza", vintage: "2023", description: "Malbec de Mendoza, frutado e macio." }, file);
+    expect(result).toMatchObject({ status: "matched", wineId: "felino" });
+    const [fill] = callsWith(poolQuery, "UPDATE catalog_wines SET").filter(([sql]) => !String(sql).includes("images"));
+    expect(fill[0]).toContain("producer_manufacturer = $2");
+    expect(fill[1]).toContain("Viña Cobos");
+    expect(fill[1]).toContain("Mendoza");
+  });
+
+  it("only proposes (never writes) after a match that is strong but not very strong", async () => {
+    const { repository, poolQuery } = repositoryFor({ candidates: [matchedAlmaviva], catalogRow });
+    await (repository as unknown as { proposeCatalogUpdate: (id: string, data: ScannedWineData, trace?: unknown, userId?: string, autoFill?: boolean) => Promise<void> })
+      .proposeCatalogUpdate("wine-id", { ...almaviva, description: "Tinto chileno." }, undefined, undefined, false);
+    expect(callsWith(poolQuery, "UPDATE catalog_wines SET")).toHaveLength(0);
+    expect(callsWith(poolQuery, "INSERT INTO wine_ai_proposals")[0][0]).toContain("ON CONFLICT");
   });
 
   it("records no proposal when the AI agrees with the catalog", async () => {
@@ -287,5 +312,40 @@ describe("merged duplicates", () => {
     await new PgWineRepository(pool).findById("duplicate-id");
     expect(query.mock.calls[0][0]).toContain("WHERE id = COALESCE((SELECT merged_into FROM catalog_wines WHERE id = $1), $1)");
     expect(query.mock.calls[0][1]).toEqual(["duplicate-id"]);
+  });
+});
+
+describe("scan safeguards (29/09 review)", () => {
+  it("maps a merged duplicate found by its old name to the wine that replaced it", async () => {
+    const client = { query: vi.fn(async (sql: string) => sql.includes("FROM catalog_wines")
+      ? { rows: [{ id: "dup", merged_into: "target", display_name: "Almadén Suave", wine_name: "Suave", producer_manufacturer: "Almadén", vintage: null, region: null, sub_region: null, country: "Brazil", color: "White", has_image: true }] }
+      : { rows: [] }), release: vi.fn() };
+    const pool = { connect: vi.fn(async () => client), query: vi.fn() } as unknown as pg.Pool;
+    const [candidate] = await new PgWineRepository(pool).findScanCandidates({ ...almaviva, displayName: "Almadén Suave", producerName: "Almadén", wine: "Suave" });
+    expect(candidate).toMatchObject({ id: "target", displayName: "Almadén Suave", colour: "White" });
+    expect(String(client.query.mock.calls.find(([sql]) => String(sql).includes("FROM catalog_wines"))?.[0])).toContain("curation_status <> 'rejected' OR merged_into IS NOT NULL");
+  });
+
+  it("does not create a wine from a reading too thin to name it (e.g. 'La Flor')", async () => {
+    const client = { query: vi.fn(async () => ({ rows: [] })), release: vi.fn() };
+    const poolQuery = vi.fn(async (sql: string) => sql.includes("INSERT INTO unlisted_wine_scans") ? { rows: [{ unlisted_code: "VINATO-UNLISTED-TEST" }] } : { rows: [], rowCount: 0 });
+    const pool = { connect: vi.fn(async () => client), query: poolQuery } as unknown as pg.Pool;
+    const result = await new PgWineRepository(pool).reconcileScan({ ...almaviva, displayName: "La Flor", producerName: null, producerTitle: null, wine: "La Flor", region: null, country: null }, file);
+    expect(result).toMatchObject({ status: "needs_registration" });
+    expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO catalog_wines"))).toBe(false);
+  });
+
+  it("proposes facts only from strong matches", async () => {
+    // A real borderline match (0.757): the right wine, but not sure enough to write facts on it.
+    const borderline = { id: "bellezza", display_name: "La Grande Bellezza Madame Gi Trebiano Toscano", wine_name: null, producer_manufacturer: null, vintage: null, has_image: true, region: null, sub_region: null, country: null, color: null };
+    const client = { query: vi.fn(async (sql: string) => (sql.includes("FROM catalog_wines") ? { rows: [borderline] } : { rows: [] })), release: vi.fn() };
+    const poolQuery = vi.fn(async () => ({ rows: [], rowCount: 1 }));
+    const pool = { connect: vi.fn(async () => client), query: poolQuery } as unknown as pg.Pool;
+    const fixture = (JSON.parse(readFileSync(join(process.cwd(), "tests/fixtures/matcher-cases.json"), "utf8")) as { label: string; reading: object }[])
+      .find((item) => item.label === "LA GRANDE BELLEZZA TREBBIANO TOSCANO")!;
+    const result = await new PgWineRepository(pool).reconcileScan({ confidence: 0.9, notes: "", ...fixture.reading } as ScannedWineData, file);
+    expect(result).toMatchObject({ status: "matched", wineId: "bellezza" });
+    expect((result as { matchScore: number }).matchScore).toBeLessThan(0.85);
+    expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("wine_ai_proposals"))).toBe(false);
   });
 });

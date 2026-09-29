@@ -115,3 +115,37 @@ export function proposedUpdates(current: CatalogFields, proposed: CatalogFields)
   }
   return changes;
 }
+
+const COLUMNS: Partial<Record<CatalogField, string>> = {
+  producer: "producer_manufacturer", country: "country", region: "region", subRegion: "sub_region", colour: "color",
+  wineType: "wine_type", designation: "designation", classification: "classification", alcoholPercent: "alcohol_percent",
+  description: "description",
+};
+
+/**
+ * Splits the AI proposal into fields the catalog does not have yet (filled at once
+ * after a strong match, so the customer never gets an empty wine page) and fields
+ * that would replace a catalog value (left for the curators).
+ */
+export function splitFills(current: CatalogFields, changes: CatalogFields) {
+  const fills: CatalogFields = {};
+  const replacements: CatalogFields = {};
+  for (const [field, value] of Object.entries(changes) as [CatalogField, CatalogFields[CatalogField]][]) {
+    const empty = current[field] === undefined || current[field] === null || (Array.isArray(current[field]) && !(current[field] as unknown[]).length);
+    (empty ? fills : replacements as Record<string, unknown>)[field] = value as never;
+  }
+  return { fills, replacements };
+}
+
+/** SQL "SET" pieces (with $n parameters starting at `offset`) that write the fills. */
+export function fillAssignments(fills: CatalogFields, offset: number) {
+  const sets: string[] = [];
+  const values: unknown[] = [];
+  const param = (value: unknown) => { values.push(value); return `$${offset + values.length}`; };
+  for (const [field, value] of Object.entries(fills) as [CatalogField, unknown][]) {
+    if (field === "grapes") sets.push(`grapes = ${param(JSON.stringify((value as string[]).map((name) => ({ name, percentage: null }))))}::jsonb`);
+    else if (field === "pairings") sets.push(`pairings = jsonb_set(coalesce(pairings, '{"dishes": [], "ingredients": []}'::jsonb), '{dishes}', ${param(JSON.stringify(value))}::jsonb)`);
+    else if (COLUMNS[field]) sets.push(`${COLUMNS[field]} = ${param(value)}`);
+  }
+  return { sets, values };
+}

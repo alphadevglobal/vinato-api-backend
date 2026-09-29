@@ -1,5 +1,5 @@
 import type { ScanTrace } from "./scan-audit.repository.js";
-import { decideMatch, searchTerms, type CatalogCandidate } from "./catalog-matcher.js";
+import { decideMatch, readingIdentity, searchTerms, type CatalogCandidate } from "./catalog-matcher.js";
 import type {
   AutocompleteWine,
   ExploreCatalog,
@@ -12,7 +12,7 @@ import type {
   ScanWineLabelResult,
 } from "./types.js";
 import { mapWineRow } from "./wine-mapper.js";
-import { canCreateWine, proposedUpdates, readingToCatalogFields, type CatalogFields } from "./wine-curation.js";
+import { canCreateWine, fillAssignments, proposedUpdates, readingToCatalogFields, splitFills, type CatalogFields } from "./wine-curation.js";
 import { createHash } from "node:crypto";
 import type pg from "pg";
 
@@ -94,6 +94,11 @@ const STYLE_SQL = `CASE lower(btrim(COALESCE(NULLIF(btrim(color), ''), NULLIF(bt
   WHEN 'dessert' THEN 'Dessert' WHEN 'sweet' THEN 'Dessert' WHEN 'amber' THEN 'Amber' WHEN 'orange' THEN 'Amber'
   ELSE initcap(btrim(COALESCE(NULLIF(btrim(color), ''), NULLIF(btrim(wine_type), ''))))
 END`;
+
+// Matches at or above this score may propose facts for the catalog wine; at or
+// above AUTO_FILL_MATCH the facts missing in the catalog are written at once.
+const STRONG_MATCH = 0.85;
+const AUTO_FILL_MATCH = 0.9;
 
 const scanImageDataUrl = (file: Express.Multer.File) => `data:${file.mimetype};base64,${file.buffer.toString("base64")}`;
 
@@ -212,19 +217,21 @@ export class PgWineRepository implements WineRepository {
       await client.query("SELECT set_config('pg_trgm.word_similarity_threshold', '0.6', true)");
       const where = terms.map((_, index) => `normalized_search %> $${index + 1}`).join(" OR ");
       const rank = terms.map((_, index) => `word_similarity($${index + 1}, normalized_search)`).join(" + ");
-      const result = await client.query<{ id: string; display_name: string; wine_name: string | null; producer_manufacturer: string | null; vintage: number | null; has_image: boolean; region: string | null; sub_region: string | null; country: string | null }>(
-        `SELECT id, display_name, wine_name, producer_manufacturer, vintage, region, sub_region, country,
+      // A duplicate the curators merged still answers to its name: it stands for
+      // the wine it was merged into (otherwise the same label creates it again).
+      const result = await client.query<{ id: string; merged_into: string | null; display_name: string; wine_name: string | null; producer_manufacturer: string | null; vintage: number | null; has_image: boolean; region: string | null; sub_region: string | null; country: string | null; color: string | null }>(
+        `SELECT id, merged_into, display_name, wine_name, producer_manufacturer, vintage, region, sub_region, country, color,
                 (jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0) AS has_image
          FROM catalog_wines
-         WHERE (${where}) AND curation_status <> 'rejected'
+         WHERE (${where}) AND (curation_status <> 'rejected' OR merged_into IS NOT NULL)
          ORDER BY (${rank}) DESC
          LIMIT 40`,
         terms,
       );
       await client.query("COMMIT");
       return result.rows.map((row) => ({
-        id: row.id, displayName: row.display_name, wineName: row.wine_name,
-        producer: row.producer_manufacturer, vintage: row.vintage, hasImage: row.has_image,
+        id: row.merged_into ?? row.id, displayName: row.display_name, wineName: row.wine_name,
+        producer: row.producer_manufacturer, vintage: row.vintage, hasImage: row.has_image, colour: row.color,
         places: [row.region, row.sub_region, row.country].filter((place): place is string => Boolean(place)),
       }));
     } catch (error) {
@@ -245,7 +252,7 @@ export class PgWineRepository implements WineRepository {
       await this.countResubmission(identical.unlisted_code);
       const imageAdded = await this.attachScanImage(identical.registered_wine_id, file);
       await this.addToPhotoPool(identical.registered_wine_id, file, userId);
-      await this.proposeCatalogUpdate(identical.registered_wine_id, data, trace, userId);
+      await this.proposeCatalogUpdate(identical.registered_wine_id, data, trace, userId, true);
       return { status: "matched", wineId: identical.registered_wine_id, imageAdded, alternatives: [] };
     }
 
@@ -259,7 +266,9 @@ export class PgWineRepository implements WineRepository {
       const { best } = decision;
       const imageAdded = best.hasImage ? false : await this.attachScanImage(best.id, file);
       await this.addToPhotoPool(best.id, file, userId);
-      await this.proposeCatalogUpdate(best.id, data, trace, userId);
+      // Only a strong match may propose facts for the wine: a borderline one
+      // ("La Flor" → "Flor das Tecedeiras") would write another wine's facts.
+      if (best.score >= STRONG_MATCH) await this.proposeCatalogUpdate(best.id, data, trace, userId, best.score >= AUTO_FILL_MATCH);
       return { status: "matched", wineId: best.id, imageAdded, matchScore: best.score, alternatives };
     }
 
@@ -292,14 +301,16 @@ export class PgWineRepository implements WineRepository {
    */
   private async createAiWine(data: ScannedWineData, file: Express.Multer.File, userId: string | undefined, alternatives: { wineId: string; displayName: string }[], trace?: ScanTrace) {
     const fields = readingToCatalogFields(data);
-    if (!canCreateWine(fields)) return null;
+    // Too little was read ("La Flor", "Eterno"): creating a wine would invent one.
+    // The app offers the similar catalog wines instead.
+    if (!canCreateWine(fields) || !readingIdentity(data).sufficient) return null;
     try {
       const existing = await this.pool.query<{ id: string }>(
-        `SELECT id FROM catalog_wines
+        `SELECT coalesce(merged_into, id) AS id FROM catalog_wines
          WHERE lower(btrim(display_name)) = lower(btrim($1))
            AND (vintage = $2::smallint OR (vintage IS NULL AND $2::smallint IS NULL))
-           AND curation_status <> 'rejected'
-         ORDER BY (data_source = 'catalog') DESC, created_at
+           AND (curation_status <> 'rejected' OR merged_into IS NOT NULL)
+         ORDER BY (merged_into IS NULL AND data_source = 'catalog') DESC, created_at
          LIMIT 1`,
         [fields.displayName, fields.vintage ?? null],
       );
@@ -342,7 +353,7 @@ export class PgWineRepository implements WineRepository {
    * Pending proposals of a wine accumulate in one row (newest values win).
    * A wine still awaiting curation only counts the new scan. Best effort.
    */
-  private async proposeCatalogUpdate(wineId: string, data: ScannedWineData, trace?: ScanTrace, userId?: string) {
+  private async proposeCatalogUpdate(wineId: string, data: ScannedWineData, trace?: ScanTrace, userId?: string, autoFill = false) {
     try {
       const row = (await this.pool.query<CatalogFieldsRow>(`SELECT ${CATALOG_FIELDS_SELECT} FROM catalog_wines WHERE id = $1`, [wineId])).rows[0];
       if (!row) return;
@@ -355,7 +366,22 @@ export class PgWineRepository implements WineRepository {
         return;
       }
       const current = catalogFieldsFromRow(row);
-      const changes = proposedUpdates(current, readingToCatalogFields(data));
+      const all = proposedUpdates(current, readingToCatalogFields(data));
+      // Empty catalog fields ("Produtor não informado") are filled at once after a
+      // very strong match, and kept as an applied proposal for the audit.
+      const { fills, replacements } = splitFills(current, all);
+      const fillKeys = Object.keys(fills) as (keyof CatalogFields)[];
+      if (autoFill && fillKeys.length) {
+        const { sets, values } = fillAssignments(fills, 1);
+        await this.pool.query(`UPDATE catalog_wines SET ${sets.join(", ")}, updated_at = now() WHERE id = $1`, [wineId, ...values]);
+        await this.pool.query(
+          `INSERT INTO wine_ai_proposals (wine_id, kind, status, proposed, current_values, reading, model, confidence, user_id, reviewed_at, decisions)
+           VALUES ($1, 'update', 'applied', $2::jsonb, $3::jsonb, $4::jsonb, $5, $6, $7, now(), $8::jsonb)`,
+          [wineId, JSON.stringify(fills), JSON.stringify(Object.fromEntries(fillKeys.map((key) => [key, null]))), JSON.stringify(data), trace?.modelUsed ?? null, data.confidence, userId ?? null,
+            JSON.stringify({ auto: true, accepted: fillKeys, reason: "campos vazios preenchidos após correspondência forte" })],
+        );
+      }
+      const changes = autoFill ? replacements : all;
       const keys = Object.keys(changes) as (keyof CatalogFields)[];
       if (!keys.length) return;
       const snapshot = Object.fromEntries(keys.map((key) => [key, current[key] ?? null]));

@@ -44,6 +44,12 @@ describe("openrouter helpers", () => {
     expect(body).toMatchObject({ model: "primary", reasoning: { effort: "low" }, response_format: { type: "json_object" }, usage: { include: true } });
   });
 
+  it("reports a timeout while the answer body is still arriving, instead of throwing", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 200, text: async () => { throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" }); } })));
+    const result = await requestJsonWithFallback({ model: "slow", fallbackModel: "fast" }, [{ type: "text", text: "x" }], { apiKey: "k" });
+    expect(result.attempts.map((attempt) => [attempt.model, attempt.status, attempt.error])).toEqual([["slow", 408, "request_timeout"], ["fast", 408, "request_timeout"]]);
+  });
+
   it("reports an answer cut by the token limit", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ choices: [{ finish_reason: "length", message: { content: '{"items": [' } }] }))));
     const result = await requestJsonWithFallback({ model: "m", fallbackModel: "m" }, [{ type: "text", text: "x" }], { apiKey: "k" });

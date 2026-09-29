@@ -113,6 +113,37 @@ describe("OpenRouterWineScanner", () => {
     expect(prompt).toContain("Nunca invente produtor, vinho ou safra");
   });
 
+  it("moves on to the fallback when the primary answer is cut or not JSON", async () => {
+    process.env.OPENROUTER_API_KEY = "test-key";
+    const { OpenRouterWineScanner } = await import("../src/scanner.service.js");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ finish_reason: "length", message: { content: '{"displayName": "Alm' } }] }), { status: 200 }))
+      .mockResolvedValueOnce(modelReply('{"displayName":"Almadén Suave","producerName":"Almadén","confidence":0.9,"notes":""}'));
+    vi.stubGlobal("fetch", fetchMock);
+    const trace = { modelsTried: [] as { model: string; ok: boolean; error?: string }[], catalogQueried: false } as never as { modelsTried: { model: string; ok: boolean; error?: string }[]; catalogQueried: boolean; modelUsed?: string };
+    const result = await new OpenRouterWineScanner({ getScannerModels: async () => ({ model: "slow-thinker", fallbackModel: "fast-vision" }) }).scanWineLabel({ buffer: Buffer.from("image"), mimetype: "image/jpeg" } as Express.Multer.File, trace as never);
+    expect(result.data.displayName).toBe("Almadén Suave");
+    expect(trace.modelsTried.map((attempt) => [attempt.model, attempt.ok])).toEqual([["slow-thinker", false], ["fast-vision", true]]);
+    expect(trace.modelsTried[0].error).toContain("MODEL_CUT");
+    expect(trace.modelUsed).toBe("fast-vision");
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).toMatchObject({ reasoning: { effort: "low" }, response_format: { type: "json_object" } });
+    expect(body.max_tokens).toBeGreaterThanOrEqual(4000);
+  });
+
+  it("still gets a second chance when the fallback was set equal to the primary", async () => {
+    process.env.OPENROUTER_API_KEY = "test-key";
+    const { OpenRouterWineScanner } = await import("../src/scanner.service.js");
+    const { defaultScannerModels } = await import("../src/ai-model-settings.js");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("upstream error", { status: 502 }))
+      .mockResolvedValueOnce(modelReply('{"displayName":"Rola Tinto","confidence":0.9,"notes":""}'));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await new OpenRouterWineScanner({ getScannerModels: async () => ({ model: "same", fallbackModel: "same" }) }).scanWineLabel({ buffer: Buffer.from("image"), mimetype: "image/jpeg" } as Express.Multer.File);
+    expect(result.data.displayName).toBe("Rola Tinto");
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).model).toBe(defaultScannerModels().fallbackModel);
+  });
+
   it("uses models selected at runtime for each scan", async () => {
     process.env.OPENROUTER_API_KEY = "test-key";
     const fetchMock = vi.fn().mockResolvedValueOnce(modelReply('{"displayName":"Runtime Wine","confidence":0.9,"notes":""}'));

@@ -3,8 +3,9 @@ import { defaultScannerModels, type ScannerModelSettingsProvider } from "./ai-mo
 import { internalServerError } from "./http-error.js";
 import type { ScanTrace } from "./scan-audit.repository.js";
 import type { ScanWineLabelResult, ScannedWineData, WineScanner } from "./types.js";
+import { requestJson } from "./openrouter.js";
 
-const scannerPrompt = `
+export const scannerPrompt = `
 Voce le rotulos de vinho para localizar o vinho no catalogo Vinato.
 Transcreva com fidelidade o texto impresso: produtor, nome do vinho (cuvee/linha),
 safra, pais, regiao, classificacao, uvas, volume e teor alcoolico. Preserve acentos
@@ -60,10 +61,13 @@ export class OpenRouterWineScanner implements WineScanner {
     } catch {
       data = undefined;
     }
-    if ((!data || isWeakReading(data)) && models.fallbackModel !== models.model) {
+    // A fallback equal to the primary would never run: use the default one instead
+    // (a slow or broken primary must still get a second chance).
+    const fallbackModel = models.fallbackModel !== models.model ? models.fallbackModel : defaultScannerModels().fallbackModel;
+    if ((!data || isWeakReading(data)) && fallbackModel !== models.model) {
       try {
-        const second = await identifyWithModel(models.fallbackModel, imageDataUrl, trace);
-        if (!data || readingScore(second) > readingScore(data)) { data = second; modelUsed = models.fallbackModel; }
+        const second = await identifyWithModel(fallbackModel, imageDataUrl, trace);
+        if (!data || readingScore(second) > readingScore(data)) { data = second; modelUsed = fallbackModel; }
       } catch {
         // Keep the primary reading, if any.
       }
@@ -74,125 +78,35 @@ export class OpenRouterWineScanner implements WineScanner {
   }
 }
 
+// Each attempt gets 22 s: primary + fallback fit in the 60 s of the function and
+// of the app. Thinking models answer with low reasoning effort and a JSON object.
+const ATTEMPT_TIMEOUT_MS = 22_000;
+
 async function identifyWithModel(model: string, imageDataUrl: string, trace?: ScanTrace) {
   const startedAt = Date.now();
   const attempt = (ok: boolean, extra: { status?: number; error?: string; promptTokens?: number; completionTokens?: number; totalTokens?: number; costUsd?: number } = {}) =>
     trace?.modelsTried.push({ model, ok, ms: Date.now() - startedAt, ...extra });
+  const reply = await requestJson(model, [
+    { type: "text", text: scannerPrompt },
+    { type: "image_url", image_url: { url: imageDataUrl } },
+  ], { maxTokens: 4000, timeoutMs: ATTEMPT_TIMEOUT_MS, title: "Wine API" });
   // An answer that fails validation is billed too, so its usage is kept on the failed attempt.
-  let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number; costUsd?: number } = {};
-  try {
-    const response = await callOpenRouter(model, imageDataUrl);
-    if (!response.ok) throw Object.assign(new Error(`MODEL_${response.status}: ${response.body.slice(0, 200)}`), { status: response.status });
-    usage = {
-      promptTokens: response.payload.usage?.prompt_tokens,
-      completionTokens: response.payload.usage?.completion_tokens,
-      totalTokens: response.payload.usage?.total_tokens,
-      costUsd: response.payload.usage?.cost,
-    };
-    const parsed = parseModelJson(response.payload.choices?.[0]?.message?.content);
-    const data = normalizeScannedWineData(parsed);
-    if (!hasWineIdentity(data)) throw new Error("EMPTY_WINE_IDENTITY: o modelo não identificou produtor nem vinho");
-    attempt(true, { status: 200, ...usage });
-    return data;
-  } catch (error) {
-    attempt(false, { status: (error as { status?: number }).status, error: (error as Error).message, ...usage });
-    throw error;
+  const usage = reply.usage ?? {};
+  if (!reply.ok) {
+    const message = reply.status === 408 ? "MODEL_TIMEOUT: o modelo não respondeu a tempo"
+      : reply.error === "answer_cut_by_token_limit" ? "MODEL_CUT: resposta cortada pelo limite de tokens"
+      : reply.error === "invalid_json_answer" ? "MODEL_INVALID_JSON: resposta sem JSON válido"
+      : `MODEL_${reply.status}: ${reply.error.slice(0, 200)}`;
+    attempt(false, { status: reply.status, error: message, ...usage });
+    throw Object.assign(new Error(message), { status: reply.status });
   }
-}
-
-type OpenRouterPayload = {
-  choices?: Array<{ message?: { content?: unknown } }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; cost?: number };
-};
-
-type OpenRouterResult =
-  | { ok: true; payload: OpenRouterPayload }
-  | { ok: false; status: number; body: string };
-
-async function callOpenRouter(
-  model: string,
-  imageDataUrl: string,
-): Promise<OpenRouterResult> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 18_000);
-  let response: Response;
-  try {
-    response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    signal: controller.signal,
-    headers: {
-      Authorization: `Bearer ${config.openRouterApiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "http://localhost",
-      "X-Title": "Wine API",
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 2500,
-      usage: { include: true },
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: scannerPrompt },
-            { type: "image_url", image_url: { url: imageDataUrl } },
-          ],
-        },
-      ],
-    }),
-    });
-  } catch {
-    return { ok: false, status: 408, body: "request_timeout" };
-  } finally {
-    clearTimeout(timeout);
+  const data = normalizeScannedWineData(reply.json);
+  if (!hasWineIdentity(data)) {
+    attempt(false, { status: 200, error: "EMPTY_WINE_IDENTITY: o modelo não identificou produtor nem vinho", ...usage });
+    throw new Error("EMPTY_WINE_IDENTITY: o modelo não identificou produtor nem vinho");
   }
-
-  const body = await response.text();
-  if (!response.ok) {
-    return { ok: false, status: response.status, body };
-  }
-
-  try {
-    return { ok: true, payload: JSON.parse(body) as OpenRouterPayload };
-  } catch {
-    throw internalServerError("Resposta inválida da API OpenRouter.");
-  }
-}
-
-function parseModelJson(content: unknown): Record<string, unknown> {
-  const text =
-    typeof content === "string"
-      ? content
-      : Array.isArray(content)
-        ? content
-            .map((item) =>
-              typeof item === "string"
-                ? item
-                : typeof item?.text === "string"
-                  ? item.text
-                  : "",
-            )
-            .join("")
-        : "";
-
-  let cleaned = text
-    .trim()
-    .replace(/^```(?:json)?/i, "")
-    .replace(/```$/i, "")
-    .trim();
-
-  const objectStart = cleaned.indexOf("{");
-  const objectEnd = cleaned.lastIndexOf("}");
-  if (objectStart >= 0 && objectEnd > objectStart) {
-    cleaned = cleaned.slice(objectStart, objectEnd + 1);
-  }
-
-  try {
-    const parsed = JSON.parse(cleaned);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    throw internalServerError("Resposta inválida da API OpenRouter.");
-  }
+  attempt(true, { status: 200, ...usage });
+  return data;
 }
 
 function normalizeScannedWineData(data: Record<string, unknown>): ScannedWineData {
