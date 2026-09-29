@@ -110,3 +110,47 @@ describe("identical scan photos", () => {
     expect(callsWith(poolQuery, "resubmissions")).toHaveLength(0);
   });
 });
+
+describe("wine photo pool", () => {
+  const matchedCandidate = { id: "wine-id", display_name: "Almaviva 2017", wine_name: "Almaviva", producer_manufacturer: "Almaviva", vintage: 2017, has_image: true };
+
+  it("offers every matched scan photo to the wine's pool, counting identical photos", async () => {
+    const { repository, poolQuery } = repositoryWith([matchedCandidate]);
+    await repository.reconcileScan(almaviva, file, "user-1");
+    const [insert] = callsWith(poolQuery, "INSERT INTO wine_photo_candidates");
+    expect(insert[1]).toEqual(["wine-id", "data:image/jpeg;base64,dXNlci1waG90bw==", "user-1"]);
+    expect(insert[0]).toContain("ON CONFLICT (wine_id, image_md5) DO UPDATE");
+    expect(insert[0]).toContain("times_seen = wine_photo_candidates.times_seen + 1");
+  });
+
+  it("adds the photo after attaching it as the main photo of a wine without one", async () => {
+    const { repository, poolQuery } = repositoryWith([{ ...matchedCandidate, has_image: false }]);
+    await repository.reconcileScan(almaviva, file);
+    const statements = poolQuery.mock.calls.map(([sql]) => String(sql));
+    expect(statements.findIndex((sql) => sql.includes("UPDATE catalog_wines SET images"))).toBeLessThan(statements.findIndex((sql) => sql.includes("INSERT INTO wine_photo_candidates")));
+  });
+
+  it("offers the photo to the wine the admin linked to an identical scan", async () => {
+    const { repository, poolQuery } = repositoryWith([], { unlisted_code: "VINATO-UNLISTED-OLD", status: "registered", registered_wine_id: "linked-wine" });
+    await repository.reconcileScan(almaviva, file);
+    expect(callsWith(poolQuery, "INSERT INTO wine_photo_candidates")[0][1][0]).toBe("linked-wine");
+  });
+
+  it("does not add photos of unmatched labels to any pool", async () => {
+    const { repository, poolQuery } = repositoryWith([]);
+    await repository.reconcileScan(almaviva, file);
+    expect(callsWith(poolQuery, "wine_photo_candidates")).toHaveLength(0);
+  });
+
+  it("keeps the match when the pool cannot be written", async () => {
+    const { repository, poolQuery } = repositoryWith([matchedCandidate]);
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("wine_photo_candidates")) throw Object.assign(new Error('relation "wine_photo_candidates" does not exist'), { code: "42P01" });
+      return { rows: [], rowCount: 1 };
+    });
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const result = await repository.reconcileScan(almaviva, file);
+    errorLog.mockRestore();
+    expect(result).toMatchObject({ status: "matched", wineId: "wine-id" });
+  });
+});

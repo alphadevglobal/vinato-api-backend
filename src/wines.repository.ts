@@ -125,6 +125,25 @@ export class PgWineRepository implements WineRepository {
     );
   }
 
+  /**
+   * Offers the scan photo to the wine's photo pool (migration 015 / vinato-web 0010),
+   * where the admin picks the photo the app shows. A byte-identical photo only
+   * bumps times_seen; the pool keeps the 5 latest distinct photos. Best effort.
+   */
+  private async addToPhotoPool(wineId: string, file: Express.Multer.File, userId?: string) {
+    try {
+      await this.pool.query(
+        `INSERT INTO wine_photo_candidates (wine_id, image_data_url, source, user_id)
+         VALUES ($1, $2, 'scan', $3)
+         ON CONFLICT (wine_id, image_md5) DO UPDATE
+         SET times_seen = wine_photo_candidates.times_seen + 1, last_seen_at = now()`,
+        [wineId, scanImageDataUrl(file), userId ?? null],
+      );
+    } catch (error) {
+      console.error("[wine-scanner] could not add the scan photo to the wine photo pool", error);
+    }
+  }
+
   // The photo is a bonus: failing to store it must not fail the scan.
   private async attachScanImage(wineId: string, file: Express.Multer.File) {
     try {
@@ -187,6 +206,7 @@ export class PgWineRepository implements WineRepository {
     if (identical?.registered_wine_id) {
       await this.countResubmission(identical.unlisted_code);
       const imageAdded = await this.attachScanImage(identical.registered_wine_id, file);
+      await this.addToPhotoPool(identical.registered_wine_id, file, userId);
       return { status: "matched", wineId: identical.registered_wine_id, imageAdded, alternatives: [] };
     }
 
@@ -199,6 +219,7 @@ export class PgWineRepository implements WineRepository {
     if (decision.status === "matched") {
       const { best } = decision;
       const imageAdded = best.hasImage ? false : await this.attachScanImage(best.id, file);
+      await this.addToPhotoPool(best.id, file, userId);
       return { status: "matched", wineId: best.id, imageAdded, matchScore: best.score, alternatives };
     }
 
