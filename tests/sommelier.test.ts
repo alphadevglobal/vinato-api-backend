@@ -23,7 +23,7 @@ function fakeDb(sentToday = 0) {
       const row = { id: `m${messages.length + 1}`, conversation_id: String(params[0]), role: assistant ? "assistant" : "user", content: String(params[1]), reasoning_details: assistant && params[2] ? JSON.parse(String(params[2])) : null, created_at: ++clock, params };
       messages.push(row); return { rows: [row] };
     }
-    if (sql.startsWith("INSERT INTO sommelier_attachments")) { const row = { id: `a${attachments.length + 1}`, message_id: String(params[0]), kind: params[1], mime_type: params[2], data_url: params[3], duration_ms: params[4] }; attachments.push(row); return { rows: [row] }; }
+    if (sql.startsWith("INSERT INTO sommelier_attachments")) { const row = { id: `a${attachments.length + 1}`, message_id: String(params[0]), kind: params[1], mime_type: params[2], data_url: params[3], duration_ms: params[4], transcript: params[5] ?? null }; attachments.push(row); return { rows: [row] }; }
     if (sql.includes("FROM sommelier_attachments WHERE message_id = ANY")) return { rows: attachments.filter((a) => (params[0] as string[]).includes(a.message_id)) };
     if (sql.includes("SELECT id, role, content, reasoning_details FROM")) return { rows: messages.filter((m) => m.conversation_id === params[0]).sort((a, b) => a.created_at - b.created_at) };
     return { rows: [] };
@@ -223,11 +223,13 @@ const VOICE = `data:audio/m4a;base64,${"B".repeat(800)}`;
 describe("Sommelier photos and audio", () => {
   it("sends photos and the voice message to the media model and stores them with the question", async () => {
     const db = fakeDb();
-    const complete = vi.fn<CompleteChat>().mockResolvedValue({ content: "É um Malbec de Mendoza.", reasoningDetails: [{ text: "x" }], model: "google/gemini-3.8-flash" });
+    const complete = vi.fn<CompleteChat>()
+      .mockResolvedValueOnce({ content: "(inaudível)", reasoningDetails: null, model: "google/gemini-3.8-flash" })
+      .mockResolvedValueOnce({ content: "É um Malbec de Mendoza.", reasoningDetails: [{ text: "x" }], model: "google/gemini-3.8-flash" });
     const agent = new SommelierAgent(db.pool, complete);
     const result = await agent.chat("user-1", { message: "", attachments: [{ kind: "image", dataUrl: PHOTO }, { kind: "audio", dataUrl: VOICE, durationMs: 4200 }] });
 
-    const [turns, settings] = complete.mock.calls[0];
+    const [turns, settings] = complete.mock.calls[1];
     expect(settings.model).toBe("google/gemini-3.8-flash");
     expect(settings.reasoningEnabled).toBe(false);
     const parts = turns.at(-1)!.content as ContentPart[];
@@ -239,6 +241,53 @@ describe("Sommelier photos and audio", () => {
     expect(db.attachments).toHaveLength(2);
     // Another model's reasoning is never sent back to the text model.
     expect(db.messages.find((m) => m.role === "assistant")?.reasoning_details).toBeNull();
+  });
+
+  it("transcribes the voice message first, stores the transcript and counts its tokens with the answer", async () => {
+    const db = fakeDb();
+    const complete = vi.fn<CompleteChat>()
+      .mockResolvedValueOnce({ content: "“Qual vinho combina com tilápia com castanha de caju?”", reasoningDetails: null, model: "google/gemini-3.8-flash", promptTokens: 300, completionTokens: 20, costUsd: 0.0001 })
+      .mockResolvedValueOnce({ content: "Um branco com corpo.", reasoningDetails: null, model: "google/gemini-3.8-flash", promptTokens: 900, completionTokens: 150, costUsd: 0.0004 });
+    const result = await new SommelierAgent(db.pool, complete).chat("user-1", { message: "", attachments: [{ kind: "audio", dataUrl: VOICE, durationMs: 10600 }] });
+
+    const [transcription, settings] = complete.mock.calls[0];
+    expect(String(transcription[0].content)).toContain("Transcreva literalmente");
+    expect((transcription[1].content as ContentPart[])[1]).toEqual({ type: "input_audio", input_audio: { data: "B".repeat(800), format: "m4a" } });
+    expect(settings).toMatchObject({ model: "google/gemini-3.8-flash", reasoningEnabled: false, temperature: 0 });
+    expect(db.attachments[0].transcript).toBe("Qual vinho combina com tilápia com castanha de caju?");
+    expect(result.userMessage.attachments?.[0].transcript).toBe("Qual vinho combina com tilápia com castanha de caju?");
+    expect(result.conversation.title).toBe("Qual vinho combina com tilápia com castanha de caju?");
+    // (conversation, content, reasoning, model, prompt_tokens, completion_tokens, cost_usd, ...)
+    expect(db.messages.find((m) => m.role === "assistant")!.params.slice(4, 7)).toEqual([1200, 170, 0.0005]);
+  });
+
+  it("finds the wine list of the restaurant named in the voice message (report of 30/09)", async () => {
+    const db = fakeDb();
+    const viriato = { id: "66666666-6666-4666-8666-666666666666", restaurantName: "Café Viriato", city: null, createdAt: "2026-09-29T04:19:02Z",
+      items: [{ section: null, name: "Monte Paschoal Reserva Chardonnay", producer: null, vintage: null, country: null, region: null, grapes: null, style: null, volume: null, price: 107, glassPrice: null, currency: "BRL", notes: null }] };
+    const mentioned = vi.fn(async (_user: string, text: string) => (/viriato/i.test(text) ? viriato : null));
+    const complete = vi.fn<CompleteChat>()
+      .mockResolvedValueOnce({ content: "Estou no Café Viriato, qual vinho vai com tilápia?", reasoningDetails: null, model: "m" })
+      .mockResolvedValueOnce({ content: "O Monte Paschoal Reserva Chardonnay (R$ 107,00).", reasoningDetails: null, model: "m" });
+    const result = await new SommelierAgent(db.pool, complete, { forUser: vi.fn(), mentioned }).chat("user-1", { message: "", attachments: [{ kind: "audio", dataUrl: VOICE }] });
+    expect(mentioned).toHaveBeenCalledWith("user-1", "Estou no Café Viriato, qual vinho vai com tilápia?");
+    expect(String(complete.mock.calls[1][0][0].content)).toContain("Monte Paschoal Reserva Chardonnay | garrafa R$ 107,00");
+    expect(result.wineList?.restaurantName).toBe("Café Viriato");
+  });
+
+  it("answers the voice message even when the transcription fails", async () => {
+    const db = fakeDb();
+    const complete = vi.fn<CompleteChat>()
+      .mockRejectedValueOnce(new Error("audio model down"))
+      .mockResolvedValueOnce({ content: "Um tinto leve.", reasoningDetails: null, model: "m" });
+    const result = await new SommelierAgent(db.pool, complete).chat("user-1", { message: "", attachments: [{ kind: "audio", dataUrl: VOICE }] });
+    expect(result.reply.content).toBe("Um tinto leve.");
+    expect(db.attachments[0].transcript).toBeNull();
+  });
+
+  it("puts the transcript of past voice messages in the history", () => {
+    expect(mediaNote([{ kind: "audio", transcript: "Qual vinho com tilápia?" }])).toBe('[O cliente enviou uma mensagem de voz.] Transcrição da mensagem de voz: "Qual vinho com tilápia?"');
+    expect(mediaNote([{ kind: "audio" }])).toBe("[O cliente enviou uma mensagem de voz.]");
   });
 
   it("keeps plain questions on the text model and notes past media in the history", async () => {

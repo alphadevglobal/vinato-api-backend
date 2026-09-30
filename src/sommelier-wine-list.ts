@@ -4,8 +4,8 @@ import { normalizeText } from "./catalog-matcher.js";
 /**
  * The Sommelier consults the wine lists already transcribed ("Verificação de
  * carta"): the one the user opened in the app, or the one of the restaurant named
- * in the question. Only the lists the user sent, and the ones the admin uploaded,
- * are available — the same rule as the bottle check.
+ * in the question. Available: the user's lists and every published list (not
+ * rejected, not deleted) — the same rule as the bottle check.
  */
 export type WineListItemContext = {
   section: string | null; name: string; producer: string | null; vintage: number | null; country: string | null; region: string | null;
@@ -21,18 +21,31 @@ export interface WineListLookup {
   mentioned(userId: string, text: string): Promise<WineListContext | null>;
 }
 
-// The lists the user may consult: theirs, and the ones the admin uploaded.
-const USABLE = `l.status = 'transcribed' AND (l.user_id = $1 OR (l.user_id IS NULL AND l.uploaded_by IS NOT NULL))`;
+// The lists the user may consult, as in the bottle check (WineListRepository.canUse):
+// theirs, and every published list — transcribed, not rejected by the curators, not
+// deleted. A restaurant's menu is public; who sent it never shows.
+const USABLE = `l.deleted_at IS NULL AND l.status = 'transcribed' AND (l.user_id = $1 OR l.curation_status <> 'rejected')`;
 // Enough for long menus while keeping the prompt small (about 30 tokens a wine).
 export const MAX_CONTEXT_ITEMS = 400;
 // Names too common to stand for a restaurant in a sentence ("em casa", "no bar").
 const COMMON_NAMES = new Set(["casa", "bar", "vinho", "vinhos", "adega", "cantina", "restaurante", "bistro", "cozinha", "mesa"]);
 
-/** Whether the question names the restaurant (accents, case and punctuation ignored, whole words). */
+// Kinds of place that customers leave out when they name it ("Café Viriato" → "o Viriato").
+const PLACE_KINDS = new Set(["cafe", "restaurante", "bar", "bistro", "cantina", "pizzaria", "churrascaria", "trattoria", "osteria", "boteco", "enoteca", "emporio", "padaria"]);
+
+/**
+ * Whether the question names the restaurant (accents, case and punctuation ignored,
+ * whole words): the full name, or the name without the kind of place in front when
+ * what is left is distinctive enough ("restaurante Viriato" names "Café Viriato").
+ */
 export function namesRestaurant(text: string, restaurantName: string) {
   const name = normalizeText(restaurantName).trim();
-  if (name.length < 4 || COMMON_NAMES.has(name)) return false;
-  return ` ${normalizeText(text).trim()} `.includes(` ${name} `);
+  const words = name.split(" ");
+  const withoutKind = PLACE_KINDS.has(words[0]) ? words.slice(1).join(" ") : "";
+  const said = ` ${normalizeText(text).trim()} `;
+  const full = name.length >= 4 && !COMMON_NAMES.has(name) && said.includes(` ${name} `);
+  const short = withoutKind.length >= 5 && !COMMON_NAMES.has(withoutKind) && said.includes(` ${withoutKind} `);
+  return full || short;
 }
 
 export class SommelierWineLists implements WineListLookup {

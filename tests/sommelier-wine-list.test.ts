@@ -24,18 +24,18 @@ describe("wine list lookup for the Sommelier (migrations 017 and 019)", () => {
     db = new PGlite();
     await db.exec(`create table catalog_wines (id uuid primary key default gen_random_uuid(), display_name text not null, images jsonb not null default '[]', updated_at timestamptz not null default now());
       create table unlisted_wine_scans (id uuid primary key default gen_random_uuid(), unlisted_code text not null unique, status text not null default 'needs_registration', image_data_url text not null, extracted_data jsonb not null default '{}', user_id uuid, registered_wine_id uuid references catalog_wines(id), created_at timestamptz not null default now());`);
-    for (const name of ["014_unlisted_scan_dedup.sql", "015_wine_photo_pool.sql", "017_wine_lists.sql", "019_admin_wine_lists.sql"]) await db.exec(read(name));
+    for (const name of ["014_unlisted_scan_dedup.sql", "015_wine_photo_pool.sql", "017_wine_lists.sql", "019_admin_wine_lists.sql", "020_wine_list_management.sql"]) await db.exec(read(name));
     lookup = new SommelierWineLists({ query: (sql: string, params?: unknown[]) => db.query(sql, params) } as unknown as pg.Pool);
   });
 
   async function restaurant(name: string, city = "São Paulo") {
     return (await db.query<{ id: string }>(`insert into restaurants (name, name_key, city) values ($1, lower($1), $2) returning id`, [name, city])).rows[0].id;
   }
-  async function list(options: { restaurantId?: string | null; name?: string | null; user?: string | null; admin?: string | null; status?: string; createdAt?: string; items?: string[] }) {
+  async function list(options: { restaurantId?: string | null; name?: string | null; user?: string | null; admin?: string | null; status?: string; createdAt?: string; items?: string[]; curation?: string; deleted?: boolean }) {
     const id = (await db.query<{ id: string }>(
-      `insert into wine_lists (restaurant_id, user_id, uploaded_by, restaurant_name, source, status, item_count, created_at)
-       values ($1, $2, $3, $4, 'photo', $5, $6, coalesce($7::timestamptz, now())) returning id`,
-      [options.restaurantId ?? null, options.user === undefined ? USER : options.user, options.admin ?? null, options.name ?? null, options.status ?? "transcribed", options.items?.length ?? 0, options.createdAt ?? null],
+      `insert into wine_lists (restaurant_id, user_id, uploaded_by, restaurant_name, source, status, item_count, created_at, curation_status, deleted_at)
+       values ($1, $2, $3, $4, 'photo', $5, $6, coalesce($7::timestamptz, now()), $8, case when $9 then now() end) returning id`,
+      [options.restaurantId ?? null, options.user === undefined ? USER : options.user, options.admin ?? null, options.name ?? null, options.status ?? "transcribed", options.items?.length ?? 0, options.createdAt ?? null, options.curation ?? "pending", options.deleted ?? false],
     )).rows[0].id;
     for (const [position, name] of (options.items ?? []).entries()) {
       await db.query(`insert into wine_list_items (wine_list_id, position, section, name, price, glass_price) values ($1, $2, 'Tintos', $3, $4, 45)`, [id, position, name, 100 + position]);
@@ -67,14 +67,28 @@ describe("wine list lookup for the Sommelier (migrations 017 and 019)", () => {
     expect(found!.items.map((entry) => [entry.name, entry.price, entry.glassPrice, entry.currency])).toEqual([["Catena Malbec", 100, 45, "BRL"], ["Chandon Brut", 101, 45, "BRL"]]);
   });
 
-  it("opens the lists the admin uploaded, but never another user's list or a failed one", async () => {
+  it("opens every published list (also sent by other users or the admin), never a rejected, deleted or failed one", async () => {
     const theirs = await list({ user: OTHER, name: "Tasca", items: ["Alamos"] });
-    const official = await list({ user: null, admin: ADMIN, name: "Tasca", items: ["Alamos"] });
+    const approved = await list({ user: OTHER, name: "Tasca", items: ["Alamos"], curation: "approved" });
+    const official = await list({ user: null, admin: ADMIN, name: "Tasca", items: ["Alamos"], curation: "approved" });
+    const rejected = await list({ user: OTHER, name: "Tasca", curation: "rejected" });
+    const deleted = await list({ user: OTHER, name: "Tasca", deleted: true });
     const failed = await list({ name: "Tasca", status: "failed" });
-    expect(await lookup.forUser(USER, theirs)).toBeNull();
-    expect(await lookup.forUser(USER, official)).toMatchObject({ id: official });
-    expect(await lookup.forUser(USER, failed)).toBeNull();
+    for (const id of [theirs, approved, official]) expect(await lookup.forUser(USER, id)).toMatchObject({ id });
+    for (const id of [rejected, deleted, failed]) expect(await lookup.forUser(USER, id)).toBeNull();
+    // The user's own list opens even when the curators rejected it.
+    expect(await lookup.forUser(USER, await list({ name: "Tasca", curation: "rejected" }))).not.toBeNull();
     expect(await lookup.forUser(USER, "not-a-uuid")).toBeNull();
+  });
+
+  it("finds the Café Viriato list another user sent when the customer says where they are (report of 30/09)", async () => {
+    // Production: the approved list was sent by another user, and "Viriato Sul" was rejected.
+    const cafe = await list({ user: OTHER, name: "Café Viriato", curation: "approved", items: ["Monte Paschoal Reserva Chardonnay", "Arte Malbec Rosé"] });
+    await list({ user: OTHER, name: "Viriato Sul", curation: "rejected", items: ["Outro"] });
+    const found = await lookup.mentioned(USER, "Estou aqui no café Viriato");
+    expect(found?.id).toBe(cafe);
+    expect((await lookup.mentioned(USER, "Ô meu sommelier, eu tô aqui no restaurante Viriato e eu pedi uma tilápia"))?.id).toBe(cafe);
+    expect(found?.items.map((entry) => entry.name)).toEqual(["Monte Paschoal Reserva Chardonnay", "Arte Malbec Rosé"]);
   });
 
   it("finds the newest list of the restaurant named in the question", async () => {
@@ -87,10 +101,10 @@ describe("wine list lookup for the Sommelier (migrations 017 and 019)", () => {
     expect(await lookup.mentioned(USER, "O que combina com risoto?")).toBeNull();
   });
 
-  it("prefers the longest name and ignores restaurants of other users", async () => {
+  it("prefers the longest name and ignores rejected lists of other users", async () => {
     await list({ name: "Fasano", items: ["A"] });
     const rio = await list({ name: "Fasano Rio", items: ["B"] });
-    await list({ user: OTHER, name: "Tasca Nova", items: ["C"] });
+    await list({ user: OTHER, name: "Tasca Nova", items: ["C"], curation: "rejected" });
     expect((await lookup.mentioned(USER, "estou no fasano rio"))?.id).toBe(rio);
     expect(await lookup.mentioned(USER, "estou na Tasca Nova")).toBeNull();
   });
@@ -103,6 +117,13 @@ describe("namesRestaurant", () => {
     expect(namesRestaurant("Vou ao Mocotozinho", "Mocotó")).toBe(false);
     expect(namesRestaurant("vou comer em casa", "Casa")).toBe(false);
     expect(namesRestaurant("Estou na Casa do Porco", "Casa do Porco")).toBe(true);
+    // Customers leave out the kind of place (the Café Viriato voice message of 30/09).
+    expect(namesRestaurant("eu tô aqui no restaurante Viriato e eu pedi uma tilápia", "Café Viriato")).toBe(true);
+    expect(namesRestaurant("Jantar no Fasano", "Restaurante Fasano")).toBe(true);
+    expect(namesRestaurant("quero um café depois do almoço", "Café Viriato")).toBe(false);
+    expect(namesRestaurant("tem vinho no bar?", "Bar Brahma")).toBe(false);
+    expect(namesRestaurant("quero carne de porco", "Casa do Porco")).toBe(false);
+    expect(namesRestaurant("fui no dos", "Bar Dos")).toBe(false); // too short without the kind
   });
 });
 

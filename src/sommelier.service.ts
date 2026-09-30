@@ -25,7 +25,7 @@ export type ChatTurn = { role: "system" | "user" | "assistant"; content: string 
 export type Completion = { content: string; reasoningDetails: unknown; model: string; promptTokens?: number; completionTokens?: number; costUsd?: number };
 export type CompleteChat = (messages: ChatTurn[], settings: SommelierConfig) => Promise<Completion>;
 
-export type AttachmentInfo = { id: string; kind: "image" | "audio"; mimeType: string; durationMs: number | null };
+export type AttachmentInfo = { id: string; kind: "image" | "audio"; mimeType: string; durationMs: number | null; transcript?: string | null };
 export type SommelierMessage = { id: string; role: "user" | "assistant"; content: string; createdAt: string; attachments?: AttachmentInfo[] };
 /** A photo or a voice message sent with the question, as a data URL (base64). */
 export type AttachmentInput = { kind: "image" | "audio"; dataUrl: string; durationMs?: number };
@@ -88,12 +88,19 @@ export function parseAttachments(value: unknown): Array<AttachmentInput & { mime
 }
 
 /** How a message with media appears in the history sent to the model (the media itself is sent only once). */
-export function mediaNote(attachments: Array<{ kind: string }>) {
+export function mediaNote(attachments: Array<{ kind: string; transcript?: string | null }>) {
   const images = attachments.filter((item) => item.kind === "image").length;
-  const audio = attachments.some((item) => item.kind === "audio");
+  const audio = attachments.find((item) => item.kind === "audio");
   const parts = [images ? (images === 1 ? "uma foto" : `${images} fotos`) : "", audio ? "uma mensagem de voz" : ""].filter(Boolean);
-  return parts.length ? `[O cliente enviou ${parts.join(" e ")}.]` : "";
+  if (!parts.length) return "";
+  // What the customer said, so the next answers (text model) know the question.
+  return `[O cliente enviou ${parts.join(" e ")}.]${audio?.transcript ? ` Transcrição da mensagem de voz: "${audio.transcript}"` : ""}`;
 }
+
+// The voice message is transcribed first: the transcript finds the restaurant the
+// customer names (its wine list), stays in the history and shows in the admin logs.
+const TRANSCRIPTION_PROMPT = "Transcreva literalmente a mensagem de voz do cliente, no idioma falado. Responda somente com a transcrição, sem comentários nem aspas. Se não houver fala compreensível, responda apenas: (inaudível)";
+const MAX_TRANSCRIPT_LENGTH = 2000;
 const MAX_MESSAGE_LENGTH = 2000;
 const BURST_LIMIT_PER_MINUTE = 6;
 export const GUARDED_REPLY = "Esse não é o meu trabalho: sou o sommelier do VINATO e só converso sobre vinhos. Posso te ajudar a escolher um vinho ou uma harmonização?";
@@ -227,12 +234,12 @@ export class SommelierAgent {
     const byMessage = new Map<string, AttachmentInfo[]>();
     if (!messageIds.length) return byMessage;
     const rows = (await this.pool.query(
-      `SELECT id, message_id, kind, mime_type, duration_ms FROM sommelier_attachments WHERE message_id = ANY($1::uuid[]) ORDER BY created_at ASC`,
+      `SELECT id, message_id, kind, mime_type, duration_ms, transcript FROM sommelier_attachments WHERE message_id = ANY($1::uuid[]) ORDER BY created_at ASC`,
       [messageIds],
     ).catch(() => ({ rows: [] as Record<string, unknown>[] }))).rows;
     for (const row of rows) {
       const list = byMessage.get(String(row.message_id)) ?? [];
-      list.push({ id: String(row.id), kind: row.kind as "image" | "audio", mimeType: String(row.mime_type), durationMs: row.duration_ms == null ? null : Number(row.duration_ms) });
+      list.push({ id: String(row.id), kind: row.kind as "image" | "audio", mimeType: String(row.mime_type), durationMs: row.duration_ms == null ? null : Number(row.duration_ms), transcript: row.transcript == null ? null : String(row.transcript) });
       byMessage.set(String(row.message_id), list);
     }
     return byMessage;
@@ -287,7 +294,11 @@ export class SommelierAgent {
     }
 
     const existing = input.conversationId ? await this.ownedConversation(userId, input.conversationId) : null;
-    const wineList = await this.wineListFor(userId, text, input.wineListId, existing?.wineListId);
+    const voice = media.find((item) => item.kind === "audio");
+    const transcription = voice ? await this.transcribe(voice, settings) : null;
+    const transcript = transcription?.text ?? null;
+    // A restaurant named out loud counts like a typed one.
+    const wineList = await this.wineListFor(userId, [text, transcript].filter(Boolean).join(" "), input.wineListId, existing?.wineListId);
     const history = existing ? (await this.pool.query(
       `SELECT id, role, content, reasoning_details FROM (
          SELECT id, role, content, reasoning_details, created_at FROM sommelier_messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2
@@ -334,7 +345,7 @@ export class SommelierAgent {
       await client.query("BEGIN");
       conversation = existing ?? (await client.query(
         `INSERT INTO sommelier_conversations (user_id, title, wine_list_id) VALUES ($1, $2, $3) RETURNING id, title, created_at AS "createdAt", updated_at AS "updatedAt", wine_list_id AS "wineListId"`,
-        [userId, conversationTitle(text, media, wineList), wineList?.id ?? null],
+        [userId, conversationTitle(text, media, wineList, transcript), wineList?.id ?? null],
       )).rows[0];
       userMessage = (await client.query(
         `INSERT INTO sommelier_messages (conversation_id, role, content, created_at) VALUES ($1, 'user', $2, now() - interval '1 millisecond') RETURNING id, role, content, created_at AS "createdAt"`,
@@ -343,16 +354,17 @@ export class SommelierAgent {
       const stored: AttachmentInfo[] = [];
       for (const item of media) {
         const saved = (await client.query(
-          `INSERT INTO sommelier_attachments (message_id, kind, mime_type, data_url, duration_ms) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-          [userMessage.id, item.kind, item.mimeType, item.dataUrl, item.durationMs ?? null],
+          `INSERT INTO sommelier_attachments (message_id, kind, mime_type, data_url, duration_ms, transcript) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+          [userMessage.id, item.kind, item.mimeType, item.dataUrl, item.durationMs ?? null, item === voice ? transcript : null],
         )).rows[0];
-        stored.push({ id: String(saved.id), kind: item.kind, mimeType: item.mimeType, durationMs: item.durationMs ?? null });
+        stored.push({ id: String(saved.id), kind: item.kind, mimeType: item.mimeType, durationMs: item.durationMs ?? null, ...(item === voice ? { transcript } : {}) });
       }
       if (stored.length) userMessage = { ...userMessage, attachments: stored };
       reply = (await client.query(
         `INSERT INTO sommelier_messages (conversation_id, role, content, reasoning_details, model, prompt_tokens, completion_tokens, cost_usd, duration_ms, wine_list_id)
          VALUES ($1, 'assistant', $2, $3::jsonb, $4, $5, $6, $7, $8, $9) RETURNING id, role, content, created_at AS "createdAt"`,
-        [conversation.id, guarded.content, guarded.blocked || withMedia || completion.reasoningDetails == null ? null : JSON.stringify(completion.reasoningDetails), completion.model, completion.promptTokens ?? null, completion.completionTokens ?? null, completion.costUsd ?? null, durationMs, wineList?.id ?? null],
+        [conversation.id, guarded.content, guarded.blocked || withMedia || completion.reasoningDetails == null ? null : JSON.stringify(completion.reasoningDetails), completion.model,
+          sumUsage(completion.promptTokens, transcription?.promptTokens), sumUsage(completion.completionTokens, transcription?.completionTokens), sumUsage(completion.costUsd, transcription?.costUsd), durationMs, wineList?.id ?? null],
       )).rows[0];
       // The conversation keeps consulting the list of this turn in the next questions.
       await client.query(`UPDATE sommelier_conversations SET updated_at = now(), wine_list_id = coalesce($2, wine_list_id) WHERE id = $1`, [conversation.id, wineList?.id ?? null]);
@@ -369,6 +381,21 @@ export class SommelierAgent {
     return { conversation, userMessage, reply, remainingToday: Math.max(0, settings.dailyMessageLimit - sentToday - 1), wineList: consulted };
   }
 
+  /** The transcript of a voice message (null when the model could not transcribe it: the answer goes on). */
+  private async transcribe(voice: { base64: string; format?: string }, settings: SommelierConfig) {
+    try {
+      const reply = await this.complete([
+        { role: "system", content: TRANSCRIPTION_PROMPT },
+        { role: "user", content: [{ type: "text", text: "Transcreva esta mensagem de voz." }, { type: "input_audio", input_audio: { data: voice.base64, format: voice.format! } }] },
+      ], { ...settings, model: settings.mediaModel, reasoningEnabled: false, temperature: 0, maxOutputTokens: 800 });
+      const text = reply.content.trim().replace(/^["“]|["”]$/g, "").slice(0, MAX_TRANSCRIPT_LENGTH);
+      return { text: text || null, promptTokens: reply.promptTokens, completionTokens: reply.completionTokens, costUsd: reply.costUsd };
+    } catch (error) {
+      console.warn("[sommelier] voice transcription failed", (error as Error).message);
+      return null;
+    }
+  }
+
   private async ownedConversation(userId: string, conversationId: string): Promise<SommelierConversation> {
     if (!/^[0-9a-f-]{36}$/i.test(conversationId)) throw notFound("Conversa não encontrada.");
     const row = (await this.pool.query(
@@ -380,7 +407,13 @@ export class SommelierAgent {
   }
 }
 
-function conversationTitle(text: string, media: Array<{ kind: string }>, wineList?: WineListContext | null) {
+/** Tokens and cost of the answer plus the transcription (null when neither reported them). */
+function sumUsage(answer: number | undefined, transcription: number | undefined) {
+  return answer === undefined && transcription === undefined ? null : (answer ?? 0) + (transcription ?? 0);
+}
+
+function conversationTitle(text: string, media: Array<{ kind: string }>, wineList?: WineListContext | null, transcript?: string | null) {
+  if (!text && transcript && transcript !== "(inaudível)") text = transcript;
   if (!text && wineList?.restaurantName) return `Carta de ${wineList.restaurantName}`;
   if (text) return text.length > 60 ? `${text.slice(0, 57)}...` : text;
   return media.some((item) => item.kind === "audio") ? "Mensagem de voz" : "Foto para o Sommelier";
