@@ -2,11 +2,12 @@ import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 import { createApp } from "../src/app.js";
+import type { WineListContext, WineListLookup } from "../src/sommelier-wine-list.js";
 import { GUARDED_REPLY, SommelierAgent, guardReply, mediaNote, parseAttachments, type ChatTurn, type CompleteChat, type ContentPart } from "../src/sommelier.service.js";
 
 // Minimal in-memory stand-in for the three sommelier tables.
 function fakeDb(sentToday = 0) {
-  const conversations: Array<{ id: string; user_id: string; title: string }> = [];
+  const conversations: Array<{ id: string; user_id: string; title: string; wineListId: string | null }> = [];
   const messages: Array<{ id: string; conversation_id: string; role: string; content: string; reasoning_details: unknown; created_at: number; params: unknown[] }> = [];
   const attachments: Array<Record<string, unknown> & { message_id: string }> = [];
   let clock = 0;
@@ -14,8 +15,9 @@ function fakeDb(sentToday = 0) {
     if (sql.includes("FROM sommelier_agent_config")) return { rows: [{ model: "deepseek/deepseek-v3.2", media_model: "google/gemini-3.8-flash", system_prompt: "REGRAS", reasoning_enabled: true, temperature: "0.7", max_output_tokens: 1200, history_messages: 20, daily_message_limit: 2 }] };
     if (sql.includes("interval '1 minute'")) return { rows: [{ n: 0 }] };
     if (sql.includes("count(*)::int AS n")) return { rows: [{ n: sentToday }] };
-    if (sql.startsWith("INSERT INTO sommelier_conversations")) { const row = { id: `00000000-0000-0000-0000-00000000000${conversations.length + 1}`, user_id: String(params[0]), title: String(params[1]) }; conversations.push(row); return { rows: [row] }; }
-    if (sql.includes("FROM sommelier_conversations WHERE id = $1 AND user_id = $2")) return { rows: conversations.filter((c) => c.id === params[0] && c.user_id === params[1]) };
+    if (sql.startsWith("INSERT INTO sommelier_conversations")) { const row = { id: `00000000-0000-0000-0000-00000000000${conversations.length + 1}`, user_id: String(params[0]), title: String(params[1]), wineListId: (params[2] ?? null) as string | null }; conversations.push(row); return { rows: [{ ...row }] }; }
+    if (sql.startsWith("UPDATE sommelier_conversations")) { const row = conversations.find((c) => c.id === params[0]); if (row && params[1]) row.wineListId = String(params[1]); return { rows: [] }; }
+    if (sql.includes("FROM sommelier_conversations WHERE id = $1 AND user_id = $2")) return { rows: conversations.filter((c) => c.id === params[0] && c.user_id === params[1]).map((c) => ({ ...c })) };
     if (sql.trim().startsWith("INSERT INTO sommelier_messages")) {
       const assistant = sql.includes("'assistant'");
       const row = { id: `m${messages.length + 1}`, conversation_id: String(params[0]), role: assistant ? "assistant" : "user", content: String(params[1]), reasoning_details: assistant && params[2] ? JSON.parse(String(params[2])) : null, created_at: ++clock, params };
@@ -99,8 +101,92 @@ describe("Sommelier routes", () => {
   it("answers Premium members", async () => {
     const { app, chat } = appFor("premium");
     const response = await request(app).post("/sommelier/chat").set("Authorization", "Bearer token").send({ message: "Oi", conversationId: "" }).expect(200);
-    expect(chat).toHaveBeenCalledWith("user-1", { conversationId: undefined, message: "Oi", attachments: undefined });
+    expect(chat).toHaveBeenCalledWith("user-1", { conversationId: undefined, message: "Oi", attachments: undefined, wineListId: undefined });
     expect(response.body.reply.content).toBe("Olá");
+  });
+});
+
+describe("Sommelier with a wine list", () => {
+  const LIST = "44444444-4444-4444-8444-444444444444";
+  const fasano: WineListContext = {
+    id: LIST, restaurantName: "Fasano", city: "São Paulo", createdAt: "2026-09-29T20:00:00Z",
+    items: [
+      { section: "Tintos", name: "Catena Zapata Malbec Argentino", producer: null, vintage: 2020, country: "Argentina", region: "Mendoza", grapes: "Malbec", style: null, volume: null, price: 489.9, glassPrice: null, currency: "BRL", notes: null },
+      { section: "Brancos", name: "Pazo de Señorans Albariño", producer: null, vintage: 2023, country: "Espanha", region: "Rías Baixas", grapes: "Albariño", style: null, volume: null, price: 390, glassPrice: 62, currency: "BRL", notes: null },
+    ],
+  };
+  const lookup = (overrides: Partial<WineListLookup> = {}) => ({
+    forUser: vi.fn(async (_user: string, id: string) => (id === LIST ? fasano : null)),
+    mentioned: vi.fn(async (_user: string, text: string) => (/fasano/i.test(text) ? fasano : null)),
+    ...overrides,
+  });
+  const systemOf = (call: unknown[]) => String((call[0] as ChatTurn[])[0].content);
+
+  it("answers from the wine list the user opened and keeps it for the next questions", async () => {
+    const db = fakeDb();
+    const wineLists = lookup();
+    const complete = vi.fn<CompleteChat>(async () => ({ content: "Peça o Albariño.", reasoningDetails: null, model: "deepseek/deepseek-v3.2" }));
+    const agent = new SommelierAgent(db.pool, complete, wineLists);
+
+    const first = await agent.chat("user-1", { message: "Vou pedir um polvo grelhado. Qual vinho desta carta?", wineListId: LIST });
+    expect(wineLists.forUser).toHaveBeenCalledWith("user-1", LIST);
+    const system = systemOf(complete.mock.calls[0]);
+    expect(system.startsWith("REGRAS\n")).toBe(true);
+    expect(system).toContain("Carta de vinhos consultada: Fasano, São Paulo");
+    expect(system).toContain("Pazo de Señorans Albariño 2023 | Rías Baixas, Espanha | Albariño | garrafa R$ 390,00 | taça R$ 62,00");
+    expect(system).toContain("Recomende somente vinhos desta carta");
+    expect(first.wineList).toEqual({ id: LIST, restaurantName: "Fasano", city: "São Paulo", itemCount: 2 });
+    expect(complete.mock.calls[0][1]).toMatchObject({ model: "deepseek/deepseek-v3.2", reasoningEnabled: true, reasoningEffort: "low" });
+    expect(db.conversations[0].wineListId).toBe(LIST);
+    // (conversation, content, reasoning, model, prompt, completion, cost, duration, wine_list_id)
+    expect(db.messages.find((message) => message.role === "assistant")!.params[8]).toBe(LIST);
+
+    // A follow-up without the id still consults the same list.
+    const second = await agent.chat("user-1", { conversationId: first.conversation.id, message: "E para a sobremesa?" });
+    expect(systemOf(complete.mock.calls[1])).toContain("Carta de vinhos consultada: Fasano");
+    expect(second.wineList?.id).toBe(LIST);
+  });
+
+  it("consults the list of the restaurant named in a free question", async () => {
+    const db = fakeDb();
+    const complete = vi.fn<CompleteChat>(async () => ({ content: "O Catena.", reasoningDetails: null, model: "deepseek/deepseek-v3.2" }));
+    const result = await new SommelierAgent(db.pool, complete, lookup()).chat("user-1", { message: "Estou no Fasano, o que peço com picanha?" });
+    expect(systemOf(complete.mock.calls[0])).toContain("Catena Zapata Malbec Argentino 2020");
+    expect(result.wineList?.restaurantName).toBe("Fasano");
+  });
+
+  it("answers without a list when the question names no restaurant", async () => {
+    const db = fakeDb();
+    const complete = vi.fn<CompleteChat>(async () => ({ content: "Um tinto leve.", reasoningDetails: null, model: "deepseek/deepseek-v3.2" }));
+    const result = await new SommelierAgent(db.pool, complete, lookup()).chat("user-1", { message: "O que combina com pizza?" });
+    expect(systemOf(complete.mock.calls[0])).toBe("REGRAS");
+    expect(complete.mock.calls[0][1]).not.toHaveProperty("reasoningEffort");
+    expect(result.wineList).toBeNull();
+    expect(db.conversations[0].wineListId).toBeNull();
+  });
+
+  it("refuses a list the user may not use, before asking the model or storing anything", async () => {
+    const db = fakeDb();
+    const complete = vi.fn<CompleteChat>();
+    const agent = new SommelierAgent(db.pool, complete, lookup());
+    await expect(agent.chat("user-1", { message: "Qual vinho?", wineListId: "55555555-5555-4555-8555-555555555555" })).rejects.toMatchObject({ statusCode: 404 });
+    expect(complete).not.toHaveBeenCalled();
+    expect(db.conversations).toHaveLength(0);
+  });
+
+  it("titles a conversation opened from the list without text", async () => {
+    const db = fakeDb();
+    const agent = new SommelierAgent(db.pool, async () => ({ content: "Veja a carta.", reasoningDetails: null, model: "m" }), lookup());
+    await agent.chat("user-1", { message: "", wineListId: LIST, attachments: [{ kind: "image", dataUrl: "data:image/jpeg;base64,AAAA" }] });
+    expect(db.conversations[0].title).toBe("Carta de Fasano");
+  });
+
+  it("sends the list id from the app to the agent", async () => {
+    const chat = vi.fn(async () => ({ conversation: { id: "c1" }, reply: { content: "Olá" }, wineList: null }));
+    const accountRepository = { getUser: vi.fn(async () => ({ id: "user-1", email: "a@b.c", displayName: "A", role: "user", plan: "premium", planExpiresAt: null, status: "active", avatarUrl: null })) };
+    const app = createApp({ wineRepository: {} as never, wineScanner: {} as never, accountRepository: accountRepository as never, sommelier: { chat } as never });
+    await request(app).post("/sommelier/chat").set("Authorization", "Bearer token").send({ message: "Com polvo?", wineListId: LIST }).expect(200);
+    expect(chat).toHaveBeenCalledWith("user-1", { conversationId: undefined, message: "Com polvo?", attachments: undefined, wineListId: LIST });
   });
 });
 
@@ -205,3 +291,25 @@ describe("Sommelier attachments route", () => {
     await request(appWith(null).app).get("/sommelier/attachments/a1").set("Authorization", "Bearer t").expect(404);
   });
 });
+
+describe("OpenRouter request of the Sommelier", () => {
+  it("limits the reasoning effort when asked, and keeps it unbounded otherwise", async () => {
+    const { openRouterChat } = await import("../src/sommelier.service.js");
+    const { config } = await import("../src/config.js");
+    const original = config.sommelierApiKey;
+    Object.assign(config, { sommelierApiKey: "k" });
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const settings = { model: "m", systemPrompt: "", reasoningEnabled: true, temperature: 0.7, maxOutputTokens: 100, historyMessages: 5, dailyMessageLimit: 5, mediaModel: "v" };
+      await openRouterChat([{ role: "user", content: "oi" }], { ...settings, reasoningEffort: "low" });
+      await openRouterChat([{ role: "user", content: "oi" }], settings);
+      const bodies = fetchMock.mock.calls.map((call) => JSON.parse(String((call as unknown as [string, RequestInit])[1].body)));
+      expect(bodies.map((body) => body.reasoning)).toEqual([{ effort: "low" }, { enabled: true }]);
+    } finally {
+      vi.unstubAllGlobals();
+      Object.assign(config, { sommelierApiKey: original });
+    }
+  });
+});
+

@@ -509,7 +509,9 @@ export function createApp(dependencies: AppDependencies) {
       requirePremium(user);
       const message = typeof req.body?.message === "string" ? req.body.message : "";
       const conversationId = typeof req.body?.conversationId === "string" && req.body.conversationId ? req.body.conversationId : undefined;
-      res.json(await sommelier().chat(user.id, { conversationId, message, attachments: req.body?.attachments }));
+      // The wine list the user opened in the app ("Harmonizar com o Sommelier").
+      const wineListId = typeof req.body?.wineListId === "string" && req.body.wineListId ? req.body.wineListId : undefined;
+      res.json(await sommelier().chat(user.id, { conversationId, message, attachments: req.body?.attachments, wineListId }));
     }),
   );
 

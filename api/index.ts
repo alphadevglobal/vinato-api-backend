@@ -2,6 +2,7 @@ import { createApp } from "../src/app.js";
 import { OfferRepository } from "../src/offers.repository.js";
 import { ReviewRepository } from "../src/reviews.repository.js";
 import { SommelierAgent } from "../src/sommelier.service.js";
+import { SommelierWineLists } from "../src/sommelier-wine-list.js";
 import { pool } from "../src/db.js";
 import { OpenRouterWineScanner } from "../src/scanner.service.js";
 import { PgWineRepository } from "../src/wines.repository.js";
@@ -19,7 +20,7 @@ const app = createApp({
   wineScanner: new OpenRouterWineScanner(aiModelSettings),
   accountRepository: new AccountRepository(pool),
   scanAudit: new PgScanAuditRepository(pool),
-  sommelier: new SommelierAgent(pool),
+  sommelier: new SommelierAgent(pool, undefined, new SommelierWineLists(pool)),
   reviews: new ReviewRepository(pool),
   offers: new OfferRepository(pool),
   adminSessions: new AdminSessions(pool),
