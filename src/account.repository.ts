@@ -145,6 +145,27 @@ export class AccountRepository {
     return result.rows[0] ? mapUser(result.rows[0]) : null;
   }
 
+  /**
+   * The user deletes their own account (App Store guideline 5.1.1(v)). Everything tied
+   * to app_users goes with it (sessions, cellar, favorites, history, Sommelier
+   * conversations; the database cascades and the audit trigger logs the deletion).
+   * The legacy login row goes too, so the account cannot come back at the next login.
+   * Team accounts are managed in the panel and cannot be deleted here.
+   */
+  async deleteAccount(userId: string) {
+    const row = (await this.pool.query(`SELECT role, email::text AS email FROM app_users WHERE id = $1`, [userId])).rows[0];
+    if (!row) return false;
+    if (isTeamAccount(row.role, row.email)) throw new Error("PROTECTED_ACCOUNT");
+    const deleted = await this.pool.query(`DELETE FROM app_users WHERE id = $1`, [userId]);
+    if (!deleted.rowCount) return false;
+    // Only an app customer's legacy login: panel users (admins) live in the same tables.
+    // Separate statements: a missing legacy table must never undo the deletion above.
+    const customer = `EXISTS (SELECT 1 FROM users WHERE id = $1 AND lower(role::text) NOT IN ('admin', 'super_admin', 'owner', 'editor'))`;
+    await this.pool.query(`DELETE FROM password_credentials WHERE user_id = $1 AND ${customer}`, [userId]).catch(() => undefined);
+    await this.pool.query(`DELETE FROM users WHERE id = $1 AND lower(role::text) NOT IN ('admin', 'super_admin', 'owner', 'editor')`, [userId]).catch(() => undefined);
+    return true;
+  }
+
   async logout(token: string) {
     await this.pool.query(`DELETE FROM user_sessions WHERE token_hash = $1`, [tokenHash(token)]);
   }
@@ -492,4 +513,10 @@ function formatGrapes(value: unknown) {
     const percentage = typeof grape.percentage === "number" || typeof grape.percentage === "string" ? String(grape.percentage) : "";
     return name ? `${percentage ? `${percentage}% ` : ""}${name}` : "";
   }).filter(Boolean).join(", ");
+}
+
+/** Accounts of the VINATO team: managed in the panel, never deleted from the app. */
+export function isTeamAccount(role: unknown, email: unknown) {
+  const normalized = String(role ?? "").toLowerCase();
+  return ["admin", "super_admin", "owner"].includes(normalized) || String(email ?? "").toLowerCase() === "contato@vinatoapp.com";
 }

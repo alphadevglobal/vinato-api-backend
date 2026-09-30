@@ -160,6 +160,22 @@ export function createApp(dependencies: AppDependencies) {
     }),
   );
 
+  // "Excluir minha conta" in the app (App Store guideline 5.1.1(v)). The body must confirm it.
+  app.delete(
+    "/me",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      if (req.body?.confirm !== true) throw badRequest("Confirme a exclusão da conta.");
+      try {
+        await accounts.deleteAccount(user.id);
+      } catch (error) {
+        if ((error as Error).message === "PROTECTED_ACCOUNT") throw new HttpError(403, "Contas da equipe VINATO são excluídas pelo painel administrativo.", "Forbidden");
+        throw error;
+      }
+      res.status(204).send();
+    }),
+  );
+
   app.patch(
     "/me/avatar",
     asyncHandler(async (req, res) => {
