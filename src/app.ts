@@ -564,7 +564,14 @@ export function createApp(dependencies: AppDependencies) {
       const prompt = typeof req.body?.prompt === "string" ? req.body.prompt : "";
       if (!model || !prompt) throw badRequest("Informe o modelo e o prompt.");
       if (prompt.length > 20_000) throw badRequest("Prompt muito longo.");
-      const reply = await requestJson(model, [{ type: "text", text: prompt }], { maxTokens: 6000, timeoutMs: 55_000, title: "Vinato curadoria", webSearch: req.body?.web === true });
+      // "Não cadastrados": the label photo the app sent goes with the facts, for the model to read it.
+      const image = req.body?.imageDataUrl;
+      if (image !== undefined && image !== null && (typeof image !== "string" || !/^data:image\/(jpeg|jpg|png|webp|heic|heif);base64,[A-Za-z0-9+/=]+$/.test(image) || image.length > 3_500_000)) {
+        throw badRequest("Foto do rótulo inválida.");
+      }
+      const content: Parameters<typeof requestJson>[1] = [{ type: "text", text: prompt }];
+      if (typeof image === "string") content.push({ type: "image_url", image_url: { url: image } });
+      const reply = await requestJson(model, content, { maxTokens: 6000, timeoutMs: 55_000, title: "Vinato curadoria", webSearch: req.body?.web === true });
       if (!reply.ok) {
         const message = reply.error === "answer_cut_by_token_limit"
           ? "A resposta do modelo foi cortada pelo limite de tokens (raciocínio longo). Tente outro modelo ou sem pesquisa na web."

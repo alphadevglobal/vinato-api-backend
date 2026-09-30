@@ -51,6 +51,18 @@ describe("POST /admin/ai/enrich", () => {
     expect(JSON.parse(String(init.body))).toMatchObject({ model: "anthropic/claude-sonnet-5.5", plugins: [{ id: "web", max_results: 3 }] });
   });
 
+  it("sends the label photo along with the prompt, and refuses anything that is not an image", async () => {
+    process.env.OPENROUTER_API_KEY = "server-key";
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: '{"displayName":"X"}' } }] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const photo = "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    await request(appWith(true)).post("/admin/ai/enrich").set("Authorization", "Bearer admin-token").send({ model: "m", prompt: "Leia o rótulo", imageDataUrl: photo }).expect(200);
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).messages[0].content).toEqual([{ type: "text", text: "Leia o rótulo" }, { type: "image_url", image_url: { url: photo } }]);
+    await request(appWith(true)).post("/admin/ai/enrich").set("Authorization", "Bearer admin-token").send({ model: "m", prompt: "p", imageDataUrl: "https://evil.example/x.jpg" }).expect(400);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects requests without an admin session", async () => {
     await request(appWith(true)).post("/admin/ai/enrich").send({ model: "m", prompt: "p" }).expect(401);
     await request(appWith(true)).post("/admin/ai/enrich").set("Authorization", "Bearer customer-token").send({ model: "m", prompt: "p" }).expect(401);
