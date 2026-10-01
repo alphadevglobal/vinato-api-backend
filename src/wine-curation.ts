@@ -22,6 +22,8 @@ export type CatalogFields = {
   grapes?: string[];
   description?: string;
   pairings?: string[];
+  /** Tempo de guarda as printed on the label. */
+  agingPotential?: string;
 };
 export type CatalogField = keyof CatalogFields;
 
@@ -30,7 +32,7 @@ export type CatalogField = keyof CatalogFields;
 const IDENTITY_FIELDS: CatalogField[] = ["displayName", "wineName", "vintage"];
 export const UPDATABLE_FIELDS: CatalogField[] = [
   "producer", "country", "region", "subRegion", "colour", "wineType", "designation", "classification",
-  "alcoholPercent", "grapes", "description", "pairings",
+  "alcoholPercent", "grapes", "description", "pairings", "agingPotential",
 ];
 
 const COLOURS: Record<string, string> = {
@@ -87,6 +89,7 @@ export function readingToCatalogFields(reading: ScannedWineData): CatalogFields 
     grapes: list(reading.grapes),
     description: text(reading.description),
     pairings: list(reading.foodPairings),
+    agingPotential: text(reading.agingPotential),
   };
   return Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)) as CatalogFields;
 }
@@ -119,7 +122,7 @@ export function proposedUpdates(current: CatalogFields, proposed: CatalogFields)
 const COLUMNS: Partial<Record<CatalogField, string>> = {
   producer: "producer_manufacturer", country: "country", region: "region", subRegion: "sub_region", colour: "color",
   wineType: "wine_type", designation: "designation", classification: "classification", alcoholPercent: "alcohol_percent",
-  description: "description",
+  description: "description", agingPotential: "aging_potential",
 };
 
 /**

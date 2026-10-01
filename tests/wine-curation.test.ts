@@ -42,6 +42,13 @@ describe("readingToCatalogFields", () => {
     });
   });
 
+  it("keeps the tempo de guarda read on the label, and writes it to aging_potential", () => {
+    const fields = readingToCatalogFields(reading({ agingPotential: " Guardar até 2032 " }));
+    expect(fields.agingPotential).toBe("Guardar até 2032");
+    expect(proposedUpdates({ displayName: "X" }, fields)).toMatchObject({ agingPotential: "Guardar até 2032" });
+    expect(fillAssignments({ agingPotential: "Guardar até 2032" }, 1)).toEqual({ sets: ["aging_potential = $2"], values: ["Guardar até 2032"] });
+  });
+
   it("builds the name from producer and wine when the AI gave no display name", () => {
     expect(readingToCatalogFields(reading({ displayName: null, producerName: null, producerTitle: "Casa Perini", wine: "Vintage" })))
       .toMatchObject({ displayName: "Casa Perini Vintage", wineName: "Vintage", producer: "Casa Perini" });

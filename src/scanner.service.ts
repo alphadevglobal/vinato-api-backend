@@ -30,13 +30,17 @@ Alem da transcricao, para a ficha do vinho no app:
   regiao, perfil de aromas e paladar), usando conhecimento enologico geral
   coerente com o rotulo. null se voce nao reconhecer o vinho nem o estilo.
 - foodPairings: lista com ate 5 pratos que harmonizam com este vinho, em portugues.
-Esses dois campos nunca alteram a transcricao: produtor, vinho e safra continuam
+- agingPotential: o tempo de guarda que o produtor informa no rotulo, como impresso
+  (ex.: "Guardar ate 2032", "Potencial de guarda: 8 a 10 anos"). Se o rotulo nao
+  mostrar, use o tempo de guarda conhecido deste vinho ou produtor, em portugues
+  (ex.: "5 a 8 anos a partir da safra"). null se voce nao souber.
+Esses campos nunca alteram a transcricao: produtor, vinho e safra continuam
 sendo apenas o que esta impresso.
 
 Responda somente JSON valido, sem markdown, com estas chaves:
 displayName, producerTitle, producerName, wine, country, region, subRegion,
 colour, type, subType, designation, classification, vintage, alcoholContent,
-grapes, volume, description, foodPairings, confidence, notes. confidence e um numero de 0 a 1.
+grapes, volume, description, foodPairings, agingPotential, confidence, notes. confidence e um numero de 0 a 1.
 `;
 
 export class OpenRouterWineScanner implements WineScanner {
@@ -129,6 +133,7 @@ function normalizeScannedWineData(data: Record<string, unknown>): ScannedWineDat
     volume: nullableString(data.volume),
     description: nullableString(data.description),
     foodPairings: stringList(data.foodPairings),
+    agingPotential: nullableString(data.agingPotential),
     confidence: confidence(data.confidence),
     notes: typeof data.notes === "string" ? data.notes : "",
   };

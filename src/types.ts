@@ -28,6 +28,8 @@ export type Wine = {
   sourceId?: string | null;
   vintageYear?: number | null;
   alcohol?: number | null;
+  /** Tempo de guarda (catalog_wines.aging_potential): shown to Premium members. */
+  agingPotential?: string | null;
   priceUsd?: number | null;
   rating?: number | null;
   grapes?: string | null;
@@ -76,6 +78,7 @@ export type WineRow = {
   source_id: string | null;
   vintage_year: number | null;
   alcohol: string | number | null;
+  aging_potential?: string | null;
   price_usd: string | number | null;
   rating: string | number | null;
   grapes: string | null;
@@ -149,6 +152,8 @@ export type ScannedWineData = {
   description?: string | null;
   /** Dishes that pair with the wine. */
   foodPairings?: string[] | null;
+  /** Tempo de guarda as the label states it ("Guardar até 2032", "8 a 10 anos"). */
+  agingPotential?: string | null;
   confidence: number;
   notes: string;
 };
@@ -200,6 +205,11 @@ export type AppDependencies = {
   wineLists?: {
     agent: Pick<import("./wine-list.service.js").OpenRouterWineListAgent, "transcribe" | "checkBottle">;
     repository: Pick<import("./wine-lists.repository.js").WineListRepository, "saveList" | "findList" | "listsOf" | "findItem" | "saveCheck" | "canUse" | "restaurantExists" | "retranscriptionSource" | "replaceTranscription" | "restaurantsWithLists">;
+  };
+  /** "Cardápios": restaurant menus uploaded in the admin (migration 026). */
+  menus?: {
+    agent: Pick<import("./menu.service.js").OpenRouterMenuAgent, "transcribe">;
+    repository: Pick<import("./menus.repository.js").MenuRepository, "saveMenu" | "retranscriptionSource" | "replaceTranscription">;
   };
 };
 

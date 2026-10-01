@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 import { createApp } from "../src/app.js";
 import type { WineListContext, WineListLookup } from "../src/sommelier-wine-list.js";
+import { AUTONOMY_RULES, menuInstructions, type MenuContext, type SommelierKnowledge } from "../src/sommelier-knowledge.js";
 import { GUARDED_REPLY, SommelierAgent, guardReply, mediaNote, parseAttachments, type ChatTurn, type CompleteChat, type ContentPart } from "../src/sommelier.service.js";
 
 // Minimal in-memory stand-in for the three sommelier tables.
@@ -44,7 +45,7 @@ describe("SommelierAgent", () => {
     await agent.chat("user-1", { conversationId: first.conversation.id, message: "Tem certeza?" });
 
     const firstCall = complete.mock.calls[0][0] as ChatTurn[];
-    expect(firstCall[0]).toEqual({ role: "system", content: "REGRAS" });
+    expect(firstCall[0]).toEqual({ role: "system", content: `REGRAS\n${AUTONOMY_RULES}` });
     const secondCall = complete.mock.calls[1][0] as ChatTurn[];
     expect(secondCall.map((turn) => turn.role)).toEqual(["system", "user", "assistant", "user"]);
     expect(secondCall[2].reasoning_details).toEqual([{ type: "reasoning.text", text: "pensando" }]);
@@ -159,7 +160,7 @@ describe("Sommelier with a wine list", () => {
     const db = fakeDb();
     const complete = vi.fn<CompleteChat>(async () => ({ content: "Um tinto leve.", reasoningDetails: null, model: "deepseek/deepseek-v3.2" }));
     const result = await new SommelierAgent(db.pool, complete, lookup()).chat("user-1", { message: "O que combina com pizza?" });
-    expect(systemOf(complete.mock.calls[0])).toBe("REGRAS");
+    expect(systemOf(complete.mock.calls[0])).toBe(`REGRAS\n${AUTONOMY_RULES}`);
     expect(complete.mock.calls[0][1]).not.toHaveProperty("reasoningEffort");
     expect(result.wineList).toBeNull();
     expect(db.conversations[0].wineListId).toBeNull();
@@ -362,3 +363,68 @@ describe("OpenRouter request of the Sommelier", () => {
   });
 });
 
+
+describe("Sommelier with the menu and the app data", () => {
+  const LIST = "44444444-4444-4444-8444-444444444444";
+  const MENU = "66666666-6666-4666-8666-666666666666";
+  const viriato: WineListContext = {
+    id: LIST, restaurantId: "r-1", restaurantName: "Café Viriato", city: "Lisboa", createdAt: "2026-09-29T20:00:00Z",
+    items: [{ section: "Brancos", name: "Soalheiro Alvarinho", producer: null, vintage: 2023, country: "Portugal", region: "Vinho Verde", grapes: "Alvarinho", style: null, volume: null, price: 180, glassPrice: 38, currency: "BRL", notes: null }],
+  };
+  const menu: MenuContext = {
+    id: MENU, restaurantId: "r-1", restaurantName: "Café Viriato", city: "Lisboa",
+    items: [{ section: "Peixes", name: "Tilápia grelhada", description: "com manteiga de limão e alcaparras", price: 92, currency: "BRL", notes: null }],
+  };
+  const knowledge = (overrides: Partial<SommelierKnowledge> = {}): SommelierKnowledge => ({
+    forUser: vi.fn(async () => "\nDADOS DO VINATO PARA ESTA CONVERSA\nAdega do cliente (vinhos que ele tem em casa):\n- Almaviva 2017 | 2 garrafa(s)"),
+    menuOfRestaurant: vi.fn(async (id: string | null) => (id === "r-1" ? menu : null)),
+    menuMentioned: vi.fn(async (text: string) => (/viriato/i.test(text) ? menu : null)),
+    menuById: vi.fn(async (id: string) => (id === MENU ? menu : null)),
+    ...overrides,
+  });
+  const lists = { forUser: vi.fn(async (_user: string, id: string) => (id === LIST ? viriato : null)), mentioned: vi.fn(async (_user: string, text: string) => (/viriato/i.test(text) ? viriato : null)) };
+  const systemOf = (call: unknown[]) => String((call[0] as ChatTurn[])[0].content);
+
+  it("reads the menu of the wine list's restaurant to pair a dish with a wine of the list", async () => {
+    const db = fakeDb();
+    const facts = knowledge();
+    const complete = vi.fn<CompleteChat>(async () => ({ content: "O Soalheiro.", reasoningDetails: null, model: "deepseek/deepseek-v3.2" }));
+    const result = await new SommelierAgent(db.pool, complete, lists, facts).chat("user-1", { message: "Estou no Viriato, qual vinho da carta vai com a tilápia?" });
+    const system = systemOf(complete.mock.calls[0]);
+    expect(facts.menuOfRestaurant).toHaveBeenCalledWith("r-1", "Café Viriato");
+    expect(system).toContain("Carta de vinhos consultada: Café Viriato, Lisboa");
+    expect(system).toContain("Cardápio consultado: Café Viriato, Lisboa (1 prato(s))");
+    expect(system).toContain("1. Tilápia grelhada | com manteiga de limão e alcaparras | R$ 92,00");
+    expect(system).toContain("Recomende para o prato os vinhos da carta deste mesmo restaurante");
+    expect(system).toContain("Adega do cliente");
+    expect(system).toContain("Não sugira chamar o sommelier, o garçom ou a equipe do restaurante para algo que você pode responder");
+    expect(result.menu).toEqual({ id: MENU, restaurantName: "Café Viriato", city: "Lisboa", itemCount: 1 });
+    expect(complete.mock.calls[0][1]).toMatchObject({ reasoningEffort: "low" });
+    // (…, wine_list_id, menu_id)
+    expect(db.messages.find((message) => message.role === "assistant")!.params.slice(8)).toEqual([LIST, MENU]);
+  });
+
+  it("uses a menu alone when the restaurant has no wine list", async () => {
+    const db = fakeDb();
+    const complete = vi.fn<CompleteChat>(async () => ({ content: "Um branco.", reasoningDetails: null, model: "deepseek/deepseek-v3.2" }));
+    const noLists = { forUser: vi.fn(async () => null), mentioned: vi.fn(async () => null) };
+    const result = await new SommelierAgent(db.pool, complete, noLists, knowledge()).chat("user-1", { message: "No Viriato, o que bebo com a tilápia?" });
+    expect(systemOf(complete.mock.calls[0])).toContain("Este restaurante não tem carta de vinhos no VINATO");
+    expect(result.wineList).toBeNull();
+    expect(result.menu?.id).toBe(MENU);
+  });
+
+  it("answers without the app data when it cannot be read", async () => {
+    const db = fakeDb();
+    const complete = vi.fn<CompleteChat>(async () => ({ content: "Um tinto.", reasoningDetails: null, model: "deepseek/deepseek-v3.2" }));
+    const failing = knowledge({ forUser: vi.fn(async () => { throw new Error("db"); }), menuMentioned: vi.fn(async () => { throw new Error("db"); }) });
+    const result = await new SommelierAgent(db.pool, complete, lists, failing).chat("user-1", { message: "O que combina com pizza?" });
+    expect(systemOf(complete.mock.calls[0])).toBe(`REGRAS\n${AUTONOMY_RULES}`);
+    expect(result.menu).toBeNull();
+  });
+
+  it("writes the menu rules", () => {
+    expect(menuInstructions(menu, false)).toContain("indique estilos, uvas e regiões que combinam com o prato");
+    expect(menuInstructions(menu, true)).not.toContain("não tem carta de vinhos");
+  });
+});

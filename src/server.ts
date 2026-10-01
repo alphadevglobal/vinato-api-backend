@@ -3,6 +3,7 @@ import { OfferRepository } from "./offers.repository.js";
 import { ReviewRepository } from "./reviews.repository.js";
 import { SommelierAgent } from "./sommelier.service.js";
 import { SommelierWineLists } from "./sommelier-wine-list.js";
+import { PgSommelierKnowledge } from "./sommelier-knowledge.js";
 import { PgScanAuditRepository } from "./scan-audit.repository.js";
 import { config } from "./config.js";
 import { pool } from "./db.js";
@@ -13,6 +14,8 @@ import { PgAiModelSettings } from "./ai-model-settings.js";
 import { OpenRouterWineListAgent } from "./wine-list.service.js";
 import { AdminSessions } from "./admin-session.js";
 import { WineListRepository } from "./wine-lists.repository.js";
+import { OpenRouterMenuAgent } from "./menu.service.js";
+import { MenuRepository } from "./menus.repository.js";
 
 const aiModelSettings = new PgAiModelSettings(pool);
 
@@ -21,11 +24,12 @@ const app = createApp({
   wineScanner: new OpenRouterWineScanner(aiModelSettings),
   accountRepository: new AccountRepository(pool),
   scanAudit: new PgScanAuditRepository(pool),
-  sommelier: new SommelierAgent(pool, undefined, new SommelierWineLists(pool)),
+  sommelier: new SommelierAgent(pool, undefined, new SommelierWineLists(pool), new PgSommelierKnowledge(pool)),
   reviews: new ReviewRepository(pool),
   offers: new OfferRepository(pool),
   adminSessions: new AdminSessions(pool),
   wineLists: { agent: new OpenRouterWineListAgent(aiModelSettings), repository: new WineListRepository(pool) },
+  menus: { agent: new OpenRouterMenuAgent(aiModelSettings), repository: new MenuRepository(pool) },
 });
 
 app.listen(config.port, () => {

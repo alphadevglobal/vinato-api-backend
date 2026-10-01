@@ -26,30 +26,38 @@ const coordinate = (value: number | null | undefined, limit: number) => typeof v
 const ITEM_SELECT = `id, position, section, name, producer, vintage, country, region, grapes, style, volume,
   price::float8 AS price, glass_price::float8 AS "glassPrice", currency, notes`;
 
+/**
+ * The restaurant chosen (id), the one with the same name (accents and case ignored)
+ * in the same city, or a new one. Shared by the wine lists and the menus (Cardápios).
+ */
+export async function resolveRestaurant(pool: pg.Pool, input: RestaurantInput) {
+  if (input.id) {
+    const chosen = await pool.query<{ id: string }>(`SELECT id FROM restaurants WHERE id = $1`, [input.id]);
+    if (chosen.rows[0]) return chosen.rows[0].id;
+  }
+  const name = clean(input.name);
+  if (!name) return null;
+  const city = clean(input.city);
+  const result = await pool.query<{ id: string }>(
+    `INSERT INTO restaurants (name, name_key, city, address, latitude, longitude)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (name_key, (coalesce(lower(btrim(city)), ''))) DO UPDATE SET
+       address = coalesce(restaurants.address, EXCLUDED.address),
+       latitude = coalesce(restaurants.latitude, EXCLUDED.latitude),
+       longitude = coalesce(restaurants.longitude, EXCLUDED.longitude),
+       updated_at = now()
+     RETURNING id`,
+    [name, normalizeText(name), city, clean(input.address), coordinate(input.latitude, 90), coordinate(input.longitude, 180)],
+  );
+  return result.rows[0].id;
+}
+
 export class WineListRepository {
   constructor(private readonly pool: pg.Pool) {}
 
   /** The restaurant chosen (id), the one with the same name (accents and case ignored) in the same city, or a new one. */
-  private async restaurantId(input: RestaurantInput) {
-    if (input.id) {
-      const chosen = await this.pool.query<{ id: string }>(`SELECT id FROM restaurants WHERE id = $1`, [input.id]);
-      if (chosen.rows[0]) return chosen.rows[0].id;
-    }
-    const name = clean(input.name);
-    if (!name) return null;
-    const city = clean(input.city);
-    const result = await this.pool.query<{ id: string }>(
-      `INSERT INTO restaurants (name, name_key, city, address, latitude, longitude)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (name_key, (coalesce(lower(btrim(city)), ''))) DO UPDATE SET
-         address = coalesce(restaurants.address, EXCLUDED.address),
-         latitude = coalesce(restaurants.latitude, EXCLUDED.latitude),
-         longitude = coalesce(restaurants.longitude, EXCLUDED.longitude),
-         updated_at = now()
-       RETURNING id`,
-      [name, normalizeText(name), city, clean(input.address), coordinate(input.latitude, 90), coordinate(input.longitude, 180)],
-    );
-    return result.rows[0].id;
+  private restaurantId(input: RestaurantInput) {
+    return resolveRestaurant(this.pool, input);
   }
 
   /** Whether the restaurant exists (the admin uploads a list for an existing one). */

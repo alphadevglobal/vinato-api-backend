@@ -691,6 +691,64 @@ export function createApp(dependencies: AppDependencies) {
     }),
   );
 
+  // Admin "Cardápios" (vinato-web): the menu of a partner restaurant, uploaded and
+  // transcribed like a wine list. The Sommelier reads it with the restaurant's list.
+  const menus = () => {
+    if (!dependencies.menus) throw new HttpError(503, "Cardápios indisponíveis.", "Service Unavailable");
+    return dependencies.menus;
+  };
+  app.post(
+    "/admin/menus",
+    uploadListFiles(),
+    asyncHandler(async (req, res) => {
+      const admin = await adminOf(req);
+      const restaurantId = optionalText(req.body?.restaurantId);
+      if (restaurantId && (!isUuid(restaurantId) || !await wineLists().repository.restaurantExists(restaurantId))) throw notFound("Restaurante não encontrado.");
+      if (!restaurantId && !optionalText(req.body?.restaurantName)) throw badRequest("Escolha um restaurante ou informe o nome do novo restaurante.");
+      const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+      if (!files.length) throw badRequest('Envie as fotos do cardápio ou o PDF no campo "files".');
+      const pdfs = files.filter((file) => file.mimetype === "application/pdf");
+      if (pdfs.length && files.length > 1) throw badRequest("Envie um único PDF ou apenas fotos do cardápio.");
+      const restaurant = { id: restaurantId, name: optionalText(req.body?.restaurantName), city: optionalText(req.body?.city), address: optionalText(req.body?.address) };
+      const menuFiles = files.map((file) => ({ mimetype: file.mimetype, dataUrl: dataUrl(file) }));
+      const { agent, repository } = menus();
+      const startedAt = Date.now();
+      const source = pdfs.length ? "pdf" as const : "photo" as const;
+      const transcription = await agent.transcribe(menuFiles, { restaurantName: restaurant.name, city: restaurant.city }, { deadline: startedAt + TRANSCRIPTION_BUDGET_MS });
+      const failed = !transcription.items.length;
+      const saved = await repository.saveMenu({
+        uploadedBy: admin.userId,
+        restaurant: { ...restaurant, name: restaurant.name ?? transcription.restaurant.name, city: restaurant.city ?? transcription.restaurant.city },
+        source, files: menuFiles, items: transcription.items,
+        status: failed ? "failed" : "transcribed", model: transcription.model, attempts: transcription.attempts, usage: transcription.usage,
+        errorMessage: menuProblems(transcription), durationMs: Date.now() - startedAt,
+      });
+      if (failed) throw menuFailure(transcription);
+      res.status(201).json({ ...saved, pages: transcription.pages, unreadPages: transcription.unreadPages });
+    }),
+  );
+
+  app.post(
+    "/admin/menus/:id/retranscribe",
+    asyncHandler(async (req, res) => {
+      await adminOf(req);
+      const menuId = String(req.params.id);
+      const { agent, repository } = menus();
+      const source = isUuid(menuId) ? await repository.retranscriptionSource(menuId) : null;
+      if (!source) throw notFound("Cardápio não encontrado.");
+      if (!source.files.length) throw badRequest("Este cardápio não tem fotos nem PDF salvos para transcrever.");
+      const startedAt = Date.now();
+      const transcription = await agent.transcribe(source.files, { restaurantName: source.restaurantName, city: source.city }, { deadline: startedAt + TRANSCRIPTION_BUDGET_MS });
+      const failed = !transcription.items.length;
+      const saved = await repository.replaceTranscription(menuId, {
+        items: transcription.items, status: failed ? "failed" : "transcribed", model: transcription.model, attempts: transcription.attempts,
+        usage: addUsage(source.usage ?? {}, transcription.usage), errorMessage: menuProblems(transcription), durationMs: Date.now() - startedAt,
+      });
+      if (failed) throw menuFailure(transcription);
+      res.json({ ...saved, pages: transcription.pages, unreadPages: transcription.unreadPages });
+    }),
+  );
+
   app.get(
     "/wine-lists",
     asyncHandler(async (req, res) => {
@@ -972,6 +1030,17 @@ function transcriptionFailure(transcription: TranscriptionOutcome) {
   return new HttpError(422, timedOut
     ? "A leitura da carta demorou demais. Envie menos páginas por vez (as que têm os vinhos que você quer escolher)."
     : "Não conseguimos ler os vinhos desta carta. Confira se as fotos mostram a lista de vinhos, uma página por foto.", "Unprocessable Entity");
+}
+
+function menuProblems(transcription: TranscriptionOutcome) {
+  return transcriptionProblems(transcription)?.replace("nenhum vinho encontrado", "nenhum prato encontrado") ?? null;
+}
+
+function menuFailure(transcription: TranscriptionOutcome) {
+  const timedOut = transcription.attempts.some((attempt) => attempt.error === "request_timeout" || attempt.error === "no_time_left");
+  return new HttpError(422, timedOut
+    ? "A leitura do cardápio demorou demais. Envie menos páginas por vez."
+    : "Não conseguimos ler os pratos deste cardápio. Confira se as fotos mostram os pratos, uma página por foto.", "Unprocessable Entity");
 }
 
 /** Usage of every attempt of a list, earlier ones included. */

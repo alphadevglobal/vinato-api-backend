@@ -31,6 +31,7 @@ export const mapWineRow = (row: WineRow): Wine => ({
   sourceId: row.source_id,
   vintageYear: row.vintage_year,
   alcohol: row.alcohol === null ? null : Number(row.alcohol),
+  agingPotential: row.aging_potential ?? null,
   priceUsd: row.price_usd === null ? null : Number(row.price_usd),
   rating: row.rating === null ? null : Number(row.rating),
   grapes: row.grapes,

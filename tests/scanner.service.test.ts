@@ -52,6 +52,7 @@ describe("OpenRouterWineScanner", () => {
       success: true,
       data: {
         displayName: "Fallback Wine",
+        agingPotential: null,
         producerTitle: null,
         producerName: null,
         wine: null,

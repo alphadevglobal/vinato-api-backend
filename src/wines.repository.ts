@@ -45,6 +45,7 @@ const baseSelect = `
     id::text AS source_id,
     vintage AS vintage_year,
     alcohol_percent AS alcohol,
+    aging_potential,
     NULL::numeric AS price_usd,
     -- "Nota Crítica": average of the users' reviews (1 to 5), from wine_review_stats.
     (SELECT round(stats.rating_sum / NULLIF(stats.review_count, 0), 1) FROM wine_review_stats stats WHERE stats.wine_id = catalog_wines.id) AS rating,
@@ -106,10 +107,10 @@ type CatalogFieldsRow = {
   display_name: string; wine_name: string | null; producer_manufacturer: string | null; country: string | null; region: string | null;
   sub_region: string | null; color: string | null; wine_type: string | null; designation: string | null; classification: string | null;
   vintage: number | null; alcohol_percent: string | number | null; grapes: unknown; description: string | null; pairings: unknown;
-  data_source: string; curation_status: string;
+  aging_potential?: string | null; data_source: string; curation_status: string;
 };
 const CATALOG_FIELDS_SELECT = `display_name, wine_name, producer_manufacturer, country, region, sub_region, color, wine_type,
-  designation, classification, vintage, alcohol_percent, grapes, description, pairings, data_source, curation_status`;
+  designation, classification, vintage, alcohol_percent, grapes, description, pairings, aging_potential, data_source, curation_status`;
 
 const names = (value: unknown) => (Array.isArray(value) ? value : [])
   .map((item) => typeof item === "string" ? item : typeof item === "object" && item && typeof (item as { name?: unknown }).name === "string" ? (item as { name: string }).name : "")
@@ -127,6 +128,7 @@ export function catalogFieldsFromRow(row: CatalogFieldsRow): CatalogFields {
     classification: row.classification ?? undefined, vintage: row.vintage ?? undefined,
     alcoholPercent: row.alcohol_percent === null ? undefined : Number(row.alcohol_percent),
     grapes: grapes.length ? grapes : undefined, description: row.description ?? undefined, pairings: dishes.length ? dishes : undefined,
+    agingPotential: row.aging_potential ?? undefined,
   };
   return Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined && value !== "")) as CatalogFields;
 }
@@ -371,11 +373,11 @@ export class PgWineRepository implements WineRepository {
       const created = await this.pool.query<{ id: string }>(
         `INSERT INTO catalog_wines (display_name, wine_name, producer_manufacturer, country, region, sub_region, color, wine_type,
                                     designation, classification, vintage, alcohol_percent, grapes, description, pairings, images,
-                                    data_source, curation_status)
+                                    data_source, curation_status, aging_potential)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15::jsonb,
                  jsonb_build_array(jsonb_build_object('url', $16::text, 'source', 'user_scan', 'role', 'front',
                    'review_status', 'pending', 'captured_at', now())),
-                 'ai_scan', 'pending')
+                 'ai_scan', 'pending', $17)
          RETURNING id`,
         [
           fields.displayName, fields.wineName, fields.producer ?? null, fields.country ?? null, fields.region ?? null,
@@ -385,6 +387,7 @@ export class PgWineRepository implements WineRepository {
           fields.description ?? null,
           JSON.stringify({ dishes: fields.pairings ?? [], ingredients: [] }),
           scanImageDataUrl(file),
+          fields.agingPotential ?? null,
         ],
       );
       const wineId = created.rows[0].id;

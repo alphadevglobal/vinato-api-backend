@@ -11,7 +11,7 @@ export type WineListItemContext = {
   section: string | null; name: string; producer: string | null; vintage: number | null; country: string | null; region: string | null;
   grapes: string | null; style: string | null; volume: string | null; price: number | null; glassPrice: number | null; currency: string; notes: string | null;
 };
-export type WineListContext = { id: string; restaurantName: string | null; city: string | null; createdAt: string; items: WineListItemContext[] };
+export type WineListContext = { id: string; restaurantId?: string | null; restaurantName: string | null; city: string | null; createdAt: string; items: WineListItemContext[] };
 export type WineListSummary = { id: string; restaurantName: string | null; city: string | null; itemCount: number };
 
 export interface WineListLookup {
@@ -53,8 +53,8 @@ export class SommelierWineLists implements WineListLookup {
 
   async forUser(userId: string, listId: string) {
     if (!/^[0-9a-f-]{36}$/i.test(listId)) return null;
-    const list = (await this.pool.query<{ id: string; restaurant_name: string | null; city: string | null; created_at: Date | string }>(
-      `SELECT l.id, coalesce(r.name, l.restaurant_name) AS restaurant_name, coalesce(r.city, l.city) AS city, l.created_at
+    const list = (await this.pool.query<{ id: string; restaurant_id?: string | null; restaurant_name: string | null; city: string | null; created_at: Date | string }>(
+      `SELECT l.id, l.restaurant_id, coalesce(r.name, l.restaurant_name) AS restaurant_name, coalesce(r.city, l.city) AS city, l.created_at
        FROM wine_lists l LEFT JOIN restaurants r ON r.id = l.restaurant_id WHERE l.id = $2 AND ${USABLE}`,
       [userId, listId],
     )).rows[0];
@@ -65,7 +65,7 @@ export class SommelierWineLists implements WineListLookup {
        FROM wine_list_items WHERE wine_list_id = $1 ORDER BY position LIMIT ${MAX_CONTEXT_ITEMS + 1}`,
       [list.id],
     );
-    return { id: list.id, restaurantName: list.restaurant_name, city: list.city, createdAt: new Date(list.created_at).toISOString(), items: items.rows };
+    return { id: list.id, restaurantId: list.restaurant_id ?? null, restaurantName: list.restaurant_name, city: list.city, createdAt: new Date(list.created_at).toISOString(), items: items.rows };
   }
 
   async mentioned(userId: string, text: string) {

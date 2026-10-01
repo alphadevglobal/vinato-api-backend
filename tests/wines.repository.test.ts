@@ -204,7 +204,7 @@ describe("AI-assisted catalog", () => {
     expect(insert[1]).toEqual([
       "Quinta do Morgado York Madeira", "York Madeira", "Fante", "Brasil", null, null, "Red", "Suave", null, null, null, 10,
       JSON.stringify([{ name: "Bordô", percentage: null }, { name: "Isabel", percentage: null }]), "Vinho de mesa suave.",
-      JSON.stringify({ dishes: ["Pizza"], ingredients: [] }), "data:image/jpeg;base64,dXNlci1waG90bw==",
+      JSON.stringify({ dishes: ["Pizza"], ingredients: [] }), "data:image/jpeg;base64,dXNlci1waG90bw==", null,
     ]);
     const [proposal] = callsWith(poolQuery, "INSERT INTO wine_ai_proposals");
     expect(proposal[0]).toContain("'new_wine'");

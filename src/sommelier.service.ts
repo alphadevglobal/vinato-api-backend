@@ -2,6 +2,7 @@ import type pg from "pg";
 import { config } from "./config.js";
 import { HttpError, internalServerError, notFound } from "./http-error.js";
 import { summaryOf, wineListInstructions, type WineListContext, type WineListLookup, type WineListSummary } from "./sommelier-wine-list.js";
+import { AUTONOMY_RULES, menuInstructions, menuSummaryOf, type MenuContext, type MenuSummary, type SommelierKnowledge } from "./sommelier-knowledge.js";
 
 export type SommelierConfig = {
   model: string;
@@ -181,6 +182,8 @@ export class SommelierAgent {
     private readonly complete: CompleteChat = openRouterChat,
     // The wine lists the Sommelier may consult (Verificação de carta).
     private readonly wineLists?: WineListLookup,
+    // The rest of the app: the customer's data, the catalog and the restaurant menus (Cardápios).
+    private readonly knowledge?: SommelierKnowledge,
   ) {}
 
   async getConfig(): Promise<SommelierConfig> {
@@ -269,6 +272,26 @@ export class SommelierAgent {
     return current ? this.wineLists.forUser(userId, current) : null;
   }
 
+  /**
+   * The menu of this turn: the one of the wine list's restaurant, the one of the
+   * restaurant the question names, or the one the conversation already consults.
+   */
+  private async menuFor(text: string, wineList: WineListContext | null, conversationId: string | undefined): Promise<MenuContext | null> {
+    if (!this.knowledge) return null;
+    try {
+      if (wineList) return await this.knowledge.menuOfRestaurant(wineList.restaurantId ?? null, wineList.restaurantName);
+      const named = text ? await this.knowledge.menuMentioned(text) : null;
+      if (named || !conversationId) return named;
+      const last = (await this.pool.query(
+        `SELECT menu_id FROM sommelier_messages WHERE conversation_id = $1 AND menu_id IS NOT NULL ORDER BY created_at DESC LIMIT 1`, [conversationId],
+      )).rows[0]?.menu_id as string | undefined;
+      return last ? await this.knowledge.menuById(last) : null;
+    } catch (error) {
+      console.warn("[sommelier] menu lookup failed", (error as Error).message);
+      return null;
+    }
+  }
+
   async chat(userId: string, input: { conversationId?: string; message: string; attachments?: unknown; wineListId?: string }) {
     const text = input.message.trim();
     const media = parseAttachments(input.attachments);
@@ -298,7 +321,13 @@ export class SommelierAgent {
     const transcription = voice ? await this.transcribe(voice, settings) : null;
     const transcript = transcription?.text ?? null;
     // A restaurant named out loud counts like a typed one.
-    const wineList = await this.wineListFor(userId, [text, transcript].filter(Boolean).join(" "), input.wineListId, existing?.wineListId);
+    const question = [text, transcript].filter(Boolean).join(" ");
+    const wineList = await this.wineListFor(userId, question, input.wineListId, existing?.wineListId);
+    // The rest of the app: the restaurant's menu, the customer's data and the catalog wines named.
+    const [menu, knowledge] = await Promise.all([
+      this.menuFor(question, wineList, existing?.id),
+      this.knowledge ? this.knowledge.forUser(userId, question).catch(() => null) : Promise.resolve(null),
+    ]);
     const history = existing ? (await this.pool.query(
       `SELECT id, role, content, reasoning_details FROM (
          SELECT id, role, content, reasoning_details, created_at FROM sommelier_messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2
@@ -312,7 +341,7 @@ export class SommelierAgent {
     // With a wine list in the prompt, reasoning models think with low effort: unbounded
     // reasoning over 100+ wines passed the 50 s limit in tests with the real lists.
     const turnSettings: SommelierConfig = withMedia ? { ...settings, model: settings.mediaModel, reasoningEnabled: false }
-      : wineList ? { ...settings, reasoningEffort: "low" } : settings;
+      : wineList || menu ? { ...settings, reasoningEffort: "low" } : settings;
     const userContent: string | ContentPart[] = withMedia ? [
       { type: "text", text: text || (media.some((item) => item.kind === "audio") ? "Responda à minha mensagem de voz." : "O que você me diz sobre esta foto?") },
       ...media.map((item): ContentPart => (item.kind === "image"
@@ -320,7 +349,7 @@ export class SommelierAgent {
         : { type: "input_audio", input_audio: { data: item.base64, format: item.format! } })),
     ] : text;
     const messages: ChatTurn[] = [
-      { role: "system", content: [settings.systemPrompt, withMedia ? MEDIA_GUIDE : null, wineList ? wineListInstructions(wineList) : null].filter(Boolean).join("\n") },
+      { role: "system", content: [settings.systemPrompt, AUTONOMY_RULES, withMedia ? MEDIA_GUIDE : null, wineList ? wineListInstructions(wineList) : null, menu ? menuInstructions(menu, Boolean(wineList)) : null, knowledge].filter(Boolean).join("\n") },
       ...history.map((turn): ChatTurn => {
         const note = turn.id ? mediaNote(pastMedia.get(turn.id) ?? []) : "";
         const content = [note, turn.content].filter(Boolean).join(" ") || "(mensagem sem texto)";
@@ -361,10 +390,11 @@ export class SommelierAgent {
       }
       if (stored.length) userMessage = { ...userMessage, attachments: stored };
       reply = (await client.query(
-        `INSERT INTO sommelier_messages (conversation_id, role, content, reasoning_details, model, prompt_tokens, completion_tokens, cost_usd, duration_ms, wine_list_id)
-         VALUES ($1, 'assistant', $2, $3::jsonb, $4, $5, $6, $7, $8, $9) RETURNING id, role, content, created_at AS "createdAt"`,
+        `INSERT INTO sommelier_messages (conversation_id, role, content, reasoning_details, model, prompt_tokens, completion_tokens, cost_usd, duration_ms, wine_list_id${menu ? ", menu_id" : ""})
+         VALUES ($1, 'assistant', $2, $3::jsonb, $4, $5, $6, $7, $8, $9${menu ? ", $10" : ""}) RETURNING id, role, content, created_at AS "createdAt"`,
         [conversation.id, guarded.content, guarded.blocked || withMedia || completion.reasoningDetails == null ? null : JSON.stringify(completion.reasoningDetails), completion.model,
-          sumUsage(completion.promptTokens, transcription?.promptTokens), sumUsage(completion.completionTokens, transcription?.completionTokens), sumUsage(completion.costUsd, transcription?.costUsd), durationMs, wineList?.id ?? null],
+          sumUsage(completion.promptTokens, transcription?.promptTokens), sumUsage(completion.completionTokens, transcription?.completionTokens), sumUsage(completion.costUsd, transcription?.costUsd), durationMs, wineList?.id ?? null,
+          ...(menu ? [menu.id] : [])],
       )).rows[0];
       // The conversation keeps consulting the list of this turn in the next questions.
       await client.query(`UPDATE sommelier_conversations SET updated_at = now(), wine_list_id = coalesce($2, wine_list_id) WHERE id = $1`, [conversation.id, wineList?.id ?? null]);
@@ -378,7 +408,8 @@ export class SommelierAgent {
     }
 
     const consulted: WineListSummary | null = wineList ? summaryOf(wineList) : null;
-    return { conversation, userMessage, reply, remainingToday: Math.max(0, settings.dailyMessageLimit - sentToday - 1), wineList: consulted };
+    const menuConsulted: MenuSummary | null = menu ? menuSummaryOf(menu) : null;
+    return { conversation, userMessage, reply, remainingToday: Math.max(0, settings.dailyMessageLimit - sentToday - 1), wineList: consulted, menu: menuConsulted };
   }
 
   /** The transcript of a voice message (null when the model could not transcribe it: the answer goes on). */
