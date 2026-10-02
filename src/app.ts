@@ -394,6 +394,9 @@ export function createApp(dependencies: AppDependencies) {
   app.get(
     "/explore",
     asyncHandler(async (_req, res) => {
+      // The same for everyone: the CDN keeps it 10 minutes and serves the old copy while
+      // it refreshes, so no one waits for the counts (several seconds on a cold start).
+      res.set("Cache-Control", "public, s-maxage=600, stale-while-revalidate=3600");
       res.json(await dependencies.wineRepository.explore());
     }),
   );

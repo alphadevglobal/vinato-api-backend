@@ -194,7 +194,7 @@ describe("Wine API", () => {
   });
 
   it("exposes catalog-backed explore facets", async () => {
-    const response = await request(app).get("/explore").expect(200);
+    const response = await request(app).get("/explore").expect(200).expect("Cache-Control", "public, s-maxage=600, stale-while-revalidate=3600");
     expect(response.body.regions[0]).toEqual({ name: "Bordeaux", country: "France", count: 2, imageUrl: "https://example.com/bordeaux.jpg" });
     expect(response.body.awarded.ready).toBe(false);
   });
