@@ -16,11 +16,15 @@ export async function fullDatabase() {
   await db.exec(`create table users (id uuid primary key default gen_random_uuid(), email text, display_name text, avatar_url text, role text not null default 'user', status text not null default 'active')`);
   const directory = join(process.cwd(), "migrations");
   for (const name of readdirSync(directory).filter((file) => file.endsWith(".sql")).sort()) await db.exec(readFileSync(join(directory, name), "utf8"));
+  // Columns the vinato-web migrations add to app_users.
+  await db.exec(`alter table app_users add column if not exists plan_expires_at timestamptz, add column if not exists plan_started_at timestamptz`);
   await db.exec(`alter table catalog_wines add column if not exists awards jsonb not null default '[]'::jsonb;
     create or replace view catalog_awarded_wines as select c.id, c.awards, jsonb_array_length(c.awards) as awards_count,
       (select max((a.value ->> 'award_year')::integer) from jsonb_array_elements(c.awards) a(value)) as latest_award_year,
       coalesce((c.awards -> 0) ->> 'badge_symbol', '🎖️') as award_symbol
     from catalog_wines c where c.awards <> '[]'::jsonb`);
-  const pool = { query: (sql: string, params?: unknown[]) => db.query(sql, params) } as unknown as pg.Pool;
+  // One connection: a "client" (pool.connect, for transactions) runs on the same database.
+  const query = (sql: string, params?: unknown[]) => db.query(sql, params);
+  const pool = { query, connect: async () => ({ query, release: () => undefined }) } as unknown as pg.Pool;
   return { db, pool };
 }

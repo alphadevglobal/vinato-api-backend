@@ -14,6 +14,8 @@ import { requestJson, type ModelAttempt, type OpenRouterUsage } from "./openrout
 import { openRouterAccount } from "./openrouter-account.js";
 import { CHECK_BUDGET_MS, TRANSCRIPTION_BUDGET_MS } from "./wine-list.service.js";
 import { DISPOSABLE_EMAIL_MESSAGE, isDisposableEmailAddress } from "./email-policy.js";
+import { ADULT_AGE, normalizeCpf, normalizePhone, parseBirthDate } from "./personal-data.js";
+import type { ProfilePatch } from "./account.repository.js";
 import { deviceSearchTerms, exactTextMatch, labelVolume, labelYears, parseDeviceReading, type DeviceReading } from "./label-text-match.js";
 
 const require = createRequire(import.meta.url);
@@ -105,21 +107,83 @@ export function createApp(dependencies: AppDependencies) {
     }),
   );
 
+  // Cadastro: nome completo, e-mail, senha, CPF (one account per CPF) and date of
+  // birth, with the Termos de Uso and the 18+ confirmation accepted; phone and the
+  // news consent are optional.
   app.post(
     "/auth/register",
     asyncHandler(async (req, res) => {
       const accounts = requireAccounts(dependencies);
-      const displayName = requiredText(req.body?.displayName, "Nome");
+      const displayName = requiredFullName(req.body?.displayName);
       const email = requiredEmail(req.body?.email);
       rejectDisposableEmail(email);
       const password = requiredPassword(req.body?.password);
+      const cpf = requiredCpf(req.body?.cpf);
+      const birthDate = requiredBirthDate(req.body?.birthDate);
+      const phone = optionalPhone(req.body?.phone);
+      const terms = await accounts.currentTerms();
+      if (req.body?.acceptTerms !== true) throw badRequest("Aceite os Termos de Uso para criar a conta.");
+      if (req.body?.adult !== true) throw badRequest("Confirme que você tem 18 anos ou mais.");
       try {
-        res.status(201).json(await accounts.register(displayName, email, password));
+        res.status(201).json(await accounts.register(displayName, email, password, { cpf, birthDate, phone, termsVersion: terms?.version ?? "0", marketing: req.body?.marketing === true }));
       } catch (error) {
-        if ((error as Error).message === "EMAIL_ALREADY_EXISTS") {
-          throw new HttpError(409, "Este e-mail já está cadastrado.", "Conflict");
-        }
-        throw error;
+        throw accountConflict(error);
+      }
+    }),
+  );
+
+  // The Termos de Uso in force, shown in the app before the account accepts them.
+  app.get(
+    "/legal/terms",
+    asyncHandler(async (_req, res) => {
+      const terms = await requireAccounts(dependencies).currentTerms();
+      if (!terms) throw notFound("Termos de Uso ainda não publicados.");
+      res.json(terms);
+    }),
+  );
+
+  // "Meus dados": the cadastro of the account itself (CPF, date of birth and phone decrypted only here).
+  app.get(
+    "/me/profile",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      res.set("Cache-Control", "no-store");
+      const profile = await accounts.getProfile(user.id);
+      if (!profile) throw notFound("Conta não encontrada.");
+      res.json(profile);
+    }),
+  );
+
+  // Edits "Meus dados", and completes the account of whoever came by Apple or Google:
+  // the CPF and the date of birth (once missing, both are required), the Termos de
+  // Uso in force and the 18+ confirmation.
+  app.put(
+    "/me/profile",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const current = await accounts.getProfile(user.id);
+      if (!current) throw notFound("Conta não encontrada.");
+      const patch: ProfilePatch = {};
+      if (body.displayName !== undefined) patch.displayName = requiredFullName(body.displayName);
+      if (body.email !== undefined) { patch.email = requiredEmail(body.email); rejectDisposableEmail(patch.email); }
+      if (body.cpf !== undefined || !current.cpf) patch.cpf = requiredCpf(body.cpf);
+      if (body.birthDate !== undefined || !current.birthDate) patch.birthDate = requiredBirthDate(body.birthDate);
+      if (body.phone !== undefined) patch.phone = optionalPhone(body.phone);
+      if (body.marketing !== undefined) patch.marketing = body.marketing === true;
+      if (body.acceptTerms === true) {
+        const terms = await accounts.currentTerms();
+        patch.termsVersion = terms?.version ?? "0";
+      } else if (!current.termsCurrent) throw badRequest("Aceite os Termos de Uso para continuar.");
+      if (body.adult === true) patch.adult = true;
+      else if (!current.adultConfirmedAt) throw badRequest("Confirme que você tem 18 anos ou mais.");
+      try {
+        const saved = await accounts.updateProfile(user.id, patch);
+        if (!saved) throw notFound("Conta não encontrada.");
+        res.set("Cache-Control", "no-store");
+        res.json({ user: saved, profile: await accounts.getProfile(user.id) });
+      } catch (error) {
+        throw accountConflict(error);
       }
     }),
   );
@@ -1207,6 +1271,44 @@ function requiredEmail(value: unknown) {
 
 function rejectDisposableEmail(email: string) {
   if (isDisposableEmailAddress(email)) throw new HttpError(400, DISPOSABLE_EMAIL_MESSAGE, "Bad Request");
+}
+
+/** Nome completo: at least a first name and a last name. */
+function requiredFullName(value: unknown) {
+  const name = typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
+  if (name.length < 5 || name.split(" ").filter((part) => part.length >= 2).length < 2) throw badRequest("Informe o nome completo (nome e sobrenome).");
+  if (name.length > 120) throw badRequest("O nome deve ter até 120 caracteres.");
+  return name;
+}
+
+function requiredCpf(value: unknown) {
+  const cpf = normalizeCpf(value);
+  if (!cpf) throw badRequest("CPF inválido. Confira os 11 números.");
+  return cpf;
+}
+
+function requiredBirthDate(value: unknown) {
+  const birth = parseBirthDate(value);
+  if (!birth) throw badRequest("Data de nascimento inválida.");
+  if (birth.age < ADULT_AGE) throw badRequest("O VINATO é exclusivo para maiores de 18 anos.");
+  if (birth.age > 120) throw badRequest("Data de nascimento inválida.");
+  return birth.value;
+}
+
+function optionalPhone(value: unknown) {
+  if (value === null || value === undefined || value === "") return null;
+  const phone = normalizePhone(value);
+  if (!phone) throw badRequest("Telefone inválido. Confira o código do país, o DDD e o número.");
+  return phone;
+}
+
+/** The e-mail or the CPF already has an account; the encryption key missing stops the cadastro. */
+function accountConflict(error: unknown) {
+  const code = (error as Error).message;
+  if (code === "EMAIL_ALREADY_EXISTS") return new HttpError(409, "Este e-mail já está cadastrado.", "Conflict");
+  if (code === "CPF_ALREADY_EXISTS") return new HttpError(409, "Este CPF já tem uma conta VINATO. Entre com a conta existente.", "Conflict");
+  if (code === "PII_KEY_MISSING") return new HttpError(503, "Cadastro temporariamente indisponível. Tente novamente em instantes.", "Service Unavailable");
+  return error;
 }
 
 function requiredPassword(value: unknown) {

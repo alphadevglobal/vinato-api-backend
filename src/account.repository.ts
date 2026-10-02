@@ -1,11 +1,41 @@
 import { photoRefSql, photoUrl } from "./photo-url.js";
 import { drinkingPhases } from "./wine-mapper.js";
+import { cpfHash, decryptField, encryptField, type Phone } from "./personal-data.js";
+
+type ConsentKind = "terms" | "adult" | "marketing";
+/** The personal data of the cadastro, already validated by the API. */
+export type PersonalData = { cpf: string; birthDate: string; phone: Phone | null; termsVersion: string; marketing: boolean };
+export type ProfilePatch = { displayName?: string; email?: string; cpf?: string; birthDate?: string; phone?: Phone | null; termsVersion?: string; adult?: boolean; marketing?: boolean };
+export type AccountProfile = {
+  fullName: string; email: string; cpf: string | null; birthDate: string | null; phone: Phone | null;
+  marketingOptIn: boolean; marketingOptInAt: string | null; termsVersion: string | null; termsAcceptedAt: string | null;
+  currentTermsVersion: string | null; termsCurrent: boolean; adultConfirmedAt: string | null; socialLogin: boolean;
+};
+
+/** A unique violation as the error the API answers: the e-mail or the CPF already has an account. */
+function uniqueError(error: unknown) {
+  const failure = error as { code?: string; constraint?: string };
+  if (failure.code !== "23505") return error;
+  return new Error(failure.constraint === "app_users_cpf_hash_key" ? "CPF_ALREADY_EXISTS" : "EMAIL_ALREADY_EXISTS");
+}
 
 export type CellarVintage = { vintage: number; quantity: number };
 import { createHash, pbkdf2Sync, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type pg from "pg";
 
 const SESSION_DAYS = 30;
+
+/** The current Termos de Uso (the newest version published). */
+export const CURRENT_TERMS_SQL = `(SELECT version FROM legal_documents WHERE kind = 'terms' ORDER BY published_at DESC LIMIT 1)`;
+/**
+ * The columns of PublicUser. profile_complete: the account has its CPF, the 18+
+ * confirmation and the current Termos de Uso accepted; until then the app asks for them.
+ */
+function userColumns(alias?: string) {
+  const c = (column: string) => alias ? `${alias}.${column}` : column;
+  return `${c("id")}, ${c("email")}::text AS email, ${c("display_name")}, ${c("role")}, ${c("plan")}, ${c("plan_expires_at")}, ${c("status")}, ${c("avatar_url")},
+    (${c("cpf_hash")} IS NOT NULL AND ${c("adult_confirmed_at")} IS NOT NULL AND ${c("terms_version")} IS NOT DISTINCT FROM ${CURRENT_TERMS_SQL}) AS profile_complete`;
+}
 
 export type Subscription = {
   plan: "free" | "premium"; startedAt: string | null; expiresAt: string | null;
@@ -18,31 +48,131 @@ export type Subscription = {
 // Used until vinato-web migration 0019 adds the prices to finance_settings.
 const DEFAULT_PRICES = { monthlyCents: 2990, yearlyCents: 23990 };
 
-export type PublicUser = { id: string; email: string; displayName: string; role: string; plan: "free" | "premium"; planExpiresAt: string | null; status: string; avatarUrl: string | null };
+export type PublicUser = { id: string; email: string; displayName: string; role: string; plan: "free" | "premium"; planExpiresAt: string | null; status: string; avatarUrl: string | null;
+  /** false: the app asks for the CPF, the date of birth and the Termos de Uso before anything else. */
+  profileComplete: boolean };
 
 export class AccountRepository {
   constructor(private readonly pool: pg.Pool) {}
 
-  async register(displayName: string, email: string, password: string) {
+  /**
+   * Cadastro: full name, e-mail, password, CPF and date of birth, with the Termos de
+   * Uso and the 18+ confirmation accepted (the API checks both) and the optional
+   * consent to news. CPF, date of birth and phone are written encrypted.
+   */
+  async register(displayName: string, email: string, password: string, personal: PersonalData) {
     const passwordHash = hashPassword(password);
+    const client = await this.pool.connect();
     try {
-      const result = await this.pool.query(
-        `INSERT INTO app_users (display_name, email, password_hash)
-         VALUES ($1, $2, $3)
-         RETURNING id, email::text, display_name, role, plan, plan_expires_at, status, avatar_url`,
-        [displayName.trim(), email.trim().toLowerCase(), passwordHash],
+      await client.query("BEGIN");
+      const result = await client.query(
+        `INSERT INTO app_users (display_name, email, password_hash, cpf_hash, cpf_encrypted, birth_date_encrypted, phone_country, phone_encrypted,
+           terms_version, terms_accepted_at, adult_confirmed_at, marketing_opt_in, marketing_opt_in_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), $10, CASE WHEN $10 THEN now() END)
+         RETURNING ${userColumns()}`,
+        [displayName.trim(), email.trim().toLowerCase(), passwordHash, cpfHash(personal.cpf), encryptField(personal.cpf), encryptField(personal.birthDate),
+          personal.phone?.country ?? null, personal.phone ? encryptField(JSON.stringify(personal.phone)) : null, personal.termsVersion, personal.marketing],
       );
-      return this.createSession(mapUser(result.rows[0]));
+      const user = mapUser(result.rows[0]);
+      await this.logConsents(client, user.id, [["terms", true, personal.termsVersion], ["adult", true, null], ["marketing", personal.marketing, null]]);
+      await client.query("COMMIT");
+      return this.createSession(user);
     } catch (error) {
-      if ((error as { code?: string }).code === "23505") throw new Error("EMAIL_ALREADY_EXISTS");
-      throw error;
+      await client.query("ROLLBACK");
+      throw uniqueError(error);
+    } finally {
+      client.release();
+    }
+  }
+
+  /** The Termos de Uso in force (the newest version), or null before any is published. */
+  async currentTerms() {
+    const result = await this.pool.query(`SELECT version, title, body, published_at FROM legal_documents WHERE kind = 'terms' ORDER BY published_at DESC LIMIT 1`);
+    const row = result.rows[0];
+    return row ? { version: String(row.version), title: String(row.title), body: String(row.body), publishedAt: new Date(row.published_at).toISOString() } : null;
+  }
+
+  /** "Meus dados" in the profile: only the account itself reads them, decrypted here. */
+  async getProfile(userId: string): Promise<AccountProfile | null> {
+    const result = await this.pool.query(
+      `SELECT display_name, email::text AS email, cpf_encrypted, birth_date_encrypted, phone_encrypted, terms_version, terms_accepted_at, adult_confirmed_at,
+              marketing_opt_in, marketing_opt_in_at, password_hash LIKE 'social:%' AS social, ${CURRENT_TERMS_SQL} AS current_terms
+       FROM app_users WHERE id = $1`,
+      [userId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const iso = (value: unknown) => (value ? new Date(String(value)).toISOString() : null);
+    const phone = decryptField(row.phone_encrypted);
+    return {
+      fullName: String(row.display_name), email: String(row.email), cpf: decryptField(row.cpf_encrypted), birthDate: decryptField(row.birth_date_encrypted),
+      phone: phone ? JSON.parse(phone) as Phone : null, marketingOptIn: row.marketing_opt_in === true, marketingOptInAt: iso(row.marketing_opt_in_at),
+      termsVersion: row.terms_version ?? null, termsAcceptedAt: iso(row.terms_accepted_at), currentTermsVersion: row.current_terms ?? null,
+      termsCurrent: row.terms_version != null && row.terms_version === row.current_terms, adultConfirmedAt: iso(row.adult_confirmed_at),
+      socialLogin: row.social === true,
+    };
+  }
+
+  /**
+   * Edits "Meus dados" (every field of the cadastro), and completes the account of
+   * whoever came by Apple or Google (CPF, date of birth, Termos de Uso, 18+). Only
+   * the fields sent change; every consent given or withdrawn goes to user_consents.
+   */
+  async updateProfile(userId: string, patch: ProfilePatch) {
+    const sets: string[] = [];
+    const params: unknown[] = [userId];
+    const set = (sql: string, ...values: unknown[]) => { values.forEach((value) => params.push(value)); sets.push(sql.replace(/\$(\d)/g, (_, n) => `$${params.length - values.length + Number(n)}`)); };
+    if (patch.displayName !== undefined) set("display_name = $1", patch.displayName.trim());
+    if (patch.email !== undefined) set("email = $1", patch.email.trim().toLowerCase());
+    if (patch.cpf !== undefined) set("cpf_hash = $1, cpf_encrypted = $2", cpfHash(patch.cpf), encryptField(patch.cpf));
+    if (patch.birthDate !== undefined) set("birth_date_encrypted = $1", encryptField(patch.birthDate));
+    if (patch.phone !== undefined) set("phone_country = $1, phone_encrypted = $2", patch.phone?.country ?? null, patch.phone ? encryptField(JSON.stringify(patch.phone)) : null);
+    if (patch.termsVersion !== undefined) set("terms_version = $1, terms_accepted_at = now()", patch.termsVersion);
+    if (patch.adult) sets.push("adult_confirmed_at = COALESCE(adult_confirmed_at, now())");
+    if (patch.marketing !== undefined) set("marketing_opt_in = $1, marketing_opt_in_at = CASE WHEN $1 THEN now() END", patch.marketing);
+    if (!sets.length) return this.publicUser(userId);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const before = (await client.query(`SELECT marketing_opt_in, adult_confirmed_at FROM app_users WHERE id = $1 FOR UPDATE`, [userId])).rows[0];
+      if (!before) { await client.query("ROLLBACK"); return null; }
+      const result = await client.query(`UPDATE app_users SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 RETURNING ${userColumns()}`, params);
+      const consents: [ConsentKind, boolean, string | null][] = [];
+      if (patch.termsVersion !== undefined) consents.push(["terms", true, patch.termsVersion]);
+      if (patch.adult && !before.adult_confirmed_at) consents.push(["adult", true, null]);
+      if (patch.marketing !== undefined && patch.marketing !== before.marketing_opt_in) consents.push(["marketing", patch.marketing, null]);
+      await this.logConsents(client, userId, consents);
+      // The admin panel's mirror of the account keeps the same name and e-mail.
+      if (patch.displayName !== undefined || patch.email !== undefined) {
+        await client.query(`SAVEPOINT mirror`);
+        await client.query(`UPDATE users SET display_name = $2, email = $3, updated_at = now() WHERE id = $1`, [userId, result.rows[0].display_name, result.rows[0].email])
+          .catch(() => client.query(`ROLLBACK TO SAVEPOINT mirror`));
+      }
+      await client.query("COMMIT");
+      return mapUser(result.rows[0]);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw uniqueError(error);
+    } finally {
+      client.release();
+    }
+  }
+
+  private async publicUser(userId: string) {
+    const result = await this.pool.query(`SELECT ${userColumns()} FROM app_users WHERE id = $1`, [userId]);
+    return result.rows[0] ? mapUser(result.rows[0]) : null;
+  }
+
+  private async logConsents(client: pg.PoolClient, userId: string, consents: [ConsentKind, boolean, string | null][]) {
+    for (const [kind, granted, version] of consents) {
+      await client.query(`INSERT INTO user_consents (user_id, kind, granted, version) VALUES ($1, $2, $3, $4)`, [userId, kind, granted, version]);
     }
   }
 
   async login(email: string, password: string) {
     const normalizedEmail = email.trim().toLowerCase();
     const result = await this.pool.query(
-      `SELECT id, email::text, display_name, role, plan, plan_expires_at, status, password_hash, avatar_url FROM app_users WHERE email = $1 LIMIT 1`,
+      `SELECT ${userColumns()}, password_hash FROM app_users WHERE email = $1 LIMIT 1`,
       [normalizedEmail],
     );
     const row = result.rows[0];
@@ -77,7 +207,7 @@ export class AccountRepository {
          password_hash = EXCLUDED.password_hash,
          role = EXCLUDED.role,
          updated_at = now()
-       RETURNING id, email::text, display_name, role, plan, plan_expires_at, status, avatar_url`,
+       RETURNING ${userColumns()}`,
       [legacy.id, email, legacy.display_name, hashPassword(password), mapLegacyRole(legacy.role)],
     );
 
@@ -98,7 +228,7 @@ export class AccountRepository {
     try {
       await client.query("BEGIN");
       const identity = await client.query(
-        `SELECT users.id, users.email::text, users.display_name, users.role, users.plan, users.plan_expires_at, users.status, users.avatar_url
+        `SELECT ${userColumns("users")}
          FROM user_identities identities JOIN app_users users ON users.id = identities.user_id
          WHERE identities.provider = $1 AND identities.provider_subject = $2 LIMIT 1`,
         [provider, subject],
@@ -106,7 +236,7 @@ export class AccountRepository {
       let row = identity.rows[0];
       if (!row) {
         const existing = await client.query(
-          `SELECT id, email::text, display_name, role, plan, plan_expires_at, status, avatar_url FROM app_users WHERE email = $1 LIMIT 1`,
+          `SELECT ${userColumns()} FROM app_users WHERE email = $1 LIMIT 1`,
           [email.toLowerCase()],
         );
         if (existing.rows[0]) row = existing.rows[0];
@@ -114,7 +244,7 @@ export class AccountRepository {
           const created = await client.query(
             `INSERT INTO app_users (email, display_name, password_hash, role, plan, status)
              VALUES ($1, $2, $3, 'user', 'free', 'active')
-             RETURNING id, email::text, display_name, role, plan, plan_expires_at, status, avatar_url`,
+             RETURNING ${userColumns()}`,
             [email.toLowerCase(), displayName?.trim() || email.split("@")[0], `social:${provider}`],
           );
           row = created.rows[0];
@@ -139,7 +269,7 @@ export class AccountRepository {
 
   async getUser(token: string): Promise<PublicUser | null> {
     const result = await this.pool.query(
-      `SELECT users.id, users.email::text, users.display_name, users.role, users.plan, users.plan_expires_at, users.status, users.avatar_url
+      `SELECT ${userColumns("users")}
        FROM user_sessions sessions
        JOIN app_users users ON users.id = sessions.user_id
        WHERE sessions.token_hash = $1 AND sessions.expires_at > now() AND users.status = 'active'
@@ -177,7 +307,7 @@ export class AccountRepository {
   async updateAvatar(userId: string, avatarUrl: string | null) {
     const result = await this.pool.query(
       `UPDATE app_users SET avatar_url = $2, updated_at = now()
-       WHERE id = $1 RETURNING id, email::text, display_name, role, plan, plan_expires_at, status, avatar_url`,
+       WHERE id = $1 RETURNING ${userColumns()}`,
       [userId, avatarUrl],
     );
     return mapUser(result.rows[0]);
@@ -327,7 +457,7 @@ export class AccountRepository {
 
   async listUsers() {
     const result = await this.pool.query(
-      `SELECT id, email::text, display_name, role, plan, plan_expires_at, status, avatar_url, created_at, updated_at
+      `SELECT ${userColumns()}, created_at, updated_at
        FROM app_users ORDER BY created_at DESC LIMIT 500`,
     );
     return result.rows.map((row) => ({ ...mapUser(row), createdAt: row.created_at, updatedAt: row.updated_at }));
@@ -339,7 +469,7 @@ export class AccountRepository {
       `UPDATE app_users SET status = COALESCE($2, status), plan = COALESCE($3, plan),
          plan_started_at = CASE WHEN $3 = 'premium' AND plan <> 'premium' THEN now() WHEN $3 = 'free' THEN NULL ELSE plan_started_at END,
          updated_at = now()
-       WHERE id = $1 RETURNING id, email::text, display_name, role, plan, plan_expires_at, status, avatar_url`,
+       WHERE id = $1 RETURNING ${userColumns()}`,
       [userId, access.status ?? null, access.plan ?? null],
     );
     if (!result.rows[0]) return null;
@@ -477,6 +607,7 @@ function mapUser(row: Record<string, unknown>): PublicUser {
     id: String(row.id), email: String(row.email), displayName: String(row.display_name), role: String(row.role),
     plan: effectivePlan(row.plan, expiresAt), planExpiresAt: expiresAt ? expiresAt.toISOString() : null,
     status: String(row.status ?? "active"), avatarUrl: typeof row.avatar_url === "string" ? row.avatar_url : null,
+    profileComplete: row.profile_complete === true,
   };
 }
 
