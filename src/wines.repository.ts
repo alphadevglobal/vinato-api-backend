@@ -13,6 +13,7 @@ import type {
   ScanWineLabelResult,
 } from "./types.js";
 import { mapWineRow } from "./wine-mapper.js";
+import { photoRefSql, photoUrl } from "./photo-url.js";
 import { canCreateWine, fillAssignments, proposedUpdates, readingToCatalogFields, splitFills, type CatalogFields } from "./wine-curation.js";
 import { createHash } from "node:crypto";
 import type pg from "pg";
@@ -65,16 +66,12 @@ const baseSelect = `
       ELSE grapes #>> '{}'
     END AS grapes,
     NULL::text AS image_path,
-    CASE
-      WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 AND jsonb_typeof(images->0) = 'string' THEN images->>0
-      WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 THEN COALESCE(images->0->>'url', images->0->>'image_url')
-      ELSE NULL
-    END AS image_url,
+    ${photoRefSql(0)} AS image_url,
     NULL::text AS source_url,
     data_source,
     curation_status,
     CASE WHEN jsonb_typeof(images) = 'array' AND jsonb_typeof(images->1) = 'object' AND images->1->>'role' = 'back'
-      THEN COALESCE(images->1->>'url', images->1->>'image_url') END AS back_image_url,
+      THEN ${photoRefSql(1)} END AS back_image_url,
     CASE WHEN jsonb_typeof(pairings->'dishes') = 'array' THEN ARRAY(
       SELECT CASE WHEN jsonb_typeof(dish) = 'string' THEN dish #>> '{}' ELSE dish->>'name' END
       FROM jsonb_array_elements(pairings->'dishes') dish
@@ -83,6 +80,7 @@ const baseSelect = `
     COALESCE((SELECT awarded.awards_count FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id), 0)::integer AS awards_count,
     (SELECT awarded.latest_award_year FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id) AS latest_award_year,
     (SELECT awarded.award_symbol FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id) AS award_symbol,
+    (SELECT awarded.awards FROM catalog_awarded_wines awarded WHERE awarded.id = catalog_wines.id) AS awards,
     created_at,
     updated_at
   FROM catalog_wines
@@ -212,6 +210,15 @@ export class PgWineRepository implements WineRepository {
 
   async findScanCandidates(data: ScannedWineData): Promise<CatalogCandidate[]> {
     return this.findCandidatesByTerms(searchTerms(data));
+  }
+
+  async findWinePhoto(wineId: string, index: number) {
+    const result = await this.pool.query<{ ref: string | null }>(
+      `SELECT CASE WHEN jsonb_typeof(images->$2::int) = 'string' THEN images->>$2::int ELSE COALESCE(images->$2::int->>'url', images->$2::int->>'image_url') END AS ref
+       FROM catalog_wines WHERE id = $1`,
+      [wineId, index],
+    );
+    return result.rows[0]?.ref ?? null;
   }
 
   /**
@@ -573,10 +580,9 @@ export class PgWineRepository implements WineRepository {
       this.pool.query(`
         WITH region_counts AS (
           SELECT region AS name, country, COUNT(*)::int AS count,
-                 MAX(CASE
-                   WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 AND jsonb_typeof(images->0) = 'string' AND images->>0 NOT ILIKE '%logo%' THEN images->>0
-                   WHEN jsonb_typeof(images) = 'array' AND jsonb_array_length(images) > 0 AND COALESCE(images->0->>'url', images->0->>'image_url') NOT ILIKE '%logo%' THEN COALESCE(images->0->>'url', images->0->>'image_url')
-                 END) AS image_url
+                 -- A link to one wine photo of the region (never the photo itself: the
+                 -- regions list was 4 MB with stored photos inline).
+                 MAX(CASE WHEN ${photoRefSql(0)} NOT ILIKE '%logo%' THEN id::text || '|' || ${photoRefSql(0)} END) AS image_url
           FROM catalog_wines WHERE length(btrim(region)) > 0 AND length(btrim(country)) > 0 AND curation_status <> 'rejected'
           GROUP BY region, country
         ), ranked AS (
@@ -622,7 +628,9 @@ export class PgWineRepository implements WineRepository {
 }
 
 function mapFacet(row: Record<string, unknown>) {
-  return { name: String(row.name), count: Number(row.count), ...(row.country ? { country: String(row.country) } : {}), ...(row.image_url ? { imageUrl: String(row.image_url) } : {}) };
+  const [wineId, ref] = typeof row.image_url === "string" ? [row.image_url.slice(0, row.image_url.indexOf("|")), row.image_url.slice(row.image_url.indexOf("|") + 1)] : ["", null];
+  const imageUrl = ref ? photoUrl(wineId, ref) : null;
+  return { name: String(row.name), count: Number(row.count), ...(row.country ? { country: String(row.country) } : {}), ...(imageUrl ? { imageUrl } : {}) };
 }
 
 function buildWhere(query: WineListQuery) {

@@ -45,6 +45,8 @@ export type Wine = {
   awardsCount?: number;
   latestAwardYear?: number | null;
   awardSymbol?: string | null;
+  /** Each award: what for (result, title), where (event, country), when (year) and for which vintage. */
+  awards?: WineAward[];
   /** "catalog" (imported base), "ai_scan" (created from a scan) or "admin". */
   dataSource?: string;
   /** "approved", "pending" (awaiting curation) or "rejected". */
@@ -53,6 +55,17 @@ export type Wine = {
   pairings?: string[];
   createdAt: string;
   updatedAt: string;
+};
+
+export type WineAward = {
+  result: string | null;
+  title: string | null;
+  event: string | null;
+  country: string | null;
+  year: number | null;
+  vintage: number | null;
+  symbol: string | null;
+  sourceUrl: string | null;
 };
 
 export type WineRow = {
@@ -95,6 +108,7 @@ export type WineRow = {
   awards_count: number;
   latest_award_year: number | null;
   award_symbol: string | null;
+  awards?: unknown;
   data_source?: string | null;
   curation_status?: string | null;
   back_image_url?: string | null;
@@ -187,6 +201,8 @@ export type WineRepository = {
   reconcileScan?(data: ScannedWineData, file: Express.Multer.File, userId?: string, trace?: import("./scan-audit.repository.js").ScanTrace): Promise<NonNullable<ScanWineLabelResult["catalog"]>>;
   // Scan without AI (label-text-match): barcode links and the catalog search by label text.
   findCandidatesByTerms?(terms: string[]): Promise<import("./catalog-matcher.js").CatalogCandidate[]>;
+  /** The stored or remote label photo images->index of a wine (GET /wines/:id/photo). */
+  findWinePhoto?(wineId: string, index: number): Promise<string | null>;
   /** Fills the empty sheet fields of a wine the scan created (and its "Novos Vinhos" proposal). */
   completeNewWine?(wineId: string, sheet: import("./scanner.service.js").WineSheet): Promise<void>;
   findWineByBarcode?(barcode: string): Promise<{ wineId: string; vintage: number | null } | null>;

@@ -1,3 +1,4 @@
+import { photoRefSql, photoUrl } from "./photo-url.js";
 import { createHash, pbkdf2Sync, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type pg from "pg";
 
@@ -184,7 +185,7 @@ export class AccountRepository {
       `SELECT favorites.created_at, wines.id,
               COALESCE(wines.scan_code, 'catalog-' || wines.id::text) AS lwin,
               wines.display_name, wines.producer_manufacturer, wines.country, wines.region,
-              wines.color, wines.vintage, wines.grapes, wines.images
+              wines.color, wines.vintage, wines.grapes, ${photoRefSql(0, "wines.images")} AS image_ref
        FROM user_favorites favorites
        JOIN catalog_wines wines ON wines.id = favorites.wine_id
        WHERE favorites.user_id = $1 ORDER BY favorites.created_at DESC`,
@@ -218,7 +219,7 @@ export class AccountRepository {
               wines.id, COALESCE(wines.scan_code, 'catalog-' || wines.id::text) AS lwin,
               wines.display_name, wines.producer_manufacturer,
               wines.country, wines.region, wines.color, wines.vintage,
-              wines.grapes, wines.images
+              wines.grapes, ${photoRefSql(0, "wines.images")} AS image_ref
        FROM user_cellars cellars
        JOIN catalog_wines wines ON wines.id = cellars.wine_id
        WHERE cellars.user_id = $1
@@ -252,7 +253,8 @@ export class AccountRepository {
   async getHistory(userId: string) {
     const result = await this.pool.query(
       `SELECT history.id, history.wine_id, history.status, history.image_uri,
-              history.result, history.scanned_at, wines.display_name, wines.country, wines.region
+              history.result, history.scanned_at, wines.display_name, wines.country, wines.region,
+              ${photoRefSql(0, "wines.images")} AS image_ref
        FROM user_scan_history history
        LEFT JOIN catalog_wines wines ON wines.id = history.wine_id
        WHERE history.user_id = $1 ORDER BY history.scanned_at DESC LIMIT 250`,
@@ -262,6 +264,8 @@ export class AccountRepository {
       id: row.id, wineId: row.wine_id, status: row.status, imageUri: row.image_uri,
       result: row.result, scannedAt: row.scanned_at, wineName: row.display_name,
       wineMeta: [row.region, row.country].filter(Boolean).join(" • "),
+      // The catalog photo as a cacheable link: the scan's imageUri is a file on the phone that may be gone.
+      wineImageUrl: row.wine_id ? photoUrl(String(row.wine_id), row.image_ref) : null,
     }));
   }
 
@@ -477,18 +481,6 @@ function mapLegacyRole(role: unknown): PublicUser["role"] {
   if (normalized === "editor") return "editor";
   return "user";
 }
-function firstImage(value: unknown) {
-  if (!Array.isArray(value) || value.length === 0) return null;
-  const first = value[0];
-  if (typeof first === "string") return first;
-  if (first && typeof first === "object") {
-    const item = first as { url?: unknown; image_url?: unknown };
-    const url = item.url ?? item.image_url;
-    return typeof url === "string" && url ? url : null;
-  }
-  return null;
-}
-
 function mapCatalogWine(row: Record<string, unknown>) {
   return {
     id: String(row.id), lwin: String(row.lwin), displayName: String(row.display_name),
@@ -499,7 +491,7 @@ function mapCatalogWine(row: Record<string, unknown>) {
     vintageYear: typeof row.vintage === "number" ? row.vintage : null,
     rating: null,
     grapes: formatGrapes(row.grapes),
-    imageUrl: firstImage(row.images), imagePath: null,
+    imageUrl: photoUrl(String(row.id), row.image_ref), imagePath: null,
   };
 }
 

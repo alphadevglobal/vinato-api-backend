@@ -14,8 +14,8 @@ const row = (overrides: Partial<WineRow> = {}): WineRow => ({
 
 describe("mapWineRow curation fields", () => {
   it("exposes the origin, the curation status, the back label and the pairings", () => {
-    expect(mapWineRow(row({ data_source: "ai_scan", curation_status: "pending", back_image_url: "data:image/jpeg;base64,AA==", pairings: ["Pizza", ""] })))
-      .toMatchObject({ dataSource: "ai_scan", curationStatus: "pending", backImageUrl: "data:image/jpeg;base64,AA==", pairings: ["Pizza"] });
+    expect(mapWineRow(row({ data_source: "ai_scan", curation_status: "pending", back_image_url: "photo:abc123def456", pairings: ["Pizza", ""] })))
+      .toMatchObject({ dataSource: "ai_scan", curationStatus: "pending", backImageUrl: "https://vinato-api-backend-eta.vercel.app/wines/w1/photo?i=1&v=abc123def456", pairings: ["Pizza"] });
   });
 
   it("treats rows without the new columns as approved catalog wines", () => {
@@ -32,5 +32,13 @@ describe("drinkingPhases (Janela de uso)", () => {
       { from: 1, to: 3, note: "Perfil floral" }, { from: 4, to: null, note: "Notas terrosas" }, { from: 8, to: 10, plus: true, note: "Em declínio" },
     ]);
     expect(drinkingPhases(null)).toEqual([]);
+  });
+});
+
+describe("label photos as links", () => {
+  it("never sends a stored photo inside the JSON", () => {
+    expect(mapWineRow(row({ image_url: "data:image/jpeg;base64,AA==" })).imageUrl).toBeNull();
+    expect(mapWineRow(row({ image_url: "photo:0123456789ab" })).imageUrl).toBe("https://vinato-api-backend-eta.vercel.app/wines/w1/photo?i=0&v=0123456789ab");
+    expect(mapWineRow(row({ image_url: "https://loja.com/a.jpg" })).imageUrl).toBe("https://loja.com/a.jpg");
   });
 });

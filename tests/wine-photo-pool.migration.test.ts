@@ -41,7 +41,7 @@ describe("migration 015: wine photo pool", () => {
     const main = dataUrl(10, 99);
     const id = await wine([{ url: main, source: "user_scan" }]);
     await addPhoto(id, main);
-    for (let fill = 1; fill <= 7; fill += 1) await addPhoto(id, dataUrl(10 + fill, fill));
+    for (let fill = 1; fill <= 7; fill += 1) { await new Promise((resolve) => setTimeout(resolve, 5)); await addPhoto(id, dataUrl(10 + fill, fill)); }
     const photos = await pool(id);
     expect(photos.map((photo) => photo.image_bytes)).toEqual([17, 16, 15, 14, 13, 10]);
   });

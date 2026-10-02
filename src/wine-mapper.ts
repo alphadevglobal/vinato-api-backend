@@ -1,4 +1,5 @@
-import type { DrinkingPhase, Wine, WineRow } from "./types.js";
+import type { DrinkingPhase, Wine, WineAward, WineRow } from "./types.js";
+import { photoUrl } from "./photo-url.js";
 
 /** catalog_wines.drinking_window → the valid phases, by start year. */
 export function drinkingPhases(value: unknown): DrinkingPhase[] {
@@ -11,6 +12,21 @@ export function drinkingPhases(value: unknown): DrinkingPhase[] {
     if (!Number.isInteger(from) || from < 0 || !note || (to !== null && (!Number.isInteger(to) || to < from))) return [];
     return [{ from, to, ...(phase.plus === true ? { plus: true } : {}), note }];
   }).sort((a, b) => a.from - b.from);
+}
+
+/** catalog_awarded_wines.awards → the awards with an event or a result, newest first. */
+export function wineAwards(value: unknown): WineAward[] {
+  if (!Array.isArray(value)) return [];
+  const text = (item: unknown) => typeof item === "string" && item.trim() ? item.trim() : null;
+  const year = (item: unknown) => Number.isInteger(Number(item)) && Number(item) > 0 ? Number(item) : null;
+  return value.flatMap((item): WineAward[] => {
+    const award = (item ?? {}) as Record<string, unknown>;
+    const result = text(award.result);
+    const event = text(award.event_name);
+    if (!result && !event) return [];
+    return [{ result, title: text(award.title), event, country: text(award.country), year: year(award.award_year), vintage: year(award.wine_vintage),
+      symbol: text(award.badge_symbol), sourceUrl: text(award.source_url) }];
+  }).sort((a, b) => (b.year ?? 0) - (a.year ?? 0));
 }
 
 const toIsoString = (value: string | Date): string =>
@@ -50,15 +66,16 @@ export const mapWineRow = (row: WineRow): Wine => ({
   rating: row.rating === null ? null : Number(row.rating),
   grapes: row.grapes,
   imagePath: row.image_path,
-  imageUrl: row.image_url,
+  imageUrl: photoUrl(row.id, row.image_url, 0),
   sourceUrl: row.source_url,
   reviewCount: row.review_count,
   awardsCount: row.awards_count,
   latestAwardYear: row.latest_award_year,
   awardSymbol: row.award_symbol,
+  awards: wineAwards(row.awards),
   dataSource: row.data_source ?? "catalog",
   curationStatus: row.curation_status ?? "approved",
-  backImageUrl: row.back_image_url ?? null,
+  backImageUrl: photoUrl(row.id, row.back_image_url, 1),
   pairings: (row.pairings ?? []).filter(Boolean),
   createdAt: toIsoString(row.created_at),
   updatedAt: toIsoString(row.updated_at),

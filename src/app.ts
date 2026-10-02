@@ -398,6 +398,25 @@ export function createApp(dependencies: AppDependencies) {
     }),
   );
 
+  // Label photos as links (photo-url.ts): the version in the link changes with the
+  // photo, so phones and CDNs keep it for a year.
+  app.get(
+    "/wines/:id/photo",
+    asyncHandler(async (req, res) => {
+      const id = String(req.params.id);
+      const index = Number.parseInt(String(req.query.i ?? "0"), 10);
+      if (!isUuid(id) || !Number.isInteger(index) || index < 0 || index > 10 || !dependencies.wineRepository.findWinePhoto) throw notFound("Foto não encontrada.");
+      const ref = await dependencies.wineRepository.findWinePhoto(id, index);
+      const match = /^data:([^;,]+);base64,(.+)$/s.exec(ref ?? "");
+      if (match) {
+        res.set({ "Content-Type": match[1], "Cache-Control": "public, max-age=31536000, immutable" }).send(Buffer.from(match[2], "base64"));
+        return;
+      }
+      if (ref && /^https?:\/\//i.test(ref)) { res.redirect(302, ref); return; }
+      throw notFound("Foto não encontrada.");
+    }),
+  );
+
   app.get(
     "/wines/autocomplete",
     asyncHandler(async (req, res) => {
