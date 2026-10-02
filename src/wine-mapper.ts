@@ -1,4 +1,17 @@
-import type { Wine, WineRow } from "./types.js";
+import type { DrinkingPhase, Wine, WineRow } from "./types.js";
+
+/** catalog_wines.drinking_window → the valid phases, by start year. */
+export function drinkingPhases(value: unknown): DrinkingPhase[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): DrinkingPhase[] => {
+    const phase = (item ?? {}) as Record<string, unknown>;
+    const from = Number(phase.from);
+    const to = phase.to === null || phase.to === undefined ? null : Number(phase.to);
+    const note = typeof phase.note === "string" ? phase.note.trim() : "";
+    if (!Number.isInteger(from) || from < 0 || !note || (to !== null && (!Number.isInteger(to) || to < from))) return [];
+    return [{ from, to, ...(phase.plus === true ? { plus: true } : {}), note }];
+  }).sort((a, b) => a.from - b.from);
+}
 
 const toIsoString = (value: string | Date): string =>
   value instanceof Date ? value.toISOString() : new Date(value).toISOString();
@@ -32,6 +45,7 @@ export const mapWineRow = (row: WineRow): Wine => ({
   vintageYear: row.vintage_year,
   alcohol: row.alcohol === null ? null : Number(row.alcohol),
   agingPotential: row.aging_potential ?? null,
+  drinkingWindow: drinkingPhases(row.drinking_window),
   priceUsd: row.price_usd === null ? null : Number(row.price_usd),
   rating: row.rating === null ? null : Number(row.rating),
   grapes: row.grapes,

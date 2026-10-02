@@ -46,6 +46,7 @@ const baseSelect = `
     vintage AS vintage_year,
     alcohol_percent AS alcohol,
     aging_potential,
+    drinking_window,
     NULL::numeric AS price_usd,
     -- "Nota Crítica": average of the users' reviews (1 to 5), from wine_review_stats.
     (SELECT round(stats.rating_sum / NULLIF(stats.review_count, 0), 1) FROM wine_review_stats stats WHERE stats.wine_id = catalog_wines.id) AS rating,

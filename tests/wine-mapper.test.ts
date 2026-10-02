@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { mapWineRow } from "../src/wine-mapper.js";
 import type { WineRow } from "../src/types.js";
+import { drinkingPhases } from "../src/wine-mapper.js";
 
 const row = (overrides: Partial<WineRow> = {}): WineRow => ({
   id: "w1", lwin: "catalog-w1", status: "active", display_name: "Vinho", producer_title: null, producer_name: null, wine: null,
@@ -19,5 +20,17 @@ describe("mapWineRow curation fields", () => {
 
   it("treats rows without the new columns as approved catalog wines", () => {
     expect(mapWineRow(row())).toMatchObject({ dataSource: "catalog", curationStatus: "approved", backImageUrl: null, pairings: [] });
+  });
+});
+
+describe("drinkingPhases (Janela de uso)", () => {
+  it("keeps the valid phases by start year", () => {
+    expect(drinkingPhases([
+      { from: 8, to: 10, plus: true, note: " Em declínio " }, { from: 1, to: 3, note: "Perfil floral" },
+      { from: 5, to: 2, note: "invertida" }, { from: 2, note: "" }, "lixo", { from: "4", to: null, note: "Notas terrosas" },
+    ])).toEqual([
+      { from: 1, to: 3, note: "Perfil floral" }, { from: 4, to: null, note: "Notas terrosas" }, { from: 8, to: 10, plus: true, note: "Em declínio" },
+    ]);
+    expect(drinkingPhases(null)).toEqual([]);
   });
 });

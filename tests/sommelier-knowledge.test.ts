@@ -15,6 +15,7 @@ async function seed() {
   const soalheiro = await wine("Soalheiro Alvarinho", { producer: "Soalheiro", vintage: 2023, color: "White", region: "Vinho Verde", country: "Portugal", aging: "3 a 5 anos" });
   await wine("Soalheiro Primeiras Vinhas", { producer: "Soalheiro", status: "pending" });
   await db.query(`insert into user_cellars (user_id, wine_id, quantity) values ($1, $2, 2)`, [user!.id, almaviva]);
+  await db.query(`update catalog_wines set drinking_window = $2::jsonb where id = $1`, [almaviva, JSON.stringify([{ from: 4, to: 7, note: "notas terrosas" }, { from: 1, to: 3, note: "perfil floral" }, { from: 8, to: 10, plus: true, note: "em declínio" }])]);
   await db.query(`insert into user_favorites (user_id, wine_id) values ($1, $2)`, [user!.id, soalheiro]);
   await db.query(`insert into wine_reviews (wine_id, user_id, rating, comment) values ($1, $2, 4.5, 'Mineral e fresco')`, [soalheiro, user!.id]);
   await db.query(`insert into user_scan_history (user_id, wine_id, status, result) values ($1, $2, 'success', '{}')`, [user!.id, almaviva]);
@@ -28,7 +29,7 @@ describe("PgSommelierKnowledge", () => {
     const { pool, userId } = await seed();
     const text = await new PgSommelierKnowledge(pool).forUser(userId, "O Soalheiro Alvarinho vai bem com polvo?");
     expect(text).toContain("Cliente: Ana (membro VINATO Premium).");
-    expect(text).toContain("- Almaviva 2017 | Red | Puente Alto, Chile | guarda: Até 2040 | 2 garrafa(s)");
+    expect(text).toContain("- Almaviva 2017 | Red | Puente Alto, Chile | guarda: Até 2040 | janela de uso (anos após a safra): 1-3 anos: perfil floral; 4-7 anos: notas terrosas; 8-10+ anos: em declínio | 2 garrafa(s)");
     expect(text).toContain("Vinhos favoritos do cliente: Soalheiro Alvarinho 2023.");
     expect(text).toContain('- Soalheiro Alvarinho: 4.5 — "Mineral e fresco"');
     expect(text).toContain("Últimos rótulos que o cliente escaneou: Almaviva (");

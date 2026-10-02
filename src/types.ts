@@ -1,5 +1,8 @@
 import type { RequestHandler } from "express";
 
+/** Janela de uso: one phase of the wine's life, in years after the vintage ("plus": and beyond). */
+export type DrinkingPhase = { from: number; to: number | null; plus?: boolean; note: string };
+
 export type Wine = {
   id: string;
   lwin: string;
@@ -30,6 +33,8 @@ export type Wine = {
   alcohol?: number | null;
   /** Tempo de guarda (catalog_wines.aging_potential): shown to Premium members. */
   agingPotential?: string | null;
+  /** Janela de uso: phases after the vintage ({ from, to, plus?, note }), shown to Premium members. */
+  drinkingWindow?: DrinkingPhase[];
   priceUsd?: number | null;
   rating?: number | null;
   grapes?: string | null;
@@ -79,6 +84,7 @@ export type WineRow = {
   vintage_year: number | null;
   alcohol: string | number | null;
   aging_potential?: string | null;
+  drinking_window?: unknown;
   price_usd: string | number | null;
   rating: string | number | null;
   grapes: string | null;

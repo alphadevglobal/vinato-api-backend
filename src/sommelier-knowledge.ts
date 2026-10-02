@@ -1,6 +1,11 @@
 import type pg from "pg";
 import { normalizeText } from "./catalog-matcher.js";
 import { namesRestaurant } from "./sommelier-wine-list.js";
+import { drinkingPhases } from "./wine-mapper.js";
+
+/** "1-3 anos: perfil floral; 4-7 anos: notas terrosas; 8+ anos: em declínio". */
+const windowText = (value: unknown) => drinkingPhases(value)
+  .map((phase) => `${phase.from}${phase.to !== null && phase.to !== phase.from ? `-${phase.to}` : ""}${phase.plus ? "+" : ""} anos: ${phase.note}`).join("; ") || null;
 
 /**
  * Everything the app knows that helps the Sommelier answer, added to its
@@ -52,8 +57,8 @@ export class PgSommelierKnowledge implements SommelierKnowledge {
   async forUser(userId: string, question: string) {
     const [profile, cellar, favorites, reviews, scans, places, catalog] = await Promise.all([
       this.rows<{ display_name: string | null; plan: string }>(`SELECT display_name, plan FROM app_users WHERE id = $1`, [userId]),
-      this.rows<{ name: string; vintage: number | null; color: string | null; origin: string | null; aging: string | null; quantity: number }>(
-        `SELECT w.display_name AS name, w.vintage, w.color, concat_ws(', ', w.region, w.country) AS origin, w.aging_potential AS aging, c.quantity
+      this.rows<{ name: string; vintage: number | null; color: string | null; origin: string | null; aging: string | null; drinking: unknown; quantity: number }>(
+        `SELECT w.display_name AS name, w.vintage, w.color, concat_ws(', ', w.region, w.country) AS origin, w.aging_potential AS aging, w.drinking_window AS drinking, c.quantity
          FROM user_cellars c JOIN catalog_wines w ON w.id = c.wine_id WHERE c.user_id = $1 ORDER BY c.updated_at DESC LIMIT 40`, [userId]),
       this.rows<{ name: string; vintage: number | null }>(
         `SELECT w.display_name AS name, w.vintage FROM user_favorites f JOIN catalog_wines w ON w.id = f.wine_id WHERE f.user_id = $1 ORDER BY f.created_at DESC LIMIT 20`, [userId]),
@@ -73,7 +78,7 @@ export class PgSommelierKnowledge implements SommelierKnowledge {
     const parts: string[] = [];
     const me = profile[0];
     if (me) parts.push(`Cliente: ${me.display_name?.trim() || "sem nome informado"} (${me.plan === "premium" ? "membro VINATO Premium" : "plano gratuito"}).`);
-    if (cellar.length) parts.push(`Adega do cliente (vinhos que ele tem em casa):\n${cellar.map((wine) => `- ${join(`${wine.name}${wine.vintage ? ` ${wine.vintage}` : ""}`, wine.color, wine.origin, wine.aging && `guarda: ${wine.aging}`, `${wine.quantity} garrafa(s)`)}`).join("\n")}`);
+    if (cellar.length) parts.push(`Adega do cliente (vinhos que ele tem em casa):\n${cellar.map((wine) => `- ${join(`${wine.name}${wine.vintage ? ` ${wine.vintage}` : ""}`, wine.color, wine.origin, wine.aging && `guarda: ${wine.aging}`, windowText(wine.drinking) && `janela de uso (anos após a safra): ${windowText(wine.drinking)}`, `${wine.quantity} garrafa(s)`)}`).join("\n")}`);
     if (favorites.length) parts.push(`Vinhos favoritos do cliente: ${favorites.map((wine) => `${wine.name}${wine.vintage ? ` ${wine.vintage}` : ""}`).join("; ")}.`);
     if (reviews.length) parts.push(`Avaliações do cliente (nota de 1 a 5):\n${reviews.map((review) => `- ${review.name}: ${review.rating}${review.comment ? ` — "${review.comment}"` : ""}`).join("\n")}`);
     if (scans.length) parts.push(`Últimos rótulos que o cliente escaneou: ${scans.filter((scan) => scan.name).map((scan) => `${scan.name} (${new Date(scan.scanned_at).toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" })})`).join("; ")}.`);
@@ -92,10 +97,10 @@ ${parts.join("\n\n")}`;
     if (!words.length) return [];
     const plain = `translate(lower(w.display_name || ' ' || coalesce(w.producer_manufacturer, '')), 'áàâãäåéèêëíìîïóòôõöúùûüçñ', 'aaaaaaeeeeiiiiooooouuuucn')`;
     const hits = words.map((_, index) => `(CASE WHEN ${plain} LIKE $${index + 1} THEN 1 ELSE 0 END)`).join(" + ");
-    const rows = await this.rows<{ name: string; vintage: number | null; producer: string | null; origin: string | null; color: string | null; grapes: string | null; alcohol: number | null; aging: string | null; average: number | null; reviews: number | null; price: number | null; currency: string | null; store: string | null; hits: number }>(
+    const rows = await this.rows<{ name: string; vintage: number | null; producer: string | null; origin: string | null; color: string | null; grapes: string | null; alcohol: number | null; aging: string | null; drinking: unknown; average: number | null; reviews: number | null; price: number | null; currency: string | null; store: string | null; hits: number }>(
       `SELECT w.display_name AS name, w.vintage, w.producer_manufacturer AS producer, concat_ws(', ', w.region, w.country) AS origin, w.color,
               (SELECT string_agg(coalesce(g->>'name', g #>> '{}'), ', ') FROM jsonb_array_elements(CASE WHEN jsonb_typeof(w.grapes) = 'array' THEN w.grapes ELSE '[]'::jsonb END) g) AS grapes,
-              w.alcohol_percent::float AS alcohol, w.aging_potential AS aging,
+              w.alcohol_percent::float AS alcohol, w.aging_potential AS aging, w.drinking_window AS drinking,
               (SELECT round(s.rating_sum / NULLIF(s.review_count, 0), 1)::float FROM wine_review_stats s WHERE s.wine_id = w.id) AS average,
               (SELECT s.review_count FROM wine_review_stats s WHERE s.wine_id = w.id) AS reviews,
               best.price, best.currency, best.store, (${hits}) AS hits
@@ -110,7 +115,7 @@ ${parts.join("\n\n")}`;
       words.map((word) => `%${word}%`),
     );
     return rows.map((wine) => `- ${join(`${wine.name}${wine.vintage ? ` ${wine.vintage}` : ""}`, wine.producer && `produtor ${wine.producer}`, wine.origin, wine.color, wine.grapes,
-      wine.alcohol && `${wine.alcohol}% álcool`, wine.aging && `tempo de guarda: ${wine.aging}`,
+      wine.alcohol && `${wine.alcohol}% álcool`, wine.aging && `tempo de guarda: ${wine.aging}`, windowText(wine.drinking) && `janela de uso (anos após a safra): ${windowText(wine.drinking)}`,
       wine.reviews ? `nota dos usuários ${wine.average}/5 (${wine.reviews} avaliações)` : null,
       wine.price !== null ? `a partir de ${money(wine.price, wine.currency ?? "BRL")} em ${wine.store}` : null)}`);
   }
