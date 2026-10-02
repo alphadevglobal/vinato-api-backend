@@ -1,4 +1,7 @@
 import { photoRefSql, photoUrl } from "./photo-url.js";
+import { drinkingPhases } from "./wine-mapper.js";
+
+export type CellarVintage = { vintage: number; quantity: number };
 import { createHash, pbkdf2Sync, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type pg from "pg";
 
@@ -219,7 +222,9 @@ export class AccountRepository {
               wines.id, COALESCE(wines.scan_code, 'catalog-' || wines.id::text) AS lwin,
               wines.display_name, wines.producer_manufacturer,
               wines.country, wines.region, wines.color, wines.vintage,
-              wines.grapes, ${photoRefSql(0, "wines.images")} AS image_ref
+              wines.grapes, ${photoRefSql(0, "wines.images")} AS image_ref, wines.drinking_window,
+              COALESCE((SELECT jsonb_agg(jsonb_build_object('vintage', v.vintage, 'quantity', v.quantity) ORDER BY v.vintage DESC)
+                FROM user_cellar_vintages v WHERE v.user_id = cellars.user_id AND v.wine_id = cellars.wine_id), '[]'::jsonb) AS vintages
        FROM user_cellars cellars
        JOIN catalog_wines wines ON wines.id = cellars.wine_id
        WHERE cellars.user_id = $1
@@ -230,7 +235,10 @@ export class AccountRepository {
       quantity: row.quantity,
       addedAt: row.added_at,
       updatedAt: row.updated_at,
-      wine: mapCatalogWine(row),
+      // The vintages the user has (the wine is the same whatever the vintage) and the
+      // wine's janela de uso, so the app tells where each vintage is in it.
+      vintages: row.vintages as CellarVintage[],
+      wine: { ...mapCatalogWine(row), drinkingWindow: drinkingPhases(row.drinking_window) },
     }));
   }
 
@@ -244,6 +252,40 @@ export class AccountRepository {
       [userId, wineId, quantity],
     );
     return result.rows[0]?.quantity ?? null;
+  }
+
+  /**
+   * Replaces the vintages the user has of a cellar wine (adding the wine to the
+   * cellar when it is not there). The bottles of the wine are at least the bottles
+   * of its vintages. Returns null when the wine does not exist.
+   */
+  async setCellarVintages(userId: string, wineId: string, vintages: CellarVintage[]) {
+    const bottles = vintages.reduce((total, item) => total + item.quantity, 0);
+    const cellar = await this.pool.query(
+      `INSERT INTO user_cellars (user_id, wine_id, quantity)
+       SELECT $1, id, GREATEST($3::int, 1) FROM catalog_wines WHERE id = $2
+       ON CONFLICT (user_id, wine_id) DO UPDATE SET quantity = GREATEST(user_cellars.quantity, $3::int), updated_at = now()
+       RETURNING quantity`,
+      [userId, wineId, bottles],
+    );
+    if (!cellar.rows[0]) return null;
+    await this.pool.query(
+      `WITH next AS (SELECT * FROM jsonb_to_recordset($3::jsonb) AS item(vintage int, quantity int)),
+       removed AS (DELETE FROM user_cellar_vintages WHERE user_id = $1 AND wine_id = $2 AND vintage NOT IN (SELECT vintage FROM next))
+       INSERT INTO user_cellar_vintages (user_id, wine_id, vintage, quantity) SELECT $1, $2, vintage, quantity FROM next
+       ON CONFLICT (user_id, wine_id, vintage) DO UPDATE SET quantity = EXCLUDED.quantity`,
+      [userId, wineId, JSON.stringify(vintages)],
+    );
+    return { quantity: Number(cellar.rows[0].quantity), vintages: [...vintages].sort((a, b) => b.vintage - a.vintage) };
+  }
+
+  /** Adds one vintage to a cellar wine (the vintage read on the label when the wine is added from a scan). */
+  async addCellarVintage(userId: string, wineId: string, vintage: number) {
+    await this.pool.query(
+      `INSERT INTO user_cellar_vintages (user_id, wine_id, vintage) SELECT user_id, wine_id, $3 FROM user_cellars WHERE user_id = $1 AND wine_id = $2
+       ON CONFLICT (user_id, wine_id, vintage) DO NOTHING`,
+      [userId, wineId, vintage],
+    );
   }
 
   async deleteCellarWine(userId: string, wineId: string) {

@@ -29,7 +29,7 @@ describe("PgSommelierKnowledge", () => {
     const { pool, userId } = await seed();
     const text = await new PgSommelierKnowledge(pool).forUser(userId, "O Soalheiro Alvarinho vai bem com polvo?");
     expect(text).toContain("Cliente: Ana (membro VINATO Premium).");
-    expect(text).toContain("- Almaviva 2017 | Red | Puente Alto, Chile | guarda: Até 2040 | janela de uso (anos após a safra): 1-3 anos: perfil floral; 4-7 anos: notas terrosas; 8-10+ anos: em declínio | 2 garrafa(s)");
+    expect(text).toContain("- Almaviva | Red | Puente Alto, Chile | guarda: Até 2040 | janela de uso (anos após a safra): 1-3 anos: perfil floral; 4-7 anos: notas terrosas; 8-10+ anos: em declínio | 2 garrafa(s)");
     expect(text).toContain("Vinhos favoritos do cliente: Soalheiro Alvarinho 2023.");
     expect(text).toContain('- Soalheiro Alvarinho: 4.5 — "Mineral e fresco"');
     expect(text).toContain("Últimos rótulos que o cliente escaneou: Almaviva (");

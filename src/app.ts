@@ -61,6 +61,8 @@ const upload = multer({
   },
 });
 
+const isVintage = (value: number) => Number.isInteger(value) && value >= 1800 && value <= new Date().getFullYear() + 1;
+
 export function createApp(dependencies: AppDependencies) {
   const app = express();
   // Work after the answer (scan audit, sheet of a new wine): Vercel keeps the function
@@ -257,9 +259,33 @@ export function createApp(dependencies: AppDependencies) {
       if (!isUuid(req.params.wineId)) throw badRequest("ID do vinho inválido.");
       const quantity = Number(req.body?.quantity);
       if (!Number.isInteger(quantity) || quantity < 0 || quantity > 9999) throw badRequest("Quantidade inválida.");
+      const vintage = req.body?.vintage === undefined || req.body?.vintage === null ? null : Number(req.body.vintage);
+      if (vintage !== null && !isVintage(vintage)) throw badRequest("Safra inválida.");
       const saved = await accounts.setCellarQuantity(user.id, req.params.wineId, quantity);
       if (saved === null) throw notFound("Vinho não encontrado no catalog_wines.");
+      if (vintage !== null) await accounts.addCellarVintage(user.id, req.params.wineId, vintage);
       res.json({ wineId: req.params.wineId, quantity: saved });
+    }),
+  );
+
+  // Adega: the vintages the user has of the wine, each with its bottles ([] clears them).
+  app.put(
+    "/me/cellar/:wineId/vintages",
+    asyncHandler(async (req, res) => {
+      const { accounts, user } = await authenticated(req, dependencies);
+      requirePremium(user);
+      if (!isUuid(req.params.wineId)) throw badRequest("ID do vinho inválido.");
+      const items: unknown[] = Array.isArray(req.body?.vintages) ? req.body.vintages : [];
+      if (!Array.isArray(req.body?.vintages) || items.length > 60) throw badRequest("Safras inválidas.");
+      const vintages = items.map((item) => {
+        const entry = (item ?? {}) as Record<string, unknown>;
+        return { vintage: Number(entry.vintage), quantity: entry.quantity === undefined ? 1 : Number(entry.quantity) };
+      });
+      if (vintages.some((item) => !isVintage(item.vintage) || !Number.isInteger(item.quantity) || item.quantity < 1 || item.quantity > 9999)
+        || new Set(vintages.map((item) => item.vintage)).size !== vintages.length) throw badRequest("Safras inválidas: um ano de 4 dígitos por safra e ao menos 1 garrafa.");
+      const saved = await accounts.setCellarVintages(user.id, req.params.wineId, vintages);
+      if (!saved) throw notFound("Vinho não encontrado no catalog_wines.");
+      res.json({ wineId: req.params.wineId, ...saved });
     }),
   );
 

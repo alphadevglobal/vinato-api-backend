@@ -57,8 +57,9 @@ export class PgSommelierKnowledge implements SommelierKnowledge {
   async forUser(userId: string, question: string) {
     const [profile, cellar, favorites, reviews, scans, places, catalog] = await Promise.all([
       this.rows<{ display_name: string | null; plan: string }>(`SELECT display_name, plan FROM app_users WHERE id = $1`, [userId]),
-      this.rows<{ name: string; vintage: number | null; color: string | null; origin: string | null; aging: string | null; drinking: unknown; quantity: number }>(
-        `SELECT w.display_name AS name, w.vintage, w.color, concat_ws(', ', w.region, w.country) AS origin, w.aging_potential AS aging, w.drinking_window AS drinking, c.quantity
+      this.rows<{ name: string; vintages: string | null; color: string | null; origin: string | null; aging: string | null; drinking: unknown; quantity: number }>(
+        `SELECT w.display_name AS name, w.color, concat_ws(', ', w.region, w.country) AS origin, w.aging_potential AS aging, w.drinking_window AS drinking, c.quantity,
+                (SELECT string_agg(v.vintage || ' (' || v.quantity || ')', ', ' ORDER BY v.vintage) FROM user_cellar_vintages v WHERE v.user_id = c.user_id AND v.wine_id = c.wine_id) AS vintages
          FROM user_cellars c JOIN catalog_wines w ON w.id = c.wine_id WHERE c.user_id = $1 ORDER BY c.updated_at DESC LIMIT 40`, [userId]),
       this.rows<{ name: string; vintage: number | null }>(
         `SELECT w.display_name AS name, w.vintage FROM user_favorites f JOIN catalog_wines w ON w.id = f.wine_id WHERE f.user_id = $1 ORDER BY f.created_at DESC LIMIT 20`, [userId]),
@@ -78,7 +79,7 @@ export class PgSommelierKnowledge implements SommelierKnowledge {
     const parts: string[] = [];
     const me = profile[0];
     if (me) parts.push(`Cliente: ${me.display_name?.trim() || "sem nome informado"} (${me.plan === "premium" ? "membro VINATO Premium" : "plano gratuito"}).`);
-    if (cellar.length) parts.push(`Adega do cliente (vinhos que ele tem em casa):\n${cellar.map((wine) => `- ${join(`${wine.name}${wine.vintage ? ` ${wine.vintage}` : ""}`, wine.color, wine.origin, wine.aging && `guarda: ${wine.aging}`, windowText(wine.drinking) && `janela de uso (anos após a safra): ${windowText(wine.drinking)}`, `${wine.quantity} garrafa(s)`)}`).join("\n")}`);
+    if (cellar.length) parts.push(`Adega do cliente (vinhos que ele tem em casa):\n${cellar.map((wine) => `- ${join(wine.name, wine.vintages && `safras que ele tem (garrafas): ${wine.vintages}`, wine.color, wine.origin, wine.aging && `guarda: ${wine.aging}`, windowText(wine.drinking) && `janela de uso (anos após a safra): ${windowText(wine.drinking)}`, `${wine.quantity} garrafa(s)`)}`).join("\n")}`);
     if (favorites.length) parts.push(`Vinhos favoritos do cliente: ${favorites.map((wine) => `${wine.name}${wine.vintage ? ` ${wine.vintage}` : ""}`).join("; ")}.`);
     if (reviews.length) parts.push(`Avaliações do cliente (nota de 1 a 5):\n${reviews.map((review) => `- ${review.name}: ${review.rating}${review.comment ? ` — "${review.comment}"` : ""}`).join("\n")}`);
     if (scans.length) parts.push(`Últimos rótulos que o cliente escaneou: ${scans.filter((scan) => scan.name).map((scan) => `${scan.name} (${new Date(scan.scanned_at).toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" })})`).join("; ")}.`);
