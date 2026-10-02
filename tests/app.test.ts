@@ -357,6 +357,37 @@ describe("scan audit log", () => {
     expect(record.mock.calls[0][0]).toMatchObject({ success: true, outcome: "ai_created", catalogWineId: seedWines[0].id, imageAdded: true });
   });
 
+  it("answers first, then writes the audit and the sheet of the wine the scan created", async () => {
+    const order: string[] = [];
+    const pending: Promise<unknown>[] = [];
+    const record = vi.fn(async () => { order.push("audit"); });
+    const sheet = { description: "Tinto frutado.", foodPairings: ["Massas"], agingPotential: "3 a 5 anos", drinkingWindow: null };
+    const repository = Object.assign(new MemoryWineRepository(seedWines), {
+      reconcileScan: vi.fn(async () => ({ status: "matched" as const, wineId: seedWines[0].id, imageAdded: true, created: true, alternatives: [] })),
+      completeNewWine: vi.fn(async () => { order.push("sheet saved"); }),
+    });
+    const scanner = { scanWineLabel: vi.fn(async () => ({ success: true as const, data: reading })), describeWine: vi.fn(async () => sheet) };
+    const app = createApp({ wineRepository: repository, wineScanner: scanner, scanAudit: { record }, background: (work) => { order.push("answered"); pending.push(work); } });
+    await post(app).expect(200);
+    await Promise.all(pending);
+    expect(order[0]).toBe("answered");
+    expect(order).toEqual(expect.arrayContaining(["audit", "sheet saved"]));
+    expect(scanner.describeWine).toHaveBeenCalledWith(reading);
+    expect(repository.completeNewWine).toHaveBeenCalledWith(seedWines[0].id, sheet);
+  });
+
+  it("does not write a sheet for a wine the catalog already had", async () => {
+    const pending: Promise<unknown>[] = [];
+    const repository = Object.assign(new MemoryWineRepository(seedWines), {
+      reconcileScan: vi.fn(async () => ({ status: "matched" as const, wineId: seedWines[0].id, imageAdded: false, alternatives: [] })),
+      completeNewWine: vi.fn(),
+    });
+    const scanner = { scanWineLabel: vi.fn(async () => ({ success: true as const, data: reading })), describeWine: vi.fn() };
+    await post(createApp({ wineRepository: repository, wineScanner: scanner, background: (work) => pending.push(work) })).expect(200);
+    await Promise.all(pending);
+    expect(scanner.describeWine).not.toHaveBeenCalled();
+  });
+
   it("returns and audits the reused code when an identical photo is already queued", async () => {
     const record = vi.fn(async () => undefined);
     const repository = Object.assign(new MemoryWineRepository(seedWines), {

@@ -197,8 +197,10 @@ export function scoreCandidate(data: ScannedWineData, candidate: CatalogCandidat
   // Only rows that name a producer can contradict the label.
   const producerMissing = producerTokens.length > 0 && Boolean(candidate.producer) && !producerTokens.some((token) => candidateIdentity.has(token));
 
+  // The vintage never decides which wine it is (a Ciro from 2016 or 2020 is the same
+  // Ciro): it only breaks ties between rows of the same wine.
   const vintage = labelVintage(data);
-  if (vintage && candidate.vintage === vintage) score += 0.1;
+  if (vintage && candidate.vintage === vintage) score += 0.02;
 
   // A red label never matches the white or sparkling version of the same line.
   // The name says it first ("il Rosso" is red even if the imported row says White);
@@ -276,10 +278,6 @@ export function scoreCandidate(data: ScannedWineData, candidate: CatalogCandidat
   // for a "Pulenta Estate I Malbec") names another wine of the producer.
   const unmatchedName = nameTokens.filter((token) => !hasWord(candidateIdentity, token) && !GRAPE_WORDS.has(token) && !places.has(token) && !TIER_WORDS.has(token));
   if (unmatchedName.length) score = Math.min(score, 0.65);
-
-  // A row for another vintage is another bottle (its notes and scores differ):
-  // keep it below the match threshold so it is offered as an alternative.
-  if (vintage && candidate.vintage && candidate.vintage !== vintage) score = Math.min(score, 0.6);
 
   // Not capped at 1 here: a perfect name match with the same vintage must still
   // outrank a perfect name match without it. decideMatch caps what it reports.

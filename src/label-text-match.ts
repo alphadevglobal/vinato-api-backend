@@ -15,6 +15,18 @@ import {
 export type DeviceLine = { text: string; confidence: number; height: number };
 export type DeviceReading = { lines: DeviceLine[]; barcodes: string[] };
 
+// Cyrillic and Greek letters that look like Latin ones: Vision sometimes reads a Latin
+// label with them ("CОНІВА" for COHIBA), and no catalog search would find it.
+const LOOKALIKES: Record<string, string> = {
+  "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "Х": "X", "У": "Y", "І": "I", "Ј": "J", "Ѕ": "S",
+  "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y", "і": "i", "ј": "j", "ѕ": "s",
+  "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X", "ο": "o",
+};
+/** Latin letters for the Cyrillic/Greek look-alikes (other letters stay). */
+export function latinize(text: string) {
+  return text.replace(/[\u0370-\u03ff\u0400-\u04ff]/g, (letter) => LOOKALIKES[letter] ?? letter);
+}
+
 /** The phone's reading, as sent in the multipart field "deviceReading" (JSON). Invalid parts are dropped. */
 export function parseDeviceReading(raw: unknown): DeviceReading | null {
   if (typeof raw !== "string" || !raw || raw.length > 60_000) return null;
@@ -28,7 +40,7 @@ export function parseDeviceReading(raw: unknown): DeviceReading | null {
     const conf = Number(confidence);
     const h = Number(height);
     if (!Number.isFinite(conf) || !Number.isFinite(h) || h <= 0 || h > 1) return [];
-    return [{ text: text.trim().slice(0, 160), confidence: Math.min(1, Math.max(0, conf)), height: h }];
+    return [{ text: latinize(text.trim()).slice(0, 160), confidence: Math.min(1, Math.max(0, conf)), height: h }];
   });
   const barcodes = [...new Set((Array.isArray(input.barcodes) ? input.barcodes : []).map((code) => normalizeBarcode(code)).filter((code): code is string => Boolean(code)))].slice(0, 4);
   return lines.length || barcodes.length ? { lines, barcodes } : null;
@@ -71,14 +83,17 @@ export function labelYears(reading: DeviceReading, now = new Date()) {
   return [...years];
 }
 
-/** The big-print lines, or null when the reading is too weak to be exact. */
+/**
+ * The big-print lines read with certainty, or null. The tallest print on a label is
+ * often a logo or a drawing Vision reads as noise ("()tt*") with low confidence: those
+ * lines are left out, so the name is the tallest text read with full confidence.
+ * Every rule of exactTextMatch still applies to it.
+ */
 export function prominentLines(reading: DeviceReading) {
-  if (!reading.lines.length) return null;
-  const tallest = Math.max(...reading.lines.map((line) => line.height));
-  const prominent = reading.lines.filter((line) => line.height >= tallest * PROMINENT_SHARE);
-  // The name itself was not read with certainty: never guess it.
-  if (prominent.some((line) => line.confidence < NAME_CONFIDENCE)) return null;
-  return prominent;
+  const certain = reading.lines.filter((line) => line.confidence >= NAME_CONFIDENCE && /\p{L}{2,}/u.test(line.text));
+  if (!certain.length) return null;
+  const tallest = Math.max(...certain.map((line) => line.height));
+  return certain.filter((line) => line.height >= tallest * PROMINENT_SHARE);
 }
 
 /** Search strings for the catalog: the big-print name, alone and with the grapes read. */
@@ -107,12 +122,21 @@ export function exactTextMatch(reading: DeviceReading, candidates: CatalogCandid
   const identity = new Set(tokens(allText));
   const bigWords = [...new Set(tokens(prominent.map((line) => line.text).join(" ")))].filter((word) => !/^\d+$/.test(word));
   if (!bigWords.length) return null;
+  // Uncertain lines printed BIGGER than the name: their real words (3+ letters, no
+  // digits) must belong to the wine, or a blurry "CARRUADES" above "Château Lafite"
+  // would pick the wrong wine. Logos read as noise ("()tt*", "750mle") do not count.
+  const nameHeight = Math.min(...prominent.map((line) => line.height));
+  const tallerNoise = [...new Set(tokens(reading.lines.filter((line) => line.confidence < NAME_CONFIDENCE && line.height > nameHeight).map((line) => line.text).join(" ")))]
+    .filter((word) => word.length >= 3 && !/\d/.test(word));
   const years = labelYears(reading, now);
   const labelColour = colourOf(allText);
   const labelSweetness = sweetnessOf(allText);
   const labelFormat = LARGE_OR_SMALL_FORMAT.test(normalizeText(allText));
-  const labelGrapes = [...words].filter((word) => GRAPE_WORDS.has(word));
-  const labelTiers = [...words].filter((word) => TIER_WORDS.has(word));
+  // To rule a wine OUT, even a guessed word counts: "Reserva" read with low confidence
+  // still means the bottle is not the plain "Pionero Carmenere".
+  const anyWords = new Set(normalizeText(reading.lines.map((line) => line.text).join(" ")).split(" ").filter(Boolean));
+  const labelGrapes = [...anyWords].filter((word) => GRAPE_WORDS.has(word));
+  const labelTiers = [...anyWords].filter((word) => TIER_WORDS.has(word));
 
   const passing = candidates.filter((candidate) => {
     const places = new Set((candidate.places ?? []).flatMap((place) => tokens(place)));
@@ -128,7 +152,9 @@ export function exactTextMatch(reading: DeviceReading, candidates: CatalogCandid
     // 3. The big print is fully explained by this wine: "Catena Alta" is not "Catena Malbec".
     if (!bigWords.every((word) => own.has(word) || places.has(word))) return false;
     // ...and it names the wine itself, not only the region.
-    if (!bigWords.some((word) => own.has(word))) return false;
+    if (!bigWords.some((word) => own.has(word) && !places.has(word))) return false;
+    // ...and nothing printed bigger contradicts it.
+    if (tallerNoise.some((word) => !own.has(word) && !places.has(word))) return false;
     // 4. No grape and no "Reserva/Gran/Brut..." on the label that the wine lacks.
     if (labelGrapes.some((word) => !own.has(word))) return false;
     if (labelTiers.some((word) => !own.has(word))) return false;
@@ -138,8 +164,6 @@ export function exactTextMatch(reading: DeviceReading, candidates: CatalogCandid
     const sweetness = sweetnessOf(candidateText);
     if ([...labelSweetness].some((word) => !sweetness.has(word)) || [...sweetness].some((word) => !labelSweetness.has(word))) return false;
     if (LARGE_OR_SMALL_FORMAT.test(candidateText) !== labelFormat) return false;
-    // 6. A row for one vintage only answers to that year printed on the label.
-    if (candidate.vintage && !years.includes(candidate.vintage)) return false;
     return true;
   });
   if (!passing.length) return null;
@@ -161,7 +185,8 @@ export function exactTextMatch(reading: DeviceReading, candidates: CatalogCandid
     if (otherName.size === bestName.size && !sameWine(best, other)) return null;
   }
 
-  const vintage = years.length === 1 ? years[0] : best.vintage ?? null;
+  // The vintage is the one printed on the label: it never decides which wine it is.
+  const vintage = years.length === 1 ? years[0] : null;
   // Duplicates of the same wine: the row for the printed vintage, then the one with a photo.
   const sameName = ranked.filter((candidate) => sameWine(candidate, best));
   const chosen = sameName.find((candidate) => vintage && candidate.vintage === vintage)

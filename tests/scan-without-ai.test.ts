@@ -130,12 +130,11 @@ describe("POST /wine-scanner/scan tries the catalog before the AI", () => {
     expect(scanWineLabel).toHaveBeenCalledTimes(1);
   });
 
-  it("ignores a barcode linked to another vintage than the one printed", async () => {
+  it("finds the wine by its barcode whatever the vintage, keeping the vintage printed on the label", async () => {
     const { scan, scanWineLabel } = setup({ [EAN]: { wineId: "w-2010", vintage: 2010 } });
-    // Text match still finds the non-vintage row exactly.
     const withBarcode = alamosReading.replace('"barcodes":[]', `"barcodes":["${EAN}"]`);
     const response = await scan({ deviceReading: withBarcode }).expect(200);
     expect(scanWineLabel).not.toHaveBeenCalled();
-    expect(response.body.catalog).toMatchObject({ wineId: "w-alamos", resolvedBy: "text" });
+    expect(response.body.catalog).toMatchObject({ wineId: "w-2010", resolvedBy: "barcode" });
   });
 });

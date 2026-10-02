@@ -25,26 +25,60 @@ Regras:
 - colour: tinto, branco, rose ou espumante, quando indicado.
 - Use null quando nao estiver visivel. Nunca invente produtor, vinho ou safra.
 
-Alem da transcricao, para a ficha do vinho no app:
-- description: 2 a 3 frases em portugues do Brasil sobre o estilo do vinho (uvas,
-  regiao, perfil de aromas e paladar), usando conhecimento enologico geral
-  coerente com o rotulo. null se voce nao reconhecer o vinho nem o estilo.
-- foodPairings: lista com ate 5 pratos que harmonizam com este vinho, em portugues.
-- agingPotential: o tempo de guarda que o produtor informa no rotulo, como impresso
-  (ex.: "Guardar ate 2032", "Potencial de guarda: 8 a 10 anos"). Se o rotulo nao
-  mostrar, use o tempo de guarda conhecido deste vinho ou produtor, em portugues
-  (ex.: "5 a 8 anos a partir da safra"). null se voce nao souber.
-Esses campos nunca alteram a transcricao: produtor, vinho e safra continuam
-sendo apenas o que esta impresso.
+- agingPotential: somente se o rotulo imprimir o tempo de guarda (ex.: "Guardar ate 2032"); senao null.
+- notes: no maximo 10 palavras, ou "".
 
-Responda somente JSON valido, sem markdown, com estas chaves:
+Responda somente JSON valido, sem markdown e sem espacos extras, com estas chaves:
 displayName, producerTitle, producerName, wine, country, region, subRegion,
 colour, type, subType, designation, classification, vintage, alcoholContent,
-grapes, volume, description, foodPairings, agingPotential, confidence, notes. confidence e um numero de 0 a 1.
+grapes, volume, agingPotential, confidence, notes. confidence e um numero de 0 a 1.
 `;
+
+/**
+ * The wine sheet of a wine the scan created (description, pairings, tempo de guarda,
+ * janela de uso). Written after the app already got its answer: the label reading
+ * the user waits for stays short (scannerPrompt), and this call reads no image.
+ */
+export const wineSheetPrompt = (reading: ScannedWineData) => `
+Voce e um sommelier escrevendo a ficha de um vinho para o app Vinato.
+Vinho lido no rotulo: ${JSON.stringify(Object.fromEntries(Object.entries(reading).filter(([key, value]) => value !== null && value !== "" && !["confidence", "notes", "description", "foodPairings"].includes(key))))}
+
+Responda somente JSON valido, sem markdown, com as chaves:
+- description: 2 a 3 frases em portugues do Brasil sobre o estilo do vinho (uvas, regiao, aromas e paladar). null se nao reconhecer o estilo.
+- foodPairings: ate 5 pratos que harmonizam, em portugues.
+- agingPotential: tempo de guarda conhecido deste vinho ou produtor, em portugues (ex.: "5 a 8 anos a partir da safra"); null se nao souber.
+- drinkingWindow: como o vinho evolui em anos apos a safra, 2 a 4 fases [{"from":1,"to":3,"note":"..."}], com "plus": true na ultima fase se continuar; null se nao souber.
+Nunca invente produtor, nome ou safra.
+`;
+
+export type WineSheet = { description: string | null; foodPairings: string[] | null; agingPotential: string | null; drinkingWindow: { from: number; to: number | null; plus?: boolean; note: string }[] | null };
+
+/** The model's sheet answer → the fields to fill (invalid parts dropped). */
+export function normalizeWineSheet(json: Record<string, unknown>): WineSheet {
+  const window = Array.isArray(json.drinkingWindow) ? json.drinkingWindow.flatMap((item) => {
+    const phase = (item ?? {}) as Record<string, unknown>;
+    const from = Number(phase.from);
+    const to = phase.to === null || phase.to === undefined ? null : Number(phase.to);
+    const note = typeof phase.note === "string" ? phase.note.trim() : "";
+    if (!Number.isInteger(from) || from < 0 || !note || (to !== null && (!Number.isInteger(to) || to < from))) return [];
+    return [{ from, to, ...(phase.plus === true ? { plus: true } : {}), note }];
+  }).sort((a, b) => a.from - b.from).slice(0, 8) : [];
+  return {
+    description: nullableString(json.description), foodPairings: stringList(json.foodPairings),
+    agingPotential: nullableString(json.agingPotential), drinkingWindow: window.length ? window : null,
+  };
+}
 
 export class OpenRouterWineScanner implements WineScanner {
   constructor(private readonly settings?: ScannerModelSettingsProvider) {}
+
+  /** The sheet of a wine the scan created, from the reading only (no image). Null when the model fails. */
+  async describeWine(reading: ScannedWineData): Promise<WineSheet | null> {
+    if (!config.openRouterApiKey) return null;
+    const models = this.settings ? await this.settings.getScannerModels() : defaultScannerModels();
+    const reply = await requestJson(models.model, [{ type: "text", text: wineSheetPrompt(reading) }], { maxTokens: 1500, timeoutMs: 30_000, title: "Wine API ficha" });
+    return reply.ok ? normalizeWineSheet(reply.json) : null;
+  }
 
   async scanWineLabel(file: Express.Multer.File, trace?: ScanTrace): Promise<ScanWineLabelResult> {
     if (!config.openRouterApiKey) {

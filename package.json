@@ -14,6 +14,7 @@
     "db:import:hf": "tsx scripts/import-huggingface.ts"
   },
   "dependencies": {
+    "@vercel/functions": "^3.9.9",
     "cors": "^2.8.5",
     "disposable-email-domains": "^1.0.62",
     "dotenv": "^16.4.7",

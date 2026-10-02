@@ -63,11 +63,12 @@ describe("scan without AI: exact catalog match from the label text", () => {
     expect(exactTextMatch(alamos, magnumRow, now)).toBeNull();
   });
 
-  it("answers a vintage row only for its printed year", () => {
+  it("finds the wine whatever the vintage; the vintage is the one printed on the label", () => {
     const rows = [wine("2010", "Alamos Malbec", { producer: "Catena Zapata", vintage: 2010 })];
-    expect(exactTextMatch(alamos, rows, now)).toBeNull();
+    // A 2005 label is still the Alamos Malbec catalogued from a 2010 bottle.
+    expect(exactTextMatch(alamos, rows, now)).toMatchObject({ candidate: { id: "2010" }, vintage: 2005 });
     const reading2010: DeviceReading = { ...alamos, lines: alamos.lines.map((item) => (item.text === "2005" ? { ...item, text: "2010" } : item)) };
-    expect(exactTextMatch(reading2010, [...catalog], now)?.candidate.id).toBe("alamos-malbec-2010");
+    expect(exactTextMatch(reading2010, [...catalog], now)).toMatchObject({ candidate: { id: "alamos-malbec-2010" }, vintage: 2010 });
   });
 
   it("gives up when two different wines fit the label", () => {

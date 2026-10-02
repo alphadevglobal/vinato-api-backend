@@ -106,12 +106,28 @@ describe("OpenRouterWineScanner", () => {
     expect(result.data.description).toBeNull();
   });
 
-  it("asks the model for the description and pairings without changing the transcription rules", async () => {
+  it("keeps the label reading short: the wine sheet is written by a separate call", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(modelReply('{"displayName":"Vinho","confidence":0.9,"notes":""}'));
     await scanWith(fetchMock);
     const prompt = JSON.parse(fetchMock.mock.calls[0][1].body).messages[0].content[0].text as string;
-    expect(prompt).toContain("description, foodPairings");
+    expect(prompt).not.toContain("description");
+    expect(prompt).not.toContain("foodPairings");
     expect(prompt).toContain("Nunca invente produtor, vinho ou safra");
+  });
+
+  it("writes the sheet of a new wine from the reading, without the image", async () => {
+    process.env.OPENROUTER_API_KEY = "test-key";
+    const { OpenRouterWineScanner, normalizeWineSheet } = await import("../src/scanner.service.js");
+    const fetchMock = vi.fn().mockResolvedValueOnce(modelReply(JSON.stringify({ description: "Tinto frutado.", foodPairings: ["Massas", "null"], agingPotential: "3 a 5 anos",
+      drinkingWindow: [{ from: 4, to: 6, note: "terroso" }, { from: 1, to: 3, note: "frutado" }, { from: 5, to: 2, note: "x" }] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const sheet = await new OpenRouterWineScanner().describeWine({ displayName: "Miolo Seleção", vintage: "2021", confidence: 0.9, notes: "" });
+    expect(sheet).toEqual({ description: "Tinto frutado.", foodPairings: ["Massas"], agingPotential: "3 a 5 anos", drinkingWindow: [{ from: 1, to: 3, note: "frutado" }, { from: 4, to: 6, note: "terroso" }] });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.messages[0].content).toHaveLength(1);
+    expect(body.messages[0].content[0].text).toContain('"displayName":"Miolo Seleção"');
+    expect(normalizeWineSheet({})).toEqual({ description: null, foodPairings: null, agingPotential: null, drinkingWindow: null });
+    vi.unstubAllGlobals();
   });
 
   it("moves on to the fallback when the primary answer is cut or not JSON", async () => {

@@ -1,3 +1,4 @@
+import type { WineSheet } from "./scanner.service.js";
 import type { ScanTrace } from "./scan-audit.repository.js";
 import { decideMatch, readingIdentity, searchTerms, type CatalogCandidate } from "./catalog-matcher.js";
 import type {
@@ -213,6 +214,29 @@ export class PgWineRepository implements WineRepository {
     return this.findCandidatesByTerms(searchTerms(data));
   }
 
+  /**
+   * The sheet of a wine the scan just created, written after the app got its answer:
+   * only the fields still empty are filled, and the "Novos Vinhos" proposal gets them too.
+   */
+  async completeNewWine(wineId: string, sheet: WineSheet) {
+    const lines = (sheet.drinkingWindow ?? []).map((phase) => `${phase.from}${phase.to !== null && phase.to !== phase.from ? `-${phase.to}` : ""}${phase.plus || phase.to === null ? "+" : ""}: ${phase.note}`);
+    await this.pool.query(
+      `UPDATE catalog_wines SET
+         description = coalesce(description, $2),
+         pairings = CASE WHEN coalesce(jsonb_array_length(pairings->'dishes'), 0) = 0 AND $3::jsonb <> '[]'::jsonb
+                         THEN jsonb_set(coalesce(pairings, '{"dishes": [], "ingredients": []}'::jsonb), '{dishes}', $3::jsonb) ELSE pairings END,
+         aging_potential = coalesce(aging_potential, $4),
+         drinking_window = coalesce(drinking_window, $5::jsonb)
+       WHERE id = $1`,
+      [wineId, sheet.description, JSON.stringify(sheet.foodPairings ?? []), sheet.agingPotential, sheet.drinkingWindow ? JSON.stringify(sheet.drinkingWindow) : null],
+    );
+    const proposed = Object.fromEntries(Object.entries({ description: sheet.description, pairings: sheet.foodPairings, agingPotential: sheet.agingPotential, drinkingWindow: lines.length ? lines : null })
+      .filter(([, value]) => value !== null && value !== undefined));
+    if (Object.keys(proposed).length) {
+      await this.pool.query(`UPDATE wine_ai_proposals SET proposed = $2::jsonb || proposed WHERE wine_id = $1 AND kind = 'new_wine' AND status = 'pending'`, [wineId, JSON.stringify(proposed)]);
+    }
+  }
+
   /** The wine a product barcode was linked to (label-text-match), following merges; null when unknown. */
   async findWineByBarcode(barcode: string): Promise<{ wineId: string; vintage: number | null } | null> {
     try {
@@ -363,11 +387,10 @@ export class PgWineRepository implements WineRepository {
       const existing = await this.pool.query<{ id: string }>(
         `SELECT coalesce(merged_into, id) AS id FROM catalog_wines
          WHERE lower(btrim(display_name)) = lower(btrim($1))
-           AND (vintage = $2::smallint OR (vintage IS NULL AND $2::smallint IS NULL))
            AND (curation_status <> 'rejected' OR merged_into IS NOT NULL)
          ORDER BY (merged_into IS NULL AND data_source = 'catalog') DESC, created_at
          LIMIT 1`,
-        [fields.displayName, fields.vintage ?? null],
+        [fields.displayName],
       );
       if (existing.rows[0]) return { wineId: existing.rows[0].id, created: false };
 
@@ -383,7 +406,8 @@ export class PgWineRepository implements WineRepository {
         [
           fields.displayName, fields.wineName, fields.producer ?? null, fields.country ?? null, fields.region ?? null,
           fields.subRegion ?? null, fields.colour ?? null, fields.wineType ?? null, fields.designation ?? null,
-          fields.classification ?? null, fields.vintage ?? null, fields.alcoholPercent ?? null,
+          // The catalog wine has no vintage: the label's goes to the app (janela de uso).
+          fields.classification ?? null, null, fields.alcoholPercent ?? null,
           JSON.stringify((fields.grapes ?? []).map((name) => ({ name, percentage: null }))),
           fields.description ?? null,
           JSON.stringify({ dishes: fields.pairings ?? [], ingredients: [] }),

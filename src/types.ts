@@ -187,6 +187,8 @@ export type WineRepository = {
   reconcileScan?(data: ScannedWineData, file: Express.Multer.File, userId?: string, trace?: import("./scan-audit.repository.js").ScanTrace): Promise<NonNullable<ScanWineLabelResult["catalog"]>>;
   // Scan without AI (label-text-match): barcode links and the catalog search by label text.
   findCandidatesByTerms?(terms: string[]): Promise<import("./catalog-matcher.js").CatalogCandidate[]>;
+  /** Fills the empty sheet fields of a wine the scan created (and its "Novos Vinhos" proposal). */
+  completeNewWine?(wineId: string, sheet: import("./scanner.service.js").WineSheet): Promise<void>;
   findWineByBarcode?(barcode: string): Promise<{ wineId: string; vintage: number | null } | null>;
   rememberBarcode?(barcode: string, wineId: string, source: "scan_ai" | "scan_text", userId?: string, replace?: boolean): Promise<void>;
   attachDeviceScan?(wineId: string, file: Express.Multer.File, userId?: string): Promise<boolean>;
@@ -197,9 +199,13 @@ export type WineRepository = {
 
 export type WineScanner = {
   scanWineLabel(file: Express.Multer.File, trace?: import("./scan-audit.repository.js").ScanTrace): Promise<ScanWineLabelResult>;
+  /** The sheet (description, pairings, tempo de guarda, janela de uso) of a wine the scan created, written after the answer. */
+  describeWine?(reading: ScannedWineData): Promise<import("./scanner.service.js").WineSheet | null>;
 };
 
 export type AppDependencies = {
+  /** Work done after the answer was sent (Vercel waitUntil); tests pass their own to await it. */
+  background?: (work: Promise<unknown>) => void;
   wineRepository: WineRepository;
   wineScanner: WineScanner;
   accountRepository?: import("./account.repository.js").AccountRepository;

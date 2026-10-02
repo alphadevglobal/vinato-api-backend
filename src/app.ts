@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import cors from "cors";
+import { waitUntil } from "@vercel/functions";
 import express, { type ErrorRequestHandler, type RequestHandler } from "express";
 import multer from "multer";
 import swaggerUi from "swagger-ui-express";
@@ -62,6 +63,12 @@ const upload = multer({
 
 export function createApp(dependencies: AppDependencies) {
   const app = express();
+  // Work after the answer (scan audit, sheet of a new wine): Vercel keeps the function
+  // alive for it (waitUntil); elsewhere the promise simply runs.
+  const later = dependencies.background ?? ((work: Promise<unknown>) => {
+    const guarded = work.catch((error) => console.error("[background]", (error as Error).message));
+    try { waitUntil(guarded); } catch { /* not on Vercel */ }
+  });
 
   app.use(cors());
   app.use(helmet({ contentSecurityPolicy: false }));
@@ -847,8 +854,9 @@ export function createApp(dependencies: AppDependencies) {
           return null;
         });
         if (quick) {
-          await audit({ success: true, outcome: "matched", reading: quick.data, catalogWineId: quick.catalog.wineId, matchScore: 1, imageAdded: quick.catalog.imageAdded, resolvedBy: quick.catalog.resolvedBy });
+          // The answer goes first; the audit row (with the photo) is written after it.
           res.json(quick);
+          later(audit({ success: true, outcome: "matched", reading: quick.data, catalogWineId: quick.catalog.wineId, matchScore: 1, imageAdded: quick.catalog.imageAdded, resolvedBy: quick.catalog.resolvedBy }));
           return;
         }
       }
@@ -884,7 +892,15 @@ export function createApp(dependencies: AppDependencies) {
           await dependencies.wineRepository.rememberBarcode?.(barcode, catalog.wineId, "scan_ai", user?.id, forceAi);
         }
       }
-      await audit({
+      res.json(result);
+      // After the answer: the audit row, and the sheet of a wine the scan created.
+      if (catalog?.status === "matched" && catalog.created && dependencies.wineScanner.describeWine && dependencies.wineRepository.completeNewWine) {
+        const describe = dependencies.wineScanner.describeWine.bind(dependencies.wineScanner);
+        const complete = dependencies.wineRepository.completeNewWine.bind(dependencies.wineRepository);
+        const wineId = catalog.wineId;
+        later(describe(reading).then((sheet) => sheet ? complete(wineId, sheet) : undefined));
+      }
+      later(audit({
         resolvedBy: catalog?.status === "matched" ? "ai" : undefined,
         success: true,
         outcome: catalog?.status === "needs_registration" ? "needs_registration" : catalog?.created ? "ai_created" : "matched",
@@ -893,8 +909,7 @@ export function createApp(dependencies: AppDependencies) {
         matchScore: catalog?.status === "matched" ? catalog.matchScore : undefined,
         unlistedCode: catalog?.status === "needs_registration" ? catalog.code : undefined,
         imageAdded: catalog?.status === "matched" ? catalog.imageAdded : undefined,
-      });
-      res.json(result);
+      }));
     }),
   );
 
@@ -923,9 +938,9 @@ async function resolveWithoutAi(dependencies: AppDependencies, device: DeviceRea
 
   for (const barcode of device.barcodes) {
     const linked = await repository.findWineByBarcode?.(barcode);
-    // One barcode serves every vintage: a row for another printed year is not this bottle.
-    if (linked && !(linked.vintage && years.length && !years.includes(linked.vintage))) {
-      found = { wineId: linked.wineId, resolvedBy: "barcode", vintage: years.length === 1 ? years[0] : linked.vintage };
+    // One barcode serves every vintage of the wine; the vintage is the one printed on the label.
+    if (linked) {
+      found = { wineId: linked.wineId, resolvedBy: "barcode", vintage: years.length === 1 ? years[0] : null };
       break;
     }
   }
@@ -977,7 +992,8 @@ function catalogWineToScanData(wine: Wine, reading: ScannedWineData): ScannedWin
     subType: wine.subType,
     designation: wine.designation,
     classification: wine.classification,
-    vintage: wine.vintageYear?.toString() ?? reading.vintage ?? null,
+    // The vintage of THIS bottle (read on the label), not the catalog row's.
+    vintage: reading.vintage ?? wine.vintageYear?.toString() ?? null,
     alcoholContent: wine.alcohol === null || wine.alcohol === undefined ? null : `${wine.alcohol}%`,
     grapes: wine.grapes,
     volume: reading.volume,

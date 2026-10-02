@@ -48,12 +48,18 @@ describe("catalog matcher", () => {
     expect(decision).toMatchObject({ status: "matched", best: { id: "bottle" } });
   });
 
-  it("offers another vintage as an alternative instead of matching it", () => {
+  it("matches the same wine whatever the vintage: the vintage only breaks ties", () => {
     const decision = decideMatch(
       reading({ displayName: "3 Autores Grande Reserva 2011", wine: "3 Autores Grande Reserva", vintage: "2011" }),
       [row("2018", "3 Autores Grande Reserva 2018", { vintage: 2018 })],
     );
-    expect(decision).toEqual({ status: "no_match", alternatives: [expect.objectContaining({ id: "2018" })] });
+    expect(decision).toMatchObject({ status: "matched", best: { id: "2018" } });
+    // Two rows of the same wine: the one of the printed vintage wins the tie.
+    const tie = decideMatch(
+      reading({ displayName: "3 Autores Grande Reserva 2011", wine: "3 Autores Grande Reserva", vintage: "2011" }),
+      [row("2018", "3 Autores Grande Reserva", { vintage: 2018 }), row("2011", "3 Autores Grande Reserva", { vintage: 2011 })],
+    );
+    expect(tie).toMatchObject({ status: "matched", best: { id: "2011" } });
   });
 
   it("treats the same wine catalogued twice as a match, not an ambiguity", () => {
